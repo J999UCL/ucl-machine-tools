@@ -32,7 +32,35 @@ TAIL_SENTINEL_END = "UCL_TAIL_TEXT_END"
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Unified UCL machine helper.")
+    parser = argparse.ArgumentParser(
+        description="Unified UCL machine helper.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Common use:
+  ucl status 3090ti
+      Show GPU availability, /tmp space, /tmp/ucl-machine-tools, and restart policy.
+  ucl status recommend 3090ti --min-free-vram-gb 20
+      Pick the best currently usable matching host.
+  ucl doctor barbury-l
+      Check one host, scratch state, and tmux sessions before work.
+  ucl exec barbury-l -- df -h /tmp
+      Run a short tmux-backed remote check without SSH quoting.
+  ucl exec barbury-l --stdin < check.sh
+      Run a multi-line bash snippet from stdin.
+  ucl exec barbury-l --shell csh --stdin < check_torch.csh
+      Run UCL/TSG csh setup snippets, such as Python/CUDA setup.
+  ucl run --host barbury-l --gpu auto --local-dir ./bundle --script run.sh
+      Upload a local bundle and launch its script in tmux.
+  ucl tail last
+      Print the latest recorded run log without login noise.
+  ucl fetch last
+      Fetch small log/config/text artifacts from the latest recorded run.
+  ucl clean barbury-l
+      List old launcher dirs; add --execute only when deletion is intended.
+
+Use 'ucl COMMAND --help' for command-specific flags.
+""",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     status = subparsers.add_parser("status", help="Check GPU, scratch, and host state.")

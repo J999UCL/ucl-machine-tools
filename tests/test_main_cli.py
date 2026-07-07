@@ -281,5 +281,9 @@ def test_help_exposes_unified_commands_and_not_legacy_scripts(capsys: pytest.Cap
     help_text = capsys.readouterr().out
     assert "status" in help_text
     assert "exec" in help_text
+    assert "Common use:" in help_text
+    assert "ucl exec barbury-l -- df -h /tmp" in help_text
+    assert "ucl run --host barbury-l --gpu auto" in help_text
+    assert "Use 'ucl COMMAND --help'" in help_text
     assert "ucl-inventory" not in help_text
     assert "ucl-launch" not in help_text
