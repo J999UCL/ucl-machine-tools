@@ -14,9 +14,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 def import_toolkit() -> tuple[Any, Any, Any]:
     from ucl_machine_tools import hosts, inventory
-    from ucl_machine_tools import cli as ucl_inventory
+    from ucl_machine_tools import main_cli
 
-    return hosts, inventory, ucl_inventory
+    return hosts, inventory, main_cli
 
 
 def ok(stdout: str = "", stderr: str = "") -> SimpleNamespace:
@@ -185,8 +185,7 @@ def test_ssh_argv_construction_is_list_argv_with_no_local_shell_tokens() -> None
     assert all(isinstance(part, str) for part in argv)
     assert argv[0] == "ssh"
     assert "barbury-l" in argv
-    assert "-lc" in argv
-    assert "bash" in argv
+    assert argv[-2:] == ["python3", "-"]
     assert "shell=True" not in argv
     assert not any(part in {";", "|", "&&"} for part in argv)
 
@@ -336,7 +335,7 @@ def test_cli_json_uses_fake_runner_only_and_emits_json(capsys: pytest.CaptureFix
             ),
         )
 
-    assert ucl_inventory.main(["--selector", "barbury-l", "--json"], runner=fake_runner) == 0
+    assert ucl_inventory.main(["status", "--selector", "barbury-l", "--json"], runner=fake_runner) == 0
 
     out = capsys.readouterr().out
     payload = json.loads(out)
@@ -365,7 +364,7 @@ def test_cli_subcommands_filter_and_recommend_without_remote_noise(capsys: pytes
             stderr="loud login noise that must not be printed",
         )
 
-    assert ucl_inventory.main(["recommend", "barbury-l,canada-l", "--json"], runner=fake_runner) == 0
+    assert ucl_inventory.main(["status", "recommend", "barbury-l,canada-l", "--json"], runner=fake_runner) == 0
 
     out = capsys.readouterr().out
     payload = json.loads(out)
@@ -382,12 +381,19 @@ def test_cli_help_documents_selectors_and_output_modes(capsys: pytest.CaptureFix
 
     assert exc.value.code == 0
     help_text = capsys.readouterr().out
-    assert "--selector" in help_text
-    assert "--json" in help_text
-    assert "--table" in help_text
+    assert "status" in help_text
+    assert "exec" in help_text
+    assert "run" in help_text
     assert "--use-master" not in help_text
-    assert "catalog JSON" in help_text
     assert "ucl" in help_text.lower()
+
+    status_parser = ucl_inventory.build_parser()
+    with pytest.raises(SystemExit):
+        status_parser.parse_args(["status", "--help"])
+    status_help = capsys.readouterr().out
+    assert "--selector" in status_help
+    assert "--json" in status_help
+    assert "--table" in status_help
 
 
 def test_ssh_master_helper_checks_and_starts_when_needed() -> None:

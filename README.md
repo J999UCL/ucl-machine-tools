@@ -1,46 +1,68 @@
 # UCL Machine Tools
 
-Standalone utilities for checking UCL CS GPU availability and launching small
-script bundles on remote machines.
-
-The inventory command checks:
-
-- GPU availability through `nvidia-smi`
-- `/tmp` free space
-- whether `/tmp/ucl-machine-tools` exists
-- the restart policy recorded for each host class
-
-It does not know about any research project, dataset, model, checkpoint, or run
-directory.
-
-## Inventory
+One command for UCL CS GPU machine checks, small remote commands, and tmux-backed
+script launches.
 
 ```bash
-scripts/ucl-inventory check barbury-l
-scripts/ucl-inventory gpus 3090ti
-scripts/ucl-inventory state timeshare
-scripts/ucl-inventory recommend barbury-l,canada-l --min-free-vram-gb 20
-scripts/ucl-inventory --selector barbury-l --json
+scripts/ucl status 3090ti
+scripts/ucl doctor barbury-l --profile tsg-pytorch --gpu 0
+scripts/ucl exec barbury-l -- hostname
+scripts/ucl exec barbury-l --profile tsg-pytorch -- python3 -c 'import torch; print(torch.cuda.is_available())'
+scripts/ucl run --host barbury-l --local-dir ./bundle --script run.sh
+scripts/ucl tail last
+scripts/ucl fetch last
 ```
 
-## Launch
+The tool always checks/starts the `knuckles` SSH master connection before remote
+work. Remote transfers use SSH/tar streams, not `scp`, `sftp`, or `rsync`.
 
-`ucl-launch` uploads a local directory with tar over SSH, writes a small remote
-launcher, and starts it inside tmux. It always checks/starts the `knuckles` SSH
-master connection first.
+## Commands
 
-```bash
-scripts/ucl-launch --host barbury-l --local-dir ./bundle --script run.sh
-scripts/ucl-launch --host barbury-l --local-dir ./bundle --script run.sh --session work
-scripts/ucl-launch --host barbury-l --local-dir ./bundle --script run.sh --new-session
-scripts/ucl-launch --host barbury-l --local-dir ./bundle --script run.sh --dry-run
+- `ucl status [target]` checks GPU availability, `/tmp` free space,
+  `/tmp/ucl-machine-tools`, and restart policy.
+- `ucl doctor HOST` checks one host, tmux visibility, scratch state, and an
+  optional launch profile.
+- `ucl exec HOST -- COMMAND...` writes a tiny remote launcher and starts it in
+  tmux. It reuses the single existing tmux session by default. If zero or
+  multiple sessions exist, pass `--session NAME` or `--new-session`.
+- `ucl exec HOST --stdin` reads a bash script from stdin, avoiding nested quote
+  problems for multi-line commands.
+- `ucl run` uploads a local bundle, writes profile-aware launcher files, and
+  starts the bundle script in tmux.
+- `ucl tail last`, `ucl fetch last`, and `ucl clean HOST` operate on recorded
+  run metadata.
+
+## Profiles
+
+Profiles are JSON and dependency-free. Load order is:
+
+```text
+configs/launch_profiles.json
+~/.config/ucl-machine-tools/launch_profiles.json
+--profile-file PATH
+CLI --env values
 ```
 
-Default tmux behavior:
+Built-ins:
 
-- if exactly one tmux session exists, launch a new window there
-- if no tmux sessions exist, create a new session
-- if multiple sessions exist, fail and ask for `--session` or `--new-session`
+- `plain-bash`: no setup.
+- `uv`: require `uv`, then run commands through `uv run --`.
+- `tsg-pytorch`: source TSG Python/CUDA setup and require torch CUDA.
+
+Profiles may use `extends`, `env`, `source`, `preflight`,
+`preflight_after_setup`, and `run_prefix`. Project-specific profiles should live
+in user or explicit profile files, not in this generic repo.
+
+## Tmux Rules
+
+`ucl exec` is intentionally conservative:
+
+- one existing session: launch a new window there
+- zero sessions: fail unless `--session` or `--new-session` is passed
+- multiple sessions: fail unless `--session` or `--new-session` is passed
+
+`ucl run` may create a generated session when no tmux session exists, because it
+is the long-job launch path.
 
 ## TSG Restart Notes
 

@@ -42,9 +42,8 @@ def build_ssh_argv(host: HostSpec, *, timeout_seconds: int = 8) -> list[str]:
         "-o",
         f"ConnectTimeout={int(timeout_seconds)}",
         host.ssh_host,
-        "bash",
-        "-lc",
-        "python3 -",
+        "python3",
+        "-",
     ]
 
 
