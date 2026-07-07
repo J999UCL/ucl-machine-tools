@@ -11,6 +11,7 @@ from typing import Any
 
 from ucl_machine_tools.hosts import load_catalog, parse_selector
 from ucl_machine_tools.inventory import collect, format_table, to_jsonable
+from ucl_machine_tools.ssh import ensure_knuckles_master
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -89,6 +90,7 @@ def main(argv: list[str] | None = None, *, runner=subprocess.run) -> int:
     root = args.root
     min_tmp_free_gb = float(args.min_tmp_free_gb) if args.min_tmp_free_gb is not None else 50.0
     selected = parse_selector(_selector_from_args(args), catalog=catalog)
+    ensure_knuckles_master(runner=runner)
     rows = collect(
         selected,
         runner=runner,

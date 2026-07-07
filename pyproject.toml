@@ -7,6 +7,7 @@ dependencies = []
 
 [project.scripts]
 ucl-inventory = "ucl_machine_tools.cli:main"
+ucl-launch = "ucl_machine_tools.launch_cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

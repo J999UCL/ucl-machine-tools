@@ -1,7 +1,7 @@
 # UCL Machine Tools
 
-Standalone read-only utilities for checking UCL CS GPU availability and
-machine-local scratch state.
+Standalone utilities for checking UCL CS GPU availability and launching small
+script bundles on remote machines.
 
 The inventory command checks:
 
@@ -13,7 +13,7 @@ The inventory command checks:
 It does not know about any research project, dataset, model, checkpoint, or run
 directory.
 
-## Usage
+## Inventory
 
 ```bash
 scripts/ucl-inventory check barbury-l
@@ -22,6 +22,25 @@ scripts/ucl-inventory state timeshare
 scripts/ucl-inventory recommend barbury-l,canada-l --min-free-vram-gb 20
 scripts/ucl-inventory --selector barbury-l --json
 ```
+
+## Launch
+
+`ucl-launch` uploads a local directory with tar over SSH, writes a small remote
+launcher, and starts it inside tmux. It always checks/starts the `knuckles` SSH
+master connection first.
+
+```bash
+scripts/ucl-launch --host barbury-l --local-dir ./bundle --script run.sh
+scripts/ucl-launch --host barbury-l --local-dir ./bundle --script run.sh --session work
+scripts/ucl-launch --host barbury-l --local-dir ./bundle --script run.sh --new-session
+scripts/ucl-launch --host barbury-l --local-dir ./bundle --script run.sh --dry-run
+```
+
+Default tmux behavior:
+
+- if exactly one tmux session exists, launch a new window there
+- if no tmux sessions exist, create a new session
+- if multiple sessions exist, fail and ask for `--session` or `--new-session`
 
 ## TSG Restart Notes
 

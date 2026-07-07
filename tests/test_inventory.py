@@ -19,6 +19,14 @@ def import_toolkit() -> tuple[Any, Any, Any]:
     return hosts, inventory, ucl_inventory
 
 
+def ok(stdout: str = "", stderr: str = "") -> SimpleNamespace:
+    return SimpleNamespace(returncode=0, stdout=stdout, stderr=stderr)
+
+
+def fail(stdout: str = "", stderr: str = "failed") -> SimpleNamespace:
+    return SimpleNamespace(returncode=1, stdout=stdout, stderr=stderr)
+
+
 def make_catalog(remote_hosts: Any) -> dict[str, Any]:
     return remote_hosts.validate_catalog(
         [
@@ -318,14 +326,14 @@ def test_cli_json_uses_fake_runner_only_and_emits_json(capsys: pytest.CaptureFix
         calls.append((argv, kwargs))
         assert isinstance(argv, list)
         assert kwargs.get("shell", False) is False
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
         assert "barbury-l" in argv
-        return SimpleNamespace(
-            returncode=0,
+        return ok(
             stdout=sentinel_stdout(
                 remote_inventory,
                 inventory_payload(host="barbury-l", gpus=[gpu()], filesystems=[tmp_fs(700.0)]),
             ),
-            stderr="",
         )
 
     assert ucl_inventory.main(["--selector", "barbury-l", "--json"], runner=fake_runner) == 0
@@ -333,6 +341,7 @@ def test_cli_json_uses_fake_runner_only_and_emits_json(capsys: pytest.CaptureFix
     out = capsys.readouterr().out
     payload = json.loads(out)
     assert calls
+    assert calls[0][0] == ["ssh", "-O", "check", "knuckles"]
     assert payload["schema_version"] == 1
     assert payload["hosts"][0]["host"] == "barbury-l"
     assert payload["hosts"][0]["status"] == "ready"
@@ -342,12 +351,13 @@ def test_cli_subcommands_filter_and_recommend_without_remote_noise(capsys: pytes
     _, remote_inventory, ucl_inventory = import_toolkit()
 
     def fake_runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
         host = "barbury-l" if "barbury-l" in argv else "canada-l"
         row_gpu = gpu()
         if host == "canada-l":
             row_gpu = gpu(processes=[{"pid": 111, "user": "busy", "used_memory_mb": 6000}])
-        return SimpleNamespace(
-            returncode=0,
+        return ok(
             stdout=sentinel_stdout(
                 remote_inventory,
                 inventory_payload(host=host, gpus=[row_gpu], filesystems=[tmp_fs(700.0)]),
@@ -375,5 +385,42 @@ def test_cli_help_documents_selectors_and_output_modes(capsys: pytest.CaptureFix
     assert "--selector" in help_text
     assert "--json" in help_text
     assert "--table" in help_text
+    assert "--use-master" not in help_text
     assert "catalog JSON" in help_text
     assert "ucl" in help_text.lower()
+
+
+def test_ssh_master_helper_checks_and_starts_when_needed() -> None:
+    from ucl_machine_tools import ssh
+
+    calls: list[list[str]] = []
+
+    def existing_runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        calls.append(argv)
+        return ok()
+
+    assert ssh.ensure_knuckles_master(runner=existing_runner) == "existing"
+    assert calls == [["ssh", "-O", "check", "knuckles"]]
+
+    calls.clear()
+
+    def start_runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        calls.append(argv)
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return fail(stderr="No such control socket")
+        return ok()
+
+    assert ssh.ensure_knuckles_master(runner=start_runner) == "started"
+    assert calls == [["ssh", "-O", "check", "knuckles"], ["ssh", "-MNf", "knuckles"]]
+
+
+def test_ssh_master_start_failure_is_clear() -> None:
+    from ucl_machine_tools import ssh
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return fail(stderr="missing")
+        return fail(stderr="permission denied")
+
+    with pytest.raises(RuntimeError, match="permission denied"):
+        ssh.ensure_knuckles_master(runner=runner)
