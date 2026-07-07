@@ -1,0 +1,530 @@
+{
+  "defaults": {
+    "scratch_root": "/tmp/ucl-machine-tools"
+  },
+  "groups": {
+    "timeshare": [
+      "cream",
+      "vanilla",
+      "blaze"
+    ],
+    "rtx6000": [
+      "cream",
+      "vanilla"
+    ],
+    "titanx": [
+      "blaze"
+    ],
+    "3090ti": [
+      "aylesbury-l",
+      "barbury-l",
+      "barnacle-l",
+      "brent-l",
+      "bufflehead-l",
+      "cackling-l",
+      "canada-l",
+      "crested-l",
+      "eider-l",
+      "gadwall-l",
+      "goosander-l",
+      "gressingham-l",
+      "harlequin-l",
+      "mallard-l",
+      "mandarin-l",
+      "pintail-l",
+      "pochard-l",
+      "ruddy-l",
+      "scaup-l",
+      "scoter-l",
+      "shelduck-l",
+      "shoveler-l",
+      "smew-l",
+      "wigeon-l"
+    ],
+    "lab3090": [
+      "aylesbury-l",
+      "barbury-l",
+      "barnacle-l",
+      "brent-l",
+      "bufflehead-l",
+      "cackling-l",
+      "canada-l",
+      "crested-l",
+      "eider-l",
+      "gadwall-l",
+      "goosander-l",
+      "gressingham-l",
+      "harlequin-l",
+      "mallard-l",
+      "mandarin-l",
+      "pintail-l",
+      "pochard-l",
+      "ruddy-l",
+      "scaup-l",
+      "scoter-l",
+      "shelduck-l",
+      "shoveler-l",
+      "smew-l",
+      "wigeon-l"
+    ],
+    "4070ti": [
+      "albacore-l",
+      "barbel-l",
+      "chub-l",
+      "dory-l",
+      "elver-l",
+      "flounder-l",
+      "goldeye-l",
+      "hake-l",
+      "inanga-l",
+      "javelin-l",
+      "koi-l",
+      "lamprey-l",
+      "mackerel-l",
+      "mullet-l",
+      "nase-l",
+      "opah-l",
+      "pike-l",
+      "plaice-l",
+      "quillback-l",
+      "roach-l",
+      "rudd-l",
+      "shark-l",
+      "skate-l",
+      "tope-l",
+      "uaru-l",
+      "vimba-l",
+      "whitebait-l",
+      "yellowtail-l",
+      "zander-l"
+    ],
+    "lab4070": [
+      "albacore-l",
+      "barbel-l",
+      "chub-l",
+      "dory-l",
+      "elver-l",
+      "flounder-l",
+      "goldeye-l",
+      "hake-l",
+      "inanga-l",
+      "javelin-l",
+      "koi-l",
+      "lamprey-l",
+      "mackerel-l",
+      "mullet-l",
+      "nase-l",
+      "opah-l",
+      "pike-l",
+      "plaice-l",
+      "quillback-l",
+      "roach-l",
+      "rudd-l",
+      "shark-l",
+      "skate-l",
+      "tope-l",
+      "uaru-l",
+      "vimba-l",
+      "whitebait-l",
+      "yellowtail-l",
+      "zander-l"
+    ]
+  },
+  "hosts": {
+    "cream": {
+      "ssh": "cream",
+      "gpu_class": "rtx6000",
+      "restart_policy": "timeshare",
+      "expected_gpu_count": 4,
+      "expected_gpu_name": "Quadro RTX 6000"
+    },
+    "vanilla": {
+      "ssh": "vanilla",
+      "gpu_class": "rtx6000",
+      "restart_policy": "timeshare",
+      "expected_gpu_count": 4,
+      "expected_gpu_name": "Quadro RTX 6000"
+    },
+    "blaze": {
+      "ssh": "blaze",
+      "gpu_class": "titanx",
+      "restart_policy": "timeshare",
+      "expected_gpu_count": 4,
+      "expected_gpu_name": "Titan X"
+    },
+    "aylesbury-l": {
+      "ssh": "aylesbury-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "barbury-l": {
+      "ssh": "barbury-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090 Ti"
+    },
+    "barnacle-l": {
+      "ssh": "barnacle-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "brent-l": {
+      "ssh": "brent-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "bufflehead-l": {
+      "ssh": "bufflehead-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "cackling-l": {
+      "ssh": "cackling-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "canada-l": {
+      "ssh": "canada-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "crested-l": {
+      "ssh": "crested-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "eider-l": {
+      "ssh": "eider-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "gadwall-l": {
+      "ssh": "gadwall-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "goosander-l": {
+      "ssh": "goosander-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "gressingham-l": {
+      "ssh": "gressingham-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "harlequin-l": {
+      "ssh": "harlequin-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "mallard-l": {
+      "ssh": "mallard-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "mandarin-l": {
+      "ssh": "mandarin-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "pintail-l": {
+      "ssh": "pintail-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "pochard-l": {
+      "ssh": "pochard-l",
+      "aliases": [
+        "pocher-l"
+      ],
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "ruddy-l": {
+      "ssh": "ruddy-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "scaup-l": {
+      "ssh": "scaup-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "scoter-l": {
+      "ssh": "scoter-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "shelduck-l": {
+      "ssh": "shelduck-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "shoveler-l": {
+      "ssh": "shoveler-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "smew-l": {
+      "ssh": "smew-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "wigeon-l": {
+      "ssh": "wigeon-l",
+      "gpu_class": "3090ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 3090"
+    },
+    "albacore-l": {
+      "ssh": "albacore-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "barbel-l": {
+      "ssh": "barbel-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "chub-l": {
+      "ssh": "chub-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "dory-l": {
+      "ssh": "dory-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "elver-l": {
+      "ssh": "elver-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "flounder-l": {
+      "ssh": "flounder-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "goldeye-l": {
+      "ssh": "goldeye-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "hake-l": {
+      "ssh": "hake-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "inanga-l": {
+      "ssh": "inanga-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "javelin-l": {
+      "ssh": "javelin-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "koi-l": {
+      "ssh": "koi-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "lamprey-l": {
+      "ssh": "lamprey-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "mackerel-l": {
+      "ssh": "mackerel-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "mullet-l": {
+      "ssh": "mullet-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "nase-l": {
+      "ssh": "nase-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "opah-l": {
+      "ssh": "opah-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "pike-l": {
+      "ssh": "pike-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "plaice-l": {
+      "ssh": "plaice-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "quillback-l": {
+      "ssh": "quillback-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "roach-l": {
+      "ssh": "roach-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "rudd-l": {
+      "ssh": "rudd-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "shark-l": {
+      "ssh": "shark-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "skate-l": {
+      "ssh": "skate-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "tope-l": {
+      "ssh": "tope-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "uaru-l": {
+      "ssh": "uaru-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "vimba-l": {
+      "ssh": "vimba-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "whitebait-l": {
+      "ssh": "whitebait-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "yellowtail-l": {
+      "ssh": "yellowtail-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "zander-l": {
+      "ssh": "zander-l",
+      "gpu_class": "4070ti",
+      "restart_policy": "lab_pc",
+      "expected_gpu_count": 1,
+      "expected_gpu_name": "RTX 4070 Ti SUPER"
+    }
+  }
+}

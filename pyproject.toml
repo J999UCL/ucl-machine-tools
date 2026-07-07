@@ -1,0 +1,12 @@
+[project]
+name = "ucl-machine-tools"
+version = "0.1.0"
+description = "Read-only UCL CS GPU and scratch inventory tools"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+ucl-inventory = "ucl_machine_tools.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
