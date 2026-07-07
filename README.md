@@ -5,9 +5,9 @@ script launches.
 
 ```bash
 scripts/ucl status 3090ti
-scripts/ucl doctor barbury-l --profile tsg-pytorch --gpu 0
+scripts/ucl doctor barbury-l
 scripts/ucl exec barbury-l -- hostname
-scripts/ucl exec barbury-l --profile tsg-pytorch -- python3 -c 'import torch; print(torch.cuda.is_available())'
+scripts/ucl exec barbury-l --shell csh --stdin < setup_python.csh
 scripts/ucl run --host barbury-l --local-dir ./bundle --script run.sh
 scripts/ucl tail last
 scripts/ucl fetch last
@@ -20,38 +20,38 @@ work. Remote transfers use SSH/tar streams, not `scp`, `sftp`, or `rsync`.
 
 - `ucl status [target]` checks GPU availability, `/tmp` free space,
   `/tmp/ucl-machine-tools`, and restart policy.
-- `ucl doctor HOST` checks one host, tmux visibility, scratch state, and an
-  optional launch profile.
+- `ucl doctor HOST` checks one host, tmux visibility, and scratch state.
 - `ucl exec HOST -- COMMAND...` writes a tiny remote launcher and starts it in
   tmux. It reuses the single existing tmux session by default. If zero or
   multiple sessions exist, pass `--session NAME` or `--new-session`.
-- `ucl exec HOST --stdin` reads a bash script from stdin, avoiding nested quote
-  problems for multi-line commands.
-- `ucl run` uploads a local bundle, writes profile-aware launcher files, and
-  starts the bundle script in tmux.
+- `ucl exec HOST --stdin` reads a script from stdin, avoiding nested quote
+  problems for multi-line commands. Use `--shell csh` when the script needs to
+  source UCL `.csh` setup files.
+- `ucl run` uploads a local bundle, writes launcher files, and starts the bundle
+  script in tmux.
 - `ucl tail last`, `ucl fetch last`, and `ucl clean HOST` operate on recorded
   run metadata.
 
-## Profiles
+## Environment Setup
 
-Profiles are JSON and dependency-free. Load order is:
+The tool deliberately does not encode Python, PyTorch, uv, conda, or project
+setup. Put setup commands in the script you launch, or send them with
+`ucl exec --stdin`.
 
-```text
-configs/launch_profiles.json
-~/.config/ucl-machine-tools/launch_profiles.json
---profile-file PATH
-CLI --env values
+For UCL TSG Python setup:
+
+```bash
+scripts/ucl exec barbury-l --shell csh --new-session --session setup_torch --stdin <<'CSH'
+source /opt/Python/Python-3.11.5_Setup.csh
+pip install torch --user
+CSH
 ```
 
-Built-ins:
+For bash-native work, keep the default shell:
 
-- `plain-bash`: no setup.
-- `uv`: require `uv`, then run commands through `uv run --`.
-- `tsg-pytorch`: source TSG Python/CUDA setup and require torch CUDA.
-
-Profiles may use `extends`, `env`, `source`, `preflight`,
-`preflight_after_setup`, and `run_prefix`. Project-specific profiles should live
-in user or explicit profile files, not in this generic repo.
+```bash
+scripts/ucl exec barbury-l --new-session --session check_tmp -- df -h /tmp
+```
 
 ## Tmux Rules
 

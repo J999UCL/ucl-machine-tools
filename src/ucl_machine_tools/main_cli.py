@@ -20,20 +20,15 @@ from ucl_machine_tools.launch import (
     format_summary,
     launch_tmux,
     list_remote_sessions,
+    parse_env,
     upload_bundle,
     write_launcher_files,
 )
-from ucl_machine_tools.profiles import (
-    ResolvedProfile,
-    bash_export_lines,
-    csh_setenv_lines,
-    load_profiles,
-    parse_cli_env,
-    resolve_profiles,
-    shell_join,
-)
 from ucl_machine_tools.registry import RunRecord, read_record, write_record
 from ucl_machine_tools.ssh import ensure_knuckles_master
+
+TAIL_SENTINEL_BEGIN = "UCL_TAIL_TEXT_BEGIN"
+TAIL_SENTINEL_END = "UCL_TAIL_TEXT_END"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -44,13 +39,9 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("items", nargs="*", help="optional mode and target, e.g. recommend 3090ti")
     _add_inventory_flags(status)
 
-    doctor = subparsers.add_parser("doctor", help="Check one host and optional launch profile.")
+    doctor = subparsers.add_parser("doctor", help="Check one host, scratch, and tmux state.")
     doctor.add_argument("host")
     doctor.add_argument("--catalog", type=Path)
-    doctor.add_argument("--profile", action="append", default=[], help="profile to validate; repeatable")
-    doctor.add_argument("--profile-file", action="append", default=[], type=Path)
-    doctor.add_argument("--env", action="append", default=[])
-    doctor.add_argument("--gpu", help="GPU id to expose while checking profile")
     doctor.add_argument("--timeout-seconds", type=int, default=8)
 
     run = subparsers.add_parser("run", help="Upload a local bundle and launch it in tmux.")
@@ -64,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     exec_parser = subparsers.add_parser("exec", help="Run a small remote command inside tmux.")
     exec_parser.add_argument("host")
     _add_launch_common_flags(exec_parser)
-    exec_parser.add_argument("--stdin", action="store_true", help="read a bash script from stdin")
+    exec_parser.add_argument("--stdin", action="store_true", help="read a script from stdin")
 
     tail = subparsers.add_parser("tail", help="Print or follow a recorded run log.")
     tail.add_argument("run_ref", nargs="?", default="last")
@@ -101,10 +92,9 @@ def _add_inventory_flags(parser: argparse.ArgumentParser) -> None:
 
 def _add_launch_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--catalog", type=Path)
-    parser.add_argument("--profile", action="append", default=[])
-    parser.add_argument("--profile-file", action="append", default=[], type=Path)
     parser.add_argument("--env", action="append", default=[], help="remote env KEY=VALUE; repeat for multiple vars")
     parser.add_argument("--gpu", help="GPU id or auto")
+    parser.add_argument("--shell", choices=("bash", "csh"), default="bash", help="shell used for the generated payload")
     parser.add_argument("--session", help="tmux session to use or create")
     parser.add_argument("--new-session", action="store_true", help="force creating a new tmux session")
     parser.add_argument("--window", help="tmux window name")
@@ -151,12 +141,6 @@ def _best_free_gpu(row: dict[str, Any], *, min_free_vram_gb: float) -> str:
     return str(best.get("index", 0))
 
 
-def _resolve_profile(args: argparse.Namespace, *, extra_env: tuple[tuple[str, str], ...] = ()) -> ResolvedProfile:
-    profile_catalog = load_profiles(explicit_files=args.profile_file)
-    cli_env = (*parse_cli_env(args.env), *extra_env)
-    return resolve_profiles(args.profile, catalog=profile_catalog, cli_env=cli_env)
-
-
 def _gpu_env(
     args: argparse.Namespace,
     host: HostSpec,
@@ -171,6 +155,10 @@ def _gpu_env(
     rows = inventory.collect([host], runner=runner, jobs=1, min_free_vram_gb=min_free_vram_gb)
     gpu_id = _best_free_gpu(rows[0], min_free_vram_gb=min_free_vram_gb)
     return (("CUDA_VISIBLE_DEVICES", gpu_id),)
+
+
+def _resolve_env(args: argparse.Namespace, host: HostSpec, *, runner) -> tuple[tuple[str, str], ...]:
+    return (*parse_env(args.env), *_gpu_env(args, host, runner=runner))
 
 
 def _filter_status_rows(mode: str, args: argparse.Namespace, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -220,52 +208,15 @@ def run_status(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     return 0
 
 
-def _profile_check_script(profile: ResolvedProfile, gpu: str | None) -> tuple[list[str], str]:
-    env = profile.env
-    if gpu:
-        env = (*env, ("CUDA_VISIBLE_DEVICES", gpu))
-    bash_lines = [
-        "#!/usr/bin/env bash",
-        "set -Eeuo pipefail",
-        *bash_export_lines(env),
-    ]
-    for check in (*profile.preflight, *profile.preflight_after_setup):
-        bash_lines.append(f"echo {shlex.quote('[ucl] preflight: ' + check.label)}")
-        bash_lines.append(check.command)
-    bash_lines.append("echo '[ucl] profile check ok'")
-    bash_body = "\n".join(bash_lines) + "\n"
-    if profile.shell != "csh-bootstrap":
-        return ["bash", "-s"], bash_body
-    csh_lines = ["#!/bin/csh -f"]
-    for source_path in profile.source:
-        csh_lines.append(f"source {shlex.quote(source_path)}")
-    csh_lines.extend(csh_setenv_lines(env))
-    csh_lines.append("exec bash -s <<'UCL_PROFILE_BASH'")
-    csh_lines.append(bash_body)
-    csh_lines.append("UCL_PROFILE_BASH")
-    return ["csh", "-f"], "\n".join(csh_lines) + "\n"
-
-
 def run_doctor(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     host = _resolve_one_host(args.host, catalog_path=args.catalog)
-    profile = _resolve_profile(args)
     ensure_knuckles_master(runner=runner)
     row = inventory.collect([host], runner=runner, jobs=1, timeout_seconds=args.timeout_seconds)[0]
     sessions = list_remote_sessions(host, runner=runner)
-    argv_tail, script = _profile_check_script(profile, args.gpu)
-    proc = runner(["ssh", host.ssh_host, *argv_tail], input=script, capture_output=True, text=True, shell=False)
-    profile_ok = int(getattr(proc, "returncode", 1)) == 0
     print(f"host:          {host.name}")
     print(f"status:        {row.get('status')}")
     print(f"tmp_scratch:  {'yes' if (row.get('scratch') or {}).get('exists') else 'no'}")
     print(f"tmux_sessions: {', '.join(sessions) if sessions else 'none'}")
-    print(f"profile:       {','.join(profile.names)}")
-    print(f"profile_check: {'ok' if profile_ok else 'failed'}")
-    if not profile_ok:
-        detail = (getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip()
-        if detail:
-            print(detail)
-        return 2
     return 0
 
 
@@ -284,7 +235,7 @@ def _dry_run_summary(plan, *, subcommand: str) -> str:
             f"run_id:     {plan.run_id}",
             f"remote_dir: {plan.remote_dir}",
             f"log:        {plan.log_path}",
-            f"profile:    {','.join(plan.profile.names)}",
+            f"shell:      {plan.shell}",
             f"tmux:       {'new-session' if plan.new_session else (plan.requested_session or 'auto')}",
         ]
     )
@@ -293,13 +244,13 @@ def _dry_run_summary(plan, *, subcommand: str) -> str:
 def run_run(args: argparse.Namespace, *, runner=subprocess.run, popener=subprocess.Popen) -> int:
     host = _resolve_one_host(args.host, catalog_path=args.catalog)
     if args.dry_run:
-        profile = _resolve_profile(args)
         plan = build_run_plan(
             host=host,
             local_dir=args.local_dir,
             script=args.script,
-            profile=profile,
             args=tuple(args.arg),
+            env=parse_env(args.env),
+            shell=args.shell,
             session=args.session,
             new_session=args.new_session,
             window=args.window,
@@ -311,14 +262,14 @@ def run_run(args: argparse.Namespace, *, runner=subprocess.run, popener=subproce
         return 0
 
     ensure_knuckles_master(runner=runner)
-    gpu_env = _gpu_env(args, host, runner=runner)
-    profile = _resolve_profile(args, extra_env=gpu_env)
+    env = _resolve_env(args, host, runner=runner)
     plan = build_run_plan(
         host=host,
         local_dir=args.local_dir,
         script=args.script,
-        profile=profile,
         args=tuple(args.arg),
+        env=env,
+        shell=args.shell,
         session=args.session,
         new_session=args.new_session,
         window=args.window,
@@ -347,12 +298,12 @@ def run_exec(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     command = _strip_remainder(args.exec_command)
     stdin_body = sys.stdin.read() if args.stdin else None
     if args.dry_run:
-        profile = _resolve_profile(args)
         plan = build_exec_plan(
             host=host,
             command=command,
             stdin_body=stdin_body,
-            profile=profile,
+            env=parse_env(args.env),
+            shell=args.shell,
             session=args.session,
             new_session=args.new_session,
             window=args.window,
@@ -363,13 +314,13 @@ def run_exec(args: argparse.Namespace, *, runner=subprocess.run) -> int:
         return 0
 
     ensure_knuckles_master(runner=runner)
-    gpu_env = _gpu_env(args, host, runner=runner)
-    profile = _resolve_profile(args, extra_env=gpu_env)
+    env = _resolve_env(args, host, runner=runner)
     plan = build_exec_plan(
         host=host,
         command=command,
         stdin_body=stdin_body,
-        profile=profile,
+        env=env,
+        shell=args.shell,
         session=args.session,
         new_session=args.new_session,
         window=args.window,
@@ -407,12 +358,53 @@ def _record_from_plan(plan, decision) -> RunRecord:
     )
 
 
+def _tail_source(path: str, lines: int) -> str:
+    return f"""
+import collections
+import json
+import sys
+BEGIN={json.dumps(TAIL_SENTINEL_BEGIN)}
+END={json.dumps(TAIL_SENTINEL_END)}
+PATH={json.dumps(path)}
+LINES={int(lines)}
+print(BEGIN)
+with open(PATH, "r", encoding="utf-8", errors="replace") as handle:
+    for line in collections.deque(handle, maxlen=LINES):
+        sys.stdout.write(line)
+print(END)
+"""
+
+
+def _extract_tail(stdout: str) -> str:
+    lines = stdout.splitlines(keepends=True)
+    begin_idx = next((idx for idx, line in enumerate(lines) if line.strip() == TAIL_SENTINEL_BEGIN), None)
+    if begin_idx is None:
+        raise RuntimeError("tail sentinel not found")
+    end_idx = next((idx for idx in range(begin_idx + 1, len(lines)) if lines[idx].strip() == TAIL_SENTINEL_END), None)
+    if end_idx is None:
+        raise RuntimeError("tail sentinel end not found")
+    return "".join(lines[begin_idx + 1 : end_idx])
+
+
 def run_tail(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     record = read_record(args.run_ref)
     ensure_knuckles_master(runner=runner)
-    flag = "-f" if args.follow else f"-n {int(args.lines)}"
-    command = f"tail {flag} {shlex.quote(record.log_path)}"
-    proc = runner(["ssh", record.ssh_host, "bash", "-lc", f"'{command}'"], text=True, shell=False)
+    if args.follow:
+        flag = f"-n {int(args.lines)} -f"
+        command = f"tail {flag} {shlex.quote(record.log_path)}"
+        proc = runner(["ssh", record.ssh_host, "bash", "-lc", f"'{command}'"], text=True, shell=False)
+        return int(getattr(proc, "returncode", 0))
+    proc = runner(
+        ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", record.ssh_host, "python3", "-"],
+        input=_tail_source(record.log_path, int(args.lines)),
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
+    if int(getattr(proc, "returncode", 1)) != 0:
+        detail = (getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip()
+        raise RuntimeError(detail or "remote tail failed")
+    print(_extract_tail(getattr(proc, "stdout", "") or ""), end="")
     return int(getattr(proc, "returncode", 0))
 
 
@@ -470,7 +462,10 @@ def main(argv: list[str] | None = None, *, runner=subprocess.run, popener=subpro
     parser = build_parser()
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     parse_argv, exec_command = _split_exec_argv(raw_argv)
-    args = parser.parse_args(parse_argv)
+    try:
+        args = parser.parse_args(parse_argv)
+    except SystemExit as exc:
+        return int(exc.code or 0)
     if args.command == "exec":
         args.exec_command = exec_command
     try:

@@ -4,22 +4,15 @@ from __future__ import annotations
 
 import json
 import posixpath
+import re
 import shlex
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 from ucl_machine_tools.hosts import HostSpec
-from ucl_machine_tools.profiles import (
-    ResolvedProfile,
-    bash_export_lines,
-    csh_setenv_lines,
-    parse_cli_env,
-    shell_join,
-    validate_name,
-)
 
 
 Runner = Callable[..., subprocess.CompletedProcess]
@@ -27,12 +20,9 @@ Popener = Callable[..., subprocess.Popen]
 REMOTE_ROOT = "/tmp/ucl-machine-tools/launchers"
 TMUX_SENTINEL_BEGIN = "UCL_TMUX_JSON_BEGIN"
 TMUX_SENTINEL_END = "UCL_TMUX_JSON_END"
-
-
-def remote_bash_argv(host: HostSpec, command: str) -> list[str]:
-    if "'" in command:
-        raise ValueError("remote bash command must not contain single quotes; use stdin for complex scripts")
-    return ["ssh", host.ssh_host, "bash", "-lc", f"'{command}'"]
+SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+SUPPORTED_SHELLS = {"bash", "csh"}
 
 
 @dataclass(frozen=True)
@@ -43,7 +33,8 @@ class RemoteJobPlan:
     remote_dir: str
     log_path: str
     command: tuple[str, ...]
-    profile: ResolvedProfile
+    env: tuple[tuple[str, str], ...]
+    shell: str
     requested_session: str | None
     new_session: bool
     window: str
@@ -58,6 +49,48 @@ class TmuxDecision:
     session: str
     window: str
     existing_sessions: tuple[str, ...]
+
+
+def remote_bash_argv(host: HostSpec, command: str) -> list[str]:
+    if "'" in command:
+        raise ValueError("remote bash command must not contain single quotes; use stdin for complex scripts")
+    return ["ssh", host.ssh_host, "bash", "-lc", f"'{command}'"]
+
+
+def validate_name(value: str, label: str) -> None:
+    if not value or not SAFE_NAME_RE.match(value):
+        raise ValueError(f"{label} may only contain letters, numbers, dot, dash, and underscore: {value!r}")
+
+
+def validate_shell(shell: str) -> None:
+    if shell not in SUPPORTED_SHELLS:
+        raise ValueError(f"shell must be one of {sorted(SUPPORTED_SHELLS)}: {shell!r}")
+
+
+def parse_env(items: Iterable[str]) -> tuple[tuple[str, str], ...]:
+    parsed: list[tuple[str, str]] = []
+    for item in items:
+        if "=" not in item:
+            raise ValueError(f"env must be KEY=VALUE: {item!r}")
+        key, value = item.split("=", 1)
+        if not ENV_KEY_RE.match(key):
+            raise ValueError(f"invalid env key: {key!r}")
+        if "\x00" in value:
+            raise ValueError(f"env value for {key!r} must not contain NUL bytes")
+        parsed.append((key, value))
+    return tuple(parsed)
+
+
+def shell_join(tokens: Iterable[str]) -> str:
+    return " ".join(shlex.quote(token) for token in tokens)
+
+
+def bash_export_lines(env: Iterable[tuple[str, str]]) -> list[str]:
+    return [f"export {key}={shlex.quote(value)}" for key, value in env]
+
+
+def csh_setenv_lines(env: Iterable[tuple[str, str]]) -> list[str]:
+    return [f"setenv {key} {shlex.quote(value)}" for key, value in env]
 
 
 def utc_run_id(stem: str) -> str:
@@ -90,14 +123,36 @@ def resolve_script(local_dir: Path, script: str) -> str:
     return resolved.relative_to(root).as_posix()
 
 
+def _common_plan_values(
+    *,
+    stem: str,
+    session: str | None,
+    window: str | None,
+    remote_dir: str | None,
+    log_path: str | None,
+) -> tuple[str, str, str, str]:
+    run_id = session or utc_run_id(stem)
+    validate_name(run_id, "run_id")
+    if session is not None:
+        validate_name(session, "session")
+    window_name = window or stem or run_id
+    validate_name(window_name, "window")
+    final_remote_dir = posixpath.normpath(remote_dir or f"{REMOTE_ROOT}/{run_id}")
+    validate_remote_dir(final_remote_dir)
+    final_log_path = posixpath.normpath(log_path or posixpath.join(final_remote_dir, "run.log"))
+    if not final_log_path.startswith("/"):
+        raise ValueError(f"log path must be absolute: {final_log_path!r}")
+    return run_id, window_name, final_remote_dir, final_log_path
+
+
 def build_run_plan(
     *,
     host: HostSpec,
     local_dir: Path,
     script: str,
-    profile: ResolvedProfile,
     args: tuple[str, ...] = (),
-    env: tuple[str, ...] = (),
+    env: tuple[tuple[str, str], ...] = (),
+    shell: str = "bash",
     session: str | None = None,
     new_session: bool = False,
     window: str | None = None,
@@ -105,30 +160,24 @@ def build_run_plan(
     log_path: str | None = None,
     replace: bool = False,
 ) -> RemoteJobPlan:
+    validate_shell(shell)
     script_rel = resolve_script(local_dir, script)
-    command = (*profile.run_prefix, "bash", script_rel, *args)
-    run_id = session or utc_run_id(Path(script_rel).stem or "run")
-    validate_name(run_id, "run_id")
-    if session is not None:
-        validate_name(session, "session")
-    window_name = window or Path(script_rel).stem or run_id
-    validate_name(window_name, "window")
-    final_remote_dir = posixpath.normpath(remote_dir or f"{REMOTE_ROOT}/{run_id}")
-    validate_remote_dir(final_remote_dir)
-    final_log_path = posixpath.normpath(log_path or posixpath.join(final_remote_dir, "run.log"))
-    if not final_log_path.startswith("/"):
-        raise ValueError(f"log path must be absolute: {final_log_path!r}")
-    if env:
-        # CLI env has already been merged into the profile by the caller.
-        parse_cli_env(env)
+    run_id, window_name, final_remote_dir, final_log_path = _common_plan_values(
+        stem=Path(script_rel).stem or "run",
+        session=session,
+        window=window,
+        remote_dir=remote_dir,
+        log_path=log_path,
+    )
     return RemoteJobPlan(
         kind="run",
         host=host,
         run_id=run_id,
         remote_dir=final_remote_dir,
         log_path=final_log_path,
-        command=command,
-        profile=profile,
+        command=("bash", script_rel, *args),
+        env=env,
+        shell=shell,
         requested_session=session,
         new_session=new_session,
         window=window_name,
@@ -142,35 +191,34 @@ def build_exec_plan(
     host: HostSpec,
     command: tuple[str, ...] = (),
     stdin_body: str | None = None,
-    profile: ResolvedProfile,
+    env: tuple[tuple[str, str], ...] = (),
+    shell: str = "bash",
     session: str | None = None,
     new_session: bool = False,
     window: str | None = None,
     remote_dir: str | None = None,
     log_path: str | None = None,
 ) -> RemoteJobPlan:
+    validate_shell(shell)
     if bool(command) == bool(stdin_body is not None):
         raise ValueError("exec requires exactly one of command tokens or --stdin")
-    stem = command[0] if command else "stdin"
-    run_id = utc_run_id(f"exec_{stem}")
-    if session is not None:
-        validate_name(session, "session")
-    window_name = window or f"exec_{stem}"
-    validate_name(window_name, "window")
-    final_remote_dir = posixpath.normpath(remote_dir or f"{REMOTE_ROOT}/{run_id}")
-    validate_remote_dir(final_remote_dir)
-    final_log_path = posixpath.normpath(log_path or posixpath.join(final_remote_dir, "run.log"))
-    if not final_log_path.startswith("/"):
-        raise ValueError(f"log path must be absolute: {final_log_path!r}")
-    final_command = (*profile.run_prefix, *command) if command else ()
+    stem = f"exec_{command[0] if command else 'stdin'}"
+    run_id, window_name, final_remote_dir, final_log_path = _common_plan_values(
+        stem=stem,
+        session=session,
+        window=window,
+        remote_dir=remote_dir,
+        log_path=log_path,
+    )
     return RemoteJobPlan(
         kind="exec",
         host=host,
         run_id=run_id,
         remote_dir=final_remote_dir,
         log_path=final_log_path,
-        command=final_command,
-        profile=profile,
+        command=command,
+        env=env,
+        shell=shell,
         requested_session=session,
         new_session=new_session,
         window=window_name,
@@ -186,48 +234,50 @@ def _bash_payload_source(plan: RemoteJobPlan) -> str:
         f"mkdir -p {shlex.quote(posixpath.dirname(plan.log_path))}",
         f"exec > >(tee -a {shlex.quote(plan.log_path)}) 2>&1",
         "trap 'rc=$?; echo \"[ucl] failed rc=$rc line=$LINENO\"; exit $rc' ERR",
-        f"echo {shlex.quote('[ucl] profile: ' + ','.join(plan.profile.names))}",
-        *bash_export_lines(plan.profile.env),
+        "echo '[ucl] shell: bash'",
+        *bash_export_lines(plan.env),
+        "echo '[ucl] run'",
     ]
-    for check in (*plan.profile.preflight, *plan.profile.preflight_after_setup):
-        lines.append(f"echo {shlex.quote('[ucl] preflight: ' + check.label)}")
-        lines.append(check.command)
-    lines.append("echo '[ucl] run'")
-    if plan.stdin_body is not None:
-        if plan.profile.run_prefix:
-            lines.append(shell_join((*plan.profile.run_prefix, "bash")) + " <<'UCL_STDIN_SCRIPT'")
-            lines.append(plan.stdin_body)
-            lines.append("UCL_STDIN_SCRIPT")
-        else:
-            lines.append(plan.stdin_body)
-    else:
-        lines.append(shell_join(plan.command))
+    lines.append(plan.stdin_body if plan.stdin_body is not None else shell_join(plan.command))
     lines.append("")
     return "\n".join(lines)
 
 
-def _csh_launcher_source(plan: RemoteJobPlan) -> str:
-    bash_path = posixpath.join(plan.remote_dir, ".ucl_payload.sh")
+def _bash_csh_launcher_source(plan: RemoteJobPlan) -> str:
+    csh_path = posixpath.join(plan.remote_dir, ".ucl_payload.csh")
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -Eeuo pipefail",
+        f"cd {shlex.quote(plan.remote_dir)}",
+        f"mkdir -p {shlex.quote(posixpath.dirname(plan.log_path))}",
+        f"exec > >(tee -a {shlex.quote(plan.log_path)}) 2>&1",
+        "trap 'rc=$?; echo \"[ucl] failed rc=$rc line=$LINENO\"; exit $rc' ERR",
+        "echo '[ucl] shell: csh'",
+        f"csh -f {shlex.quote(csh_path)}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _csh_payload_source(plan: RemoteJobPlan) -> str:
     lines = [
         "#!/bin/csh -f",
         f"cd {shlex.quote(plan.remote_dir)}",
+        *csh_setenv_lines(plan.env),
+        "echo '[ucl] run'",
     ]
-    for source_path in plan.profile.source:
-        lines.append(f"source {shlex.quote(source_path)}")
-    lines.extend(csh_setenv_lines(plan.profile.env))
-    lines.append(f"exec bash {shlex.quote(bash_path)}")
+    lines.append(plan.stdin_body if plan.stdin_body is not None else shell_join(plan.command))
     lines.append("")
     return "\n".join(lines)
 
 
 def build_launcher_files(plan: RemoteJobPlan) -> tuple[str, dict[str, str]]:
-    bash_source = _bash_payload_source(plan)
-    if plan.profile.shell == "csh-bootstrap":
-        return ".ucl_launch.csh", {
-            ".ucl_payload.sh": bash_source,
-            ".ucl_launch.csh": _csh_launcher_source(plan),
+    if plan.shell == "csh":
+        return ".ucl_launch.sh", {
+            ".ucl_launch.sh": _bash_csh_launcher_source(plan),
+            ".ucl_payload.csh": _csh_payload_source(plan),
         }
-    return ".ucl_payload.sh", {".ucl_payload.sh": bash_source}
+    return ".ucl_payload.sh", {".ucl_payload.sh": _bash_payload_source(plan)}
 
 
 def build_remote_mkdir_command(remote_dir: str, *, replace: bool = False) -> str:
@@ -336,9 +386,9 @@ def decide_tmux(
 def build_tmux_launch_argv(host: HostSpec, plan: RemoteJobPlan, decision: TmuxDecision, launcher_name: str) -> list[str]:
     launcher_path = shlex.quote(posixpath.join(plan.remote_dir, launcher_name))
     launcher = f"csh -f {launcher_path}" if launcher_name.endswith(".csh") else f"bash {launcher_path}"
+    launcher_q = '"' + launcher.replace('"', '\\"') + '"'
     session_q = shlex.quote(decision.session)
     window_q = shlex.quote(decision.window)
-    launcher_q = '"' + launcher.replace('"', '\\"') + '"'
     if decision.mode == "new-session":
         command = f"tmux new-session -d -s {session_q} {launcher_q}"
     elif decision.mode == "new-window":

@@ -1,7 +1,7 @@
 [project]
 name = "ucl-machine-tools"
 version = "0.1.0"
-description = "UCL CS GPU status, profile, exec, and tmux launch tools"
+description = "UCL CS GPU status, exec, and tmux launch tools"
 requires-python = ">=3.10"
 dependencies = []
 

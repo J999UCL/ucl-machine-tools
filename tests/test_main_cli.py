@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from ucl_machine_tools import launch, main_cli
+from ucl_machine_tools.registry import RunRecord, write_record
 
 
 def ok(stdout: str = "", stderr: str = "") -> SimpleNamespace:
@@ -187,22 +188,22 @@ def test_ucl_exec_requires_explicit_session_when_no_existing_tmux(
     assert not any("cat >" in " ".join(call) for call in calls)
 
 
-def test_ucl_exec_stdin_profile_dry_run_reads_stdin(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+def test_ucl_exec_stdin_dry_run_reads_stdin(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     class FakeStdin:
         def read(self) -> str:
             return "echo hello\n"
 
     monkeypatch.setattr("sys.stdin", FakeStdin())
 
-    rc = main_cli.main(["exec", "barbury-l", "--profile", "uv", "--stdin", "--dry-run"])
+    rc = main_cli.main(["exec", "barbury-l", "--stdin", "--dry-run"])
 
     assert rc == 0
     out = capsys.readouterr().out
     assert "dry_run: true" in out
-    assert "profile:    uv" in out
+    assert "shell:      bash" in out
 
 
-def test_ucl_doctor_uses_profile_check(capsys: pytest.CaptureFixture[str]) -> None:
+def test_ucl_doctor_reports_host_state(capsys: pytest.CaptureFixture[str]) -> None:
     calls: list[list[str]] = []
 
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
@@ -214,15 +215,63 @@ def test_ucl_doctor_uses_profile_check(capsys: pytest.CaptureFixture[str]) -> No
             return ok(stdout=tmux_stdout(["work"]))
         if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=8", "barbury-l", "python3", "-"]:
             return ok(stdout=inventory_stdout())
-        if argv[-2:] == ["bash", "-s"]:
-            assert "[ucl] profile check ok" in kwargs["input"]
-            return ok(stdout="[ucl] profile check ok\n")
         raise AssertionError(f"unexpected argv: {argv}")
 
     assert main_cli.main(["doctor", "barbury-l"], runner=runner) == 0
 
     out = capsys.readouterr().out
-    assert "profile_check: ok" in out
+    assert "status:        ready" in out
+    assert "tmux_sessions: work" in out
+
+
+def test_profile_flags_are_rejected(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main_cli.main(["exec", "barbury-l", "--profile", "uv", "--dry-run", "--", "hostname"]) == 2
+    assert "--profile" in capsys.readouterr().err
+
+
+def test_ucl_tail_filters_login_noise(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
+    write_record(
+        RunRecord(
+            run_id="demo",
+            kind="exec",
+            host="barbury-l",
+            ssh_host="barbury-l",
+            session="demo",
+            window="exec_demo",
+            remote_dir="/tmp/ucl-machine-tools/launchers/demo",
+            log_path="/tmp/ucl-machine-tools/launchers/demo/run.log",
+            command=("hostname",),
+        )
+    )
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        assert kwargs.get("shell", False) is False
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+            assert "/tmp/ucl-machine-tools/launchers/demo/run.log" in kwargs["input"]
+            return ok(
+                stdout="\n".join(
+                    [
+                        "VBoxManage startup noise",
+                        main_cli.TAIL_SENTINEL_BEGIN,
+                        "actual log line",
+                        main_cli.TAIL_SENTINEL_END,
+                        "logout noise",
+                    ]
+                )
+                + "\n"
+            )
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["tail", "demo", "--lines", "5"], runner=runner) == 0
+
+    assert capsys.readouterr().out == "actual log line\n"
 
 
 def test_help_exposes_unified_commands_and_not_legacy_scripts(capsys: pytest.CaptureFixture[str]) -> None:
