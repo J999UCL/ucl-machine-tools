@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import shlex
 import subprocess
@@ -29,6 +30,10 @@ from ucl_machine_tools.ssh import ensure_knuckles_master
 
 TAIL_SENTINEL_BEGIN = "UCL_TAIL_TEXT_BEGIN"
 TAIL_SENTINEL_END = "UCL_TAIL_TEXT_END"
+FETCH_SENTINEL_BEGIN = "UCL_FETCH_TAR_BASE64_BEGIN"
+FETCH_SENTINEL_END = "UCL_FETCH_TAR_BASE64_END"
+CLEAN_SENTINEL_BEGIN = "UCL_CLEAN_JSON_BEGIN"
+CLEAN_SENTINEL_END = "UCL_CLEAN_JSON_END"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -403,27 +408,80 @@ print(END)
 """
 
 
-def _extract_tail(stdout: str) -> str:
+def _extract_between(stdout: str, begin: str, end: str, *, label: str) -> str:
     lines = stdout.splitlines(keepends=True)
-    begin_idx = next((idx for idx, line in enumerate(lines) if line.strip() == TAIL_SENTINEL_BEGIN), None)
+    begin_idx = next((idx for idx, line in enumerate(lines) if line.strip() == begin), None)
     if begin_idx is None:
-        raise RuntimeError("tail sentinel not found")
-    end_idx = next((idx for idx in range(begin_idx + 1, len(lines)) if lines[idx].strip() == TAIL_SENTINEL_END), None)
+        raise RuntimeError(f"{label} sentinel not found")
+    end_idx = next((idx for idx in range(begin_idx + 1, len(lines)) if lines[idx].strip() == end), None)
     if end_idx is None:
-        raise RuntimeError("tail sentinel end not found")
+        raise RuntimeError(f"{label} sentinel end not found")
     return "".join(lines[begin_idx + 1 : end_idx])
 
 
-def run_tail(args: argparse.Namespace, *, runner=subprocess.run) -> int:
+def _extract_tail(stdout: str) -> str:
+    return _extract_between(stdout, TAIL_SENTINEL_BEGIN, TAIL_SENTINEL_END, label="tail")
+
+
+def _tail_follow_source(path: str, lines: int) -> str:
+    return f"""
+import json
+import subprocess
+BEGIN={json.dumps(TAIL_SENTINEL_BEGIN)}
+PATH={json.dumps(path)}
+LINES={int(lines)}
+print(BEGIN, flush=True)
+raise SystemExit(subprocess.call(["tail", "-n", str(LINES), "-f", PATH]))
+"""
+
+
+def _strip_remote_noise(text: str) -> str:
+    noisy_markers = ("VBoxManage", "VirtualBox")
+    return "".join(line for line in text.splitlines(keepends=True) if not any(marker in line for marker in noisy_markers))
+
+
+def _ssh_python_argv(host: str) -> list[str]:
+    return ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", host, "python3", "-"]
+
+
+def run_tail(args: argparse.Namespace, *, runner=subprocess.run, popener=subprocess.Popen) -> int:
     record = read_record(args.run_ref)
     ensure_knuckles_master(runner=runner)
     if args.follow:
-        flag = f"-n {int(args.lines)} -f"
-        command = f"tail {flag} {shlex.quote(record.log_path)}"
-        proc = runner(["ssh", record.ssh_host, "bash", "-lc", f"'{command}'"], text=True, shell=False)
-        return int(getattr(proc, "returncode", 0))
+        proc = popener(
+            _ssh_python_argv(record.ssh_host),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if proc.stdin is None or proc.stdout is None:
+            raise RuntimeError("failed to open remote tail pipes")
+        proc.stdin.write(_tail_follow_source(record.log_path, int(args.lines)))
+        proc.stdin.close()
+        started = False
+        try:
+            while True:
+                line = proc.stdout.readline()
+                if line == "":
+                    break
+                if not started:
+                    if line.strip() == TAIL_SENTINEL_BEGIN:
+                        started = True
+                    continue
+                print(line, end="", flush=True)
+        except KeyboardInterrupt:
+            proc.terminate()
+            return 130
+        returncode = int(proc.wait())
+        stderr = ""
+        if proc.stderr is not None:
+            stderr = _strip_remote_noise(proc.stderr.read())
+        if returncode != 0 and stderr:
+            print(stderr, file=sys.stderr, end="")
+        return returncode
     proc = runner(
-        ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", record.ssh_host, "python3", "-"],
+        _ssh_python_argv(record.ssh_host),
         input=_tail_source(record.log_path, int(args.lines)),
         capture_output=True,
         text=True,
@@ -441,40 +499,100 @@ def run_fetch(args: argparse.Namespace, *, runner=subprocess.run, popener=subpro
     output_dir = args.output_dir or Path("ucl-fetch") / record.run_id
     output_dir.mkdir(parents=True, exist_ok=True)
     ensure_knuckles_master(runner=runner)
-    remote_dir_q = shlex.quote(record.remote_dir)
-    command = (
-        "set -euo pipefail; "
-        f"cd {remote_dir_q}; "
-        "find . -type f -regex \"./.*\\(\\.log\\|\\.json\\|\\.jsonl\\|\\.yaml\\|\\.yml\\|\\.txt\\|/.ucl_.*\\)\" "
-        "-print0 | tar --null -T - -cf -"
+    proc = runner(
+        _ssh_python_argv(record.ssh_host),
+        input=_fetch_source(record.remote_dir),
+        capture_output=True,
+        text=True,
+        shell=False,
     )
-    remote = popener(["ssh", record.ssh_host, "bash", "-lc", f"'{command}'"], stdout=subprocess.PIPE)
-    try:
-        proc = runner(["tar", "-xf", "-", "-C", str(output_dir)], stdin=remote.stdout, capture_output=True, shell=False)
-        if remote.stdout is not None:
-            remote.stdout.close()
-        remote_rc = remote.wait()
-    finally:
-        if remote.stdout is not None and not remote.stdout.closed:
-            remote.stdout.close()
-    if remote_rc != 0:
-        raise RuntimeError(f"remote tar failed with exit {remote_rc}")
     if int(getattr(proc, "returncode", 1)) != 0:
-        raise RuntimeError((getattr(proc, "stderr", b"") or b"").decode(errors="replace").strip() or "local tar failed")
+        detail = _strip_remote_noise((getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip())
+        raise RuntimeError(detail or "remote fetch failed")
+    tar_data = base64.b64decode(_extract_between(getattr(proc, "stdout", "") or "", FETCH_SENTINEL_BEGIN, FETCH_SENTINEL_END, label="fetch"))
+    local = runner(["tar", "-xf", "-", "-C", str(output_dir)], input=tar_data, capture_output=True, shell=False)
+    if int(getattr(local, "returncode", 1)) != 0:
+        raise RuntimeError((getattr(local, "stderr", b"") or b"").decode(errors="replace").strip() or "local tar failed")
     print(output_dir)
     return 0
+
+
+def _fetch_source(remote_dir: str) -> str:
+    return f"""
+import base64
+import io
+import json
+import os
+import tarfile
+import sys
+BEGIN={json.dumps(FETCH_SENTINEL_BEGIN)}
+END={json.dumps(FETCH_SENTINEL_END)}
+REMOTE_DIR={json.dumps(remote_dir)}
+SUFFIXES=(".log", ".json", ".jsonl", ".yaml", ".yml", ".txt")
+buf = io.BytesIO()
+with tarfile.open(fileobj=buf, mode="w") as tar:
+    if os.path.isdir(REMOTE_DIR):
+        for root, _, files in os.walk(REMOTE_DIR):
+            for name in sorted(files):
+                path = os.path.join(root, name)
+                rel = os.path.relpath(path, REMOTE_DIR)
+                base = os.path.basename(rel)
+                if rel.endswith(SUFFIXES) or base.startswith(".ucl_"):
+                    tar.add(path, arcname=rel, recursive=False)
+print(BEGIN)
+sys.stdout.write(base64.b64encode(buf.getvalue()).decode("ascii"))
+sys.stdout.write("\\n")
+print(END)
+"""
 
 
 def run_clean(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     host = _resolve_one_host(args.host, catalog_path=args.catalog)
     ensure_knuckles_master(runner=runner)
-    days = int(args.older_than_days)
-    action = "-delete" if args.execute else "-print"
-    command = f"find /tmp/ucl-machine-tools/launchers -mindepth 1 -maxdepth 1 -type d -mtime +{days} {action} 2>/dev/null || true"
-    proc = runner(["ssh", host.ssh_host, "bash", "-lc", f"'{command}'"], capture_output=True, text=True, shell=False)
-    if getattr(proc, "stdout", ""):
-        print(proc.stdout, end="")
+    proc = runner(
+        _ssh_python_argv(host.ssh_host),
+        input=_clean_source(int(args.older_than_days), bool(args.execute)),
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
+    if int(getattr(proc, "returncode", 1)) != 0:
+        detail = _strip_remote_noise((getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip())
+        raise RuntimeError(detail or "remote clean failed")
+    payload = json.loads(_extract_between(getattr(proc, "stdout", "") or "", CLEAN_SENTINEL_BEGIN, CLEAN_SENTINEL_END, label="clean"))
+    for path in payload.get("paths", []):
+        print(path)
     return int(getattr(proc, "returncode", 0))
+
+
+def _clean_source(days: int, execute: bool) -> str:
+    return f"""
+import json
+import os
+import shutil
+import time
+BEGIN={json.dumps(CLEAN_SENTINEL_BEGIN)}
+END={json.dumps(CLEAN_SENTINEL_END)}
+ROOT="/tmp/ucl-machine-tools/launchers"
+DAYS={int(days)}
+EXECUTE={bool(execute)!r}
+cutoff = time.time() - DAYS * 86400
+paths = []
+if os.path.isdir(ROOT):
+    for name in sorted(os.listdir(ROOT)):
+        path = os.path.join(ROOT, name)
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        if os.path.isdir(path) and stat.st_mtime < cutoff:
+            paths.append(path)
+            if EXECUTE:
+                shutil.rmtree(path)
+print(BEGIN)
+print(json.dumps({{"schema_version": 1, "paths": paths}}, sort_keys=True))
+print(END)
+"""
 
 
 def _split_exec_argv(argv: list[str]) -> tuple[list[str], tuple[str, ...]]:
@@ -506,7 +624,7 @@ def main(argv: list[str] | None = None, *, runner=subprocess.run, popener=subpro
         if args.command == "exec":
             return run_exec(args, runner=runner)
         if args.command == "tail":
-            return run_tail(args, runner=runner)
+            return run_tail(args, runner=runner, popener=popener)
         if args.command == "fetch":
             return run_fetch(args, runner=runner, popener=popener)
         if args.command == "clean":

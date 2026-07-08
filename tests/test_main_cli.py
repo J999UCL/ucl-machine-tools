@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
+import io
 import json
+import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -272,6 +275,171 @@ def test_ucl_tail_filters_login_noise(
     assert main_cli.main(["tail", "demo", "--lines", "5"], runner=runner) == 0
 
     assert capsys.readouterr().out == "actual log line\n"
+
+
+def test_ucl_tail_follow_filters_login_noise(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
+    write_record(
+        RunRecord(
+            run_id="demo",
+            kind="exec",
+            host="barbury-l",
+            ssh_host="barbury-l",
+            session="demo",
+            window="exec_demo",
+            remote_dir="/tmp/ucl-machine-tools/launchers/demo",
+            log_path="/tmp/ucl-machine-tools/launchers/demo/run.log",
+            command=("hostname",),
+        )
+    )
+
+    class FakePipe:
+        def __init__(self, lines: list[str] | None = None, text: str = "") -> None:
+            self.lines = lines or []
+            self.text = text
+            self.writes: list[str] = []
+
+        def write(self, value: str) -> None:
+            self.writes.append(value)
+
+        def close(self) -> None:
+            pass
+
+        def readline(self) -> str:
+            return self.lines.pop(0) if self.lines else ""
+
+        def read(self) -> str:
+            return self.text
+
+    class FakeFollowPopen:
+        def __init__(self, argv: list[str], **kwargs: Any) -> None:
+            assert argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]
+            self.stdin = FakePipe()
+            self.stdout = FakePipe(
+                [
+                    "VBoxManage: error: startup noise\n",
+                    main_cli.TAIL_SENTINEL_BEGIN + "\n",
+                    "actual follow line\n",
+                ]
+            )
+            self.stderr = FakePipe(text="VBoxManage: error: stderr noise\n")
+
+        def wait(self) -> int:
+            return 0
+
+        def terminate(self) -> None:
+            pass
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["tail", "demo", "--follow"], runner=runner, popener=FakeFollowPopen) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == "actual follow line\n"
+    assert "VBoxManage" not in captured.out
+    assert "VBoxManage" not in captured.err
+
+
+def test_ucl_fetch_filters_login_noise(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
+    write_record(
+        RunRecord(
+            run_id="demo",
+            kind="run",
+            host="barbury-l",
+            ssh_host="barbury-l",
+            session="demo",
+            window="run",
+            remote_dir="/tmp/ucl-machine-tools/launchers/demo",
+            log_path="/tmp/ucl-machine-tools/launchers/demo/run.log",
+            command=("bash", "run.sh"),
+        )
+    )
+    tar_buf = io.BytesIO()
+    with tarfile.open(fileobj=tar_buf, mode="w") as tar:
+        data = b"ok\n"
+        info = tarfile.TarInfo("run.log")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    encoded = base64.b64encode(tar_buf.getvalue()).decode("ascii")
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        calls.append(argv)
+        assert kwargs.get("shell", False) is False
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+            assert "/tmp/ucl-machine-tools/launchers/demo" in kwargs["input"]
+            return ok(
+                stdout="\n".join(
+                    [
+                        "VBoxManage: error: startup noise",
+                        main_cli.FETCH_SENTINEL_BEGIN,
+                        encoded,
+                        main_cli.FETCH_SENTINEL_END,
+                    ]
+                )
+                + "\n"
+            )
+        if argv[:2] == ["tar", "-xf"]:
+            assert kwargs["input"].startswith(b"././@PaxHeader") or kwargs["input"]
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["fetch", "demo", "--output-dir", str(tmp_path / "out")], runner=runner) == 0
+
+    captured = capsys.readouterr()
+    assert "VBoxManage" not in captured.out
+    assert "VBoxManage" not in captured.err
+    assert str(tmp_path / "out") in captured.out
+
+
+def test_ucl_clean_filters_login_noise(capsys: pytest.CaptureFixture[str]) -> None:
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        assert kwargs.get("shell", False) is False
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+            assert "DAYS=7" in kwargs["input"]
+            return ok(
+                stdout="\n".join(
+                    [
+                        "VBoxManage: error: startup noise",
+                        main_cli.CLEAN_SENTINEL_BEGIN,
+                        json.dumps({"schema_version": 1, "paths": ["/tmp/ucl-machine-tools/launchers/old"]}),
+                        main_cli.CLEAN_SENTINEL_END,
+                    ]
+                )
+                + "\n"
+            )
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["clean", "barbury-l"], runner=runner) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == "/tmp/ucl-machine-tools/launchers/old\n"
+    assert "VBoxManage" not in captured.out
+    assert "VBoxManage" not in captured.err
+
+
+def test_generated_remote_python_sources_compile() -> None:
+    compile(main_cli._tail_source("/tmp/demo/run.log", 20), "<tail-source>", "exec")
+    compile(main_cli._tail_follow_source("/tmp/demo/run.log", 20), "<tail-follow-source>", "exec")
+    compile(main_cli._fetch_source("/tmp/demo"), "<fetch-source>", "exec")
+    compile(main_cli._clean_source(7, False), "<clean-source>", "exec")
+    compile(main_cli._clean_source(7, True), "<clean-source-execute>", "exec")
 
 
 def test_help_exposes_unified_commands_and_not_legacy_scripts(capsys: pytest.CaptureFixture[str]) -> None:
