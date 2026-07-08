@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import base64
 import io
 import json
+import re
 import tarfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -57,6 +59,39 @@ def inventory_stdout(host: str = "barbury-l", *, busy: bool = False) -> str:
             "UCL_INVENTORY_JSON_END",
         ]
     )
+
+
+def exec_stdout(
+    *,
+    stdout: bytes = b"",
+    stderr: bytes = b"",
+    returncode: int = 0,
+    timed_out: bool = False,
+    outside_noise: str = "VBoxManage: error: wrapper noise\n",
+) -> str:
+    payload = {
+        "schema_version": 1,
+        "returncode": returncode,
+        "stdout_b64": base64.b64encode(stdout).decode("ascii"),
+        "stderr_b64": base64.b64encode(stderr).decode("ascii"),
+        "timed_out": timed_out,
+        "wrapper_error": False,
+    }
+    return "\n".join(
+        [
+            outside_noise.rstrip("\n"),
+            main_cli.EXEC_SENTINEL_BEGIN,
+            json.dumps(payload),
+            main_cli.EXEC_SENTINEL_END,
+            "logout noise",
+        ]
+    )
+
+
+def embedded_exec_params(source: str) -> dict[str, Any]:
+    match = re.search(r"PARAMS=json\.loads\((?P<literal>.*)\)", source)
+    assert match is not None
+    return json.loads(ast.literal_eval(match.group("literal")))
 
 
 def make_bundle(tmp_path: Path) -> Path:
@@ -141,7 +176,157 @@ def test_ucl_run_full_fake_path_writes_registry(
     assert json.loads(latest.read_text(encoding="utf-8"))["kind"] == "run"
 
 
-def test_ucl_exec_defaults_to_single_existing_tmux_session(
+def test_ucl_exec_sync_command_prints_output_and_preserves_argv(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        calls.append(argv)
+        assert kwargs.get("shell", False) is False
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+            source = kwargs["input"]
+            assert embedded_exec_params(source)["argv"] == ["python3", "-c", 'print("hi")', "--remote-flag"]
+            assert "shell=True" not in source
+            return ok(stdout=exec_stdout(stdout=b"hi\n", stderr=b"VirtualBox from command stderr\n"))
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["exec", "barbury-l", "python3", "-c", 'print("hi")', "--remote-flag"], runner=runner) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == "hi\n"
+    assert captured.err == "VirtualBox from command stderr\n"
+    assert not any("UCL_TMUX_JSON_BEGIN" in str(call) for call in calls)
+
+
+def test_ucl_exec_sync_supports_options_cwd_json_timeout_and_gpu_auto(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        calls.append(argv)
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=8", "barbury-l", "python3", "-"]:
+            return ok(stdout=inventory_stdout())
+        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+            source = kwargs["input"]
+            params = embedded_exec_params(source)
+            assert params["cwd"] == "/tmp"
+            assert params["timeout"] == 1.0
+            assert params["env"]["CUDA_VISIBLE_DEVICES"] == "0"
+            return ok(stdout=exec_stdout(stdout=b"/tmp\n", returncode=0))
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    rc = main_cli.main(
+        ["exec", "barbury-l", "--gpu", "auto", "--cwd", "/tmp", "--timeout", "1", "--json", "pwd"],
+        runner=runner,
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stdout"] == "/tmp\n"
+    assert payload["stderr"] == ""
+    assert payload["returncode"] == 0
+    assert payload["timed_out"] is False
+
+
+def test_ucl_exec_sync_accepts_delimiter_for_dash_command_and_timeout_zero(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+            params = embedded_exec_params(kwargs["input"])
+            assert params["argv"] == ["-remote-command", "arg"]
+            assert params["timeout"] == 0.0
+            return ok(stdout=exec_stdout(stdout=b"dash-ok\n"))
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["exec", "barbury-l", "--timeout", "0", "--", "-remote-command", "arg"], runner=runner) == 0
+    assert capsys.readouterr().out == "dash-ok\n"
+
+
+def test_ucl_exec_sync_returns_remote_nonzero_and_timeout(capsys: pytest.CaptureFixture[str]) -> None:
+    responses = [
+        exec_stdout(stderr=b"bad\n", returncode=7),
+        exec_stdout(stderr=b"ucl exec timed out after 1.0 seconds\n", returncode=124, timed_out=True),
+    ]
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+            return ok(stdout=responses.pop(0))
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["exec", "barbury-l", "false"], runner=runner) == 7
+    assert capsys.readouterr().err == "bad\n"
+    assert main_cli.main(["exec", "barbury-l", "--timeout", "1", "sleep", "5"], runner=runner) == 124
+    assert "timed out" in capsys.readouterr().err
+
+
+def test_ucl_exec_sync_stdin_uses_selected_shell(capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeStdin:
+        def read(self) -> str:
+            return "echo hello\n"
+
+    monkeypatch.setattr("sys.stdin", FakeStdin())
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+            source = kwargs["input"]
+            params = embedded_exec_params(source)
+            assert params["mode"] == "stdin"
+            assert params["shell"] == "csh"
+            assert params["stdin_b64"] == base64.b64encode(b"echo hello\n").decode("ascii")
+            return ok(stdout=exec_stdout(stdout=b"hello\n"))
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["exec", "barbury-l", "--shell", "csh", "--stdin"], runner=runner) == 0
+    assert capsys.readouterr().out == "hello\n"
+
+
+def test_ucl_exec_stdin_dry_run_reads_stdin(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    class FakeStdin:
+        def read(self) -> str:
+            return "echo hello\n"
+
+    monkeypatch.setattr("sys.stdin", FakeStdin())
+
+    rc = main_cli.main(["exec", "barbury-l", "--stdin", "--dry-run"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "dry_run: true" in out
+    assert "mode:       sync" in out
+    assert "shell:      bash" in out
+
+
+def test_ucl_exec_rejects_bad_command_shapes(capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeStdin:
+        def read(self) -> str:
+            return "echo hello\n"
+
+    monkeypatch.setattr("sys.stdin", FakeStdin())
+
+    assert main_cli.main(["exec", "barbury-l"]) == 2
+    assert "no remote command provided" in capsys.readouterr().err
+    assert main_cli.main(["exec", "barbury-l", "--stdin", "hostname"]) == 2
+    assert "--stdin cannot be used with COMMAND" in capsys.readouterr().err
+    assert main_cli.main(["exec", "barbury-l", "--session", "work", "hostname"]) == 2
+    assert "require --detach" in capsys.readouterr().err
+    assert main_cli.main(["exec", "barbury-l", "--unknown", "hostname"]) == 2
+    assert "unknown ucl exec option" in capsys.readouterr().err
+
+
+def test_ucl_exec_detach_preserves_tmux_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -166,13 +351,13 @@ def test_ucl_exec_defaults_to_single_existing_tmux_session(
             return ok()
         raise AssertionError(f"unexpected argv: {argv}")
 
-    assert main_cli.main(["exec", "barbury-l", "--", "hostname"], runner=runner) == 0
+    assert main_cli.main(["exec", "barbury-l", "--detach", "--", "hostname"], runner=runner) == 0
 
     assert "session:    work" in capsys.readouterr().out
     assert any("tmux new-window" in " ".join(call) for call in calls)
 
 
-def test_ucl_exec_requires_explicit_session_when_no_existing_tmux(
+def test_ucl_exec_detach_requires_explicit_session_when_no_existing_tmux(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     calls: list[list[str]] = []
@@ -185,25 +370,10 @@ def test_ucl_exec_requires_explicit_session_when_no_existing_tmux(
             return ok(stdout=tmux_stdout([]))
         raise AssertionError(f"unexpected argv after failed tmux decision: {argv}")
 
-    assert main_cli.main(["exec", "barbury-l", "--", "hostname"], runner=runner) == 2
+    assert main_cli.main(["exec", "barbury-l", "--detach", "--", "hostname"], runner=runner) == 2
 
     assert "no tmux sessions exist" in capsys.readouterr().err
     assert not any("cat >" in " ".join(call) for call in calls)
-
-
-def test_ucl_exec_stdin_dry_run_reads_stdin(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    class FakeStdin:
-        def read(self) -> str:
-            return "echo hello\n"
-
-    monkeypatch.setattr("sys.stdin", FakeStdin())
-
-    rc = main_cli.main(["exec", "barbury-l", "--stdin", "--dry-run"])
-
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert "dry_run: true" in out
-    assert "shell:      bash" in out
 
 
 def test_ucl_doctor_reports_host_state(capsys: pytest.CaptureFixture[str]) -> None:
@@ -435,6 +605,11 @@ def test_ucl_clean_filters_login_noise(capsys: pytest.CaptureFixture[str]) -> No
 
 
 def test_generated_remote_python_sources_compile() -> None:
+    compile(
+        main_cli._sync_exec_source({"mode": "command", "argv": ["hostname"], "timeout": 60.0}),
+        "<exec-source>",
+        "exec",
+    )
     compile(main_cli._tail_source("/tmp/demo/run.log", 20), "<tail-source>", "exec")
     compile(main_cli._tail_follow_source("/tmp/demo/run.log", 20), "<tail-follow-source>", "exec")
     compile(main_cli._fetch_source("/tmp/demo"), "<fetch-source>", "exec")
@@ -450,7 +625,8 @@ def test_help_exposes_unified_commands_and_not_legacy_scripts(capsys: pytest.Cap
     assert "status" in help_text
     assert "exec" in help_text
     assert "Common use:" in help_text
-    assert "ucl exec barbury-l -- df -h /tmp" in help_text
+    assert "ucl exec barbury-l df -h /tmp" in help_text
+    assert "ucl exec barbury-l --detach -- hostname" in help_text
     assert "ucl run --host barbury-l --gpu auto" in help_text
     assert "Use 'ucl COMMAND --help'" in help_text
     assert "ucl-inventory" not in help_text

@@ -6,8 +6,10 @@ script launches.
 ```bash
 scripts/ucl status 3090ti
 scripts/ucl doctor barbury-l
-scripts/ucl exec barbury-l -- hostname
+scripts/ucl exec barbury-l hostname
+scripts/ucl exec barbury-l --cwd /tmp --timeout 60 pwd
 scripts/ucl exec barbury-l --shell csh --stdin < setup_python.csh
+scripts/ucl exec barbury-l --detach --new-session -- hostname
 scripts/ucl run --host barbury-l --local-dir ./bundle --script run.sh
 scripts/ucl tail last
 scripts/ucl fetch last
@@ -21,12 +23,14 @@ work. Remote transfers use SSH/tar streams, not `scp`, `sftp`, or `rsync`.
 - `ucl status [target]` checks GPU availability, `/tmp` free space,
   `/tmp/ucl-machine-tools`, and restart policy.
 - `ucl doctor HOST` checks one host, tmux visibility, and scratch state.
-- `ucl exec HOST -- COMMAND...` writes a tiny remote launcher and starts it in
-  tmux. It reuses the single existing tmux session by default. If zero or
-  multiple sessions exist, pass `--session NAME` or `--new-session`.
-- `ucl exec HOST --stdin` reads a script from stdin, avoiding nested quote
-  problems for multi-line commands. Use `--shell csh` when the script needs to
-  source UCL `.csh` setup files.
+- `ucl exec HOST COMMAND...` runs a short remote command synchronously and
+  prints stdout/stderr directly. Use `--cwd DIR`, `--timeout SECONDS`, or
+  `--json` when helpful.
+- `ucl exec HOST --stdin` runs a stdin script synchronously, avoiding nested
+  quote problems for multi-line commands. Use `--shell csh` when the script
+  needs to source UCL `.csh` setup files.
+- `ucl exec HOST --detach -- COMMAND...` uses the old tmux-backed async path
+  and records the run for `tail`/`fetch`.
 - `ucl run` uploads a local bundle, writes launcher files, and starts the bundle
   script in tmux.
 - `ucl tail last`, `ucl fetch last`, and `ucl clean HOST` operate on recorded
@@ -41,7 +45,7 @@ setup. Put setup commands in the script you launch, or send them with
 For UCL TSG Python setup:
 
 ```bash
-scripts/ucl exec barbury-l --shell csh --new-session --session setup_torch --stdin <<'CSH'
+scripts/ucl exec barbury-l --shell csh --stdin <<'CSH'
 source /opt/Python/Python-3.11.5_Setup.csh
 pip install torch --user
 CSH
@@ -50,19 +54,20 @@ CSH
 For bash-native work, keep the default shell:
 
 ```bash
-scripts/ucl exec barbury-l --new-session --session check_tmp -- df -h /tmp
+scripts/ucl exec barbury-l df -h /tmp
 ```
 
 ## Tmux Rules
 
-`ucl exec` is intentionally conservative:
+`ucl exec` only uses tmux when `--detach` is passed. Detached exec is
+intentionally conservative:
 
 - one existing session: launch a new window there
 - zero sessions: fail unless `--session` or `--new-session` is passed
 - multiple sessions: fail unless `--session` or `--new-session` is passed
 
 `ucl run` may create a generated session when no tmux session exists, because it
-is the long-job launch path.
+is always the long-job launch path.
 
 ## TSG Restart Notes
 

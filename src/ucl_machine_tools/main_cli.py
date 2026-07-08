@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import base64
 import json
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -34,6 +33,8 @@ FETCH_SENTINEL_BEGIN = "UCL_FETCH_TAR_BASE64_BEGIN"
 FETCH_SENTINEL_END = "UCL_FETCH_TAR_BASE64_END"
 CLEAN_SENTINEL_BEGIN = "UCL_CLEAN_JSON_BEGIN"
 CLEAN_SENTINEL_END = "UCL_CLEAN_JSON_END"
+EXEC_SENTINEL_BEGIN = "UCL_EXEC_JSON_BEGIN"
+EXEC_SENTINEL_END = "UCL_EXEC_JSON_END"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,12 +49,16 @@ Common use:
       Pick the best currently usable matching host.
   ucl doctor barbury-l
       Check one host, scratch state, and tmux sessions before work.
-  ucl exec barbury-l -- df -h /tmp
-      Run a short tmux-backed remote check without SSH quoting.
+  ucl exec barbury-l df -h /tmp
+      Run a short remote check and print output now.
+  ucl exec barbury-l --cwd /tmp --timeout 60 pwd
+      Run from a remote directory with a bounded timeout.
   ucl exec barbury-l --stdin < check.sh
-      Run a multi-line bash snippet from stdin.
+      Run a multi-line bash snippet from stdin and print output now.
   ucl exec barbury-l --shell csh --stdin < check_torch.csh
       Run UCL/TSG csh setup snippets, such as Python/CUDA setup.
+  ucl exec barbury-l --detach -- hostname
+      Launch a small command in tmux and record it like a run.
   ucl run --host barbury-l --gpu auto --local-dir ./bundle --script run.sh
       Upload a local bundle and launch its script in tmux.
   ucl tail last
@@ -85,10 +90,8 @@ Use 'ucl COMMAND --help' for command-specific flags.
     run.add_argument("--arg", action="append", default=[], help="script argument; repeat for multiple args")
     run.add_argument("--replace", action="store_true", help="replace an existing non-empty remote bundle dir")
 
-    exec_parser = subparsers.add_parser("exec", help="Run a small remote command inside tmux.")
-    exec_parser.add_argument("host")
-    _add_launch_common_flags(exec_parser)
-    exec_parser.add_argument("--stdin", action="store_true", help="read a script from stdin")
+    exec_parser = subparsers.add_parser("exec", help="Run a small remote command or snippet.")
+    _configure_exec_parser(exec_parser)
 
     tail = subparsers.add_parser("tail", help="Print or follow a recorded run log.")
     tail.add_argument("run_ref", nargs="?", default="last")
@@ -134,6 +137,162 @@ def _add_launch_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--remote-dir", help="remote bundle dir under /tmp/ucl-machine-tools/launchers")
     parser.add_argument("--log", help="remote log path; default is <remote-dir>/run.log")
     parser.add_argument("--dry-run", action="store_true")
+
+
+def _configure_exec_parser(parser: argparse.ArgumentParser) -> None:
+    parser.formatter_class = argparse.RawDescriptionHelpFormatter
+    parser.description = "Run a small remote command/snippet; synchronous by default."
+    parser.epilog = """\
+Examples:
+  ucl exec barbury-l df -h /tmp
+  ucl exec barbury-l -- python3 -c 'print("hi")'
+  ucl exec barbury-l --cwd /tmp --timeout 60 pwd
+  ucl exec barbury-l --stdin < check.sh
+  ucl exec barbury-l --shell csh --stdin < check_torch.csh
+  ucl exec barbury-l --detach --new-session -- hostname
+"""
+    parser.add_argument("host")
+    parser.add_argument("--catalog", type=Path)
+    parser.add_argument("--env", action="append", default=[], help="remote env KEY=VALUE; repeat for multiple vars")
+    parser.add_argument("--gpu", help="GPU id or auto")
+    parser.add_argument("--shell", choices=("bash", "csh"), default="bash", help="shell used only with --stdin")
+    parser.add_argument("--stdin", action="store_true", help="read a script from stdin")
+    parser.add_argument("--timeout", type=float, default=60.0, help="remote command timeout in seconds; 0 disables")
+    parser.add_argument("--cwd", help="remote working directory for synchronous exec")
+    parser.add_argument("--json", action="store_true", help="emit returncode/stdout/stderr as JSON")
+    parser.add_argument("--detach", action="store_true", help="launch in tmux and record a run instead of printing output now")
+    parser.add_argument("--session", help="tmux session to use or create; requires --detach")
+    parser.add_argument("--new-session", action="store_true", help="force creating a new tmux session; requires --detach")
+    parser.add_argument("--window", help="tmux window name; requires --detach")
+    parser.add_argument("--remote-dir", help="remote bundle dir under /tmp/ucl-machine-tools/launchers; requires --detach")
+    parser.add_argument("--log", help="remote log path; requires --detach")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("exec_command", nargs=argparse.REMAINDER, metavar="COMMAND")
+
+
+def _build_exec_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="ucl exec")
+    _configure_exec_parser(parser)
+    return parser
+
+
+def _parse_exec_argv(tokens: list[str]) -> argparse.Namespace:
+    parser = _build_exec_parser()
+    if not tokens or tokens[0] in {"-h", "--help"}:
+        return parser.parse_args(tokens)
+    host = tokens[0]
+    if host.startswith("-"):
+        parser.error("HOST is required before exec options")
+    values: dict[str, Any] = {
+        "command": "exec",
+        "host": host,
+        "catalog": None,
+        "env": [],
+        "gpu": None,
+        "shell": "bash",
+        "stdin": False,
+        "timeout": 60.0,
+        "cwd": None,
+        "json": False,
+        "detach": False,
+        "session": None,
+        "new_session": False,
+        "window": None,
+        "remote_dir": None,
+        "log": None,
+        "dry_run": False,
+        "exec_command": (),
+    }
+    no_value_flags = {
+        "--stdin": "stdin",
+        "--detach": "detach",
+        "--new-session": "new_session",
+        "--json": "json",
+        "--dry-run": "dry_run",
+    }
+    value_flags = {
+        "--catalog": "catalog",
+        "--env": "env",
+        "--gpu": "gpu",
+        "--shell": "shell",
+        "--timeout": "timeout",
+        "--cwd": "cwd",
+        "--session": "session",
+        "--window": "window",
+        "--remote-dir": "remote_dir",
+        "--log": "log",
+    }
+    rest = tokens[1:]
+    command: list[str] = []
+    idx = 0
+    while idx < len(rest):
+        token = rest[idx]
+        if token == "--":
+            command = rest[idx + 1 :]
+            break
+        if token in {"-h", "--help"}:
+            return parser.parse_args(["--help"])
+        if token in no_value_flags:
+            values[no_value_flags[token]] = True
+            idx += 1
+            continue
+        if token in value_flags:
+            if idx + 1 >= len(rest):
+                parser.error(f"{token} requires a value")
+            raw_value = rest[idx + 1]
+            key = value_flags[token]
+            if key == "env":
+                values["env"].append(raw_value)
+            elif key == "catalog":
+                values[key] = Path(raw_value)
+            elif key == "timeout":
+                try:
+                    values[key] = float(raw_value)
+                except ValueError:
+                    parser.error(f"{token} must be a number")
+            elif key == "shell":
+                if raw_value not in {"bash", "csh"}:
+                    parser.error("--shell must be one of: bash, csh")
+                values[key] = raw_value
+            else:
+                values[key] = raw_value
+            idx += 2
+            continue
+        if token.startswith("-"):
+            parser.error(f"unknown ucl exec option: {token}; use '--' before remote commands that start with '-'")
+        command = rest[idx:]
+        break
+
+    values["exec_command"] = tuple(command)
+    if values["timeout"] < 0:
+        parser.error("--timeout must be >= 0")
+    if values["stdin"] and command:
+        parser.error("--stdin cannot be used with COMMAND arguments")
+    if not values["stdin"] and not command:
+        parser.error("no remote command provided; use 'ucl exec HOST COMMAND...' or 'ucl exec HOST --stdin < script.sh'")
+    tmux_only = []
+    for flag, key in (
+        ("--session", "session"),
+        ("--new-session", "new_session"),
+        ("--window", "window"),
+        ("--remote-dir", "remote_dir"),
+        ("--log", "log"),
+    ):
+        if values[key]:
+            tmux_only.append(flag)
+    if not values["detach"] and tmux_only:
+        parser.error(f"{', '.join(tmux_only)} require --detach")
+    if values["detach"]:
+        sync_only = []
+        if values["cwd"] is not None:
+            sync_only.append("--cwd")
+        if values["json"]:
+            sync_only.append("--json")
+        if values["timeout"] != 60.0:
+            sync_only.append("--timeout")
+        if sync_only:
+            parser.error(f"{', '.join(sync_only)} are only supported for synchronous exec")
+    return argparse.Namespace(**values)
 
 
 def _resolve_one_host(selector: str, *, catalog_path: Path | None) -> HostSpec:
@@ -274,6 +433,177 @@ def _dry_run_summary(plan, *, subcommand: str) -> str:
     )
 
 
+def _sync_exec_dry_run_summary(args: argparse.Namespace, host: HostSpec, command: tuple[str, ...]) -> str:
+    return "\n".join(
+        [
+            "dry_run: true",
+            "command:    exec",
+            "mode:       sync",
+            f"host:       {host.name}",
+            f"shell:      {args.shell}",
+            f"cwd:        {args.cwd or '-'}",
+            f"timeout:    {'none' if args.timeout == 0 else args.timeout:g}",
+            f"stdin:      {'yes' if args.stdin else 'no'}",
+            f"argv:       {json.dumps(list(command))}",
+        ]
+    )
+
+
+def _sync_exec_source(params: dict[str, Any]) -> str:
+    params_json = json.dumps(params, sort_keys=True)
+    return f"""
+import base64
+import json
+import os
+import subprocess
+import sys
+BEGIN={json.dumps(EXEC_SENTINEL_BEGIN)}
+END={json.dumps(EXEC_SENTINEL_END)}
+PARAMS=json.loads({params_json!r})
+
+env = os.environ.copy()
+env.update(PARAMS.get("env", {{}}))
+cwd = PARAMS.get("cwd") or None
+timeout_value = PARAMS.get("timeout")
+timeout = None if timeout_value in (None, 0) else float(timeout_value)
+stdout = b""
+stderr = b""
+returncode = 0
+timed_out = False
+wrapper_error = False
+
+try:
+    if PARAMS["mode"] == "stdin":
+        argv = ["csh", "-f"] if PARAMS.get("shell") == "csh" else ["bash"]
+        proc = subprocess.run(
+            argv,
+            input=base64.b64decode(PARAMS.get("stdin_b64", "")),
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            timeout=timeout,
+        )
+    else:
+        proc = subprocess.run(
+            PARAMS["argv"],
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            timeout=timeout,
+        )
+    stdout = proc.stdout or b""
+    stderr = proc.stderr or b""
+    returncode = int(proc.returncode)
+except subprocess.TimeoutExpired as exc:
+    timed_out = True
+    returncode = 124
+    stdout = exc.stdout or b""
+    stderr = exc.stderr or b""
+    message = f"ucl exec timed out after {{timeout_value}} seconds\\n".encode()
+    stderr = stderr + message
+except Exception as exc:
+    wrapper_error = True
+    returncode = 127
+    stderr = f"{{type(exc).__name__}}: {{exc}}\\n".encode()
+
+payload = {{
+    "schema_version": 1,
+    "returncode": returncode,
+    "stdout_b64": base64.b64encode(stdout).decode("ascii"),
+    "stderr_b64": base64.b64encode(stderr).decode("ascii"),
+    "timed_out": timed_out,
+    "wrapper_error": wrapper_error,
+}}
+print(BEGIN)
+print(json.dumps(payload, sort_keys=True))
+print(END)
+"""
+
+
+def _parse_sync_exec_result(stdout: str) -> dict[str, Any]:
+    payload = json.loads(_extract_between(stdout, EXEC_SENTINEL_BEGIN, EXEC_SENTINEL_END, label="exec"))
+    if payload.get("schema_version") != 1:
+        raise RuntimeError(f"unsupported exec result schema: {payload.get('schema_version')!r}")
+    return {
+        "returncode": int(payload.get("returncode", 127)),
+        "stdout": base64.b64decode(payload.get("stdout_b64", "")),
+        "stderr": base64.b64decode(payload.get("stderr_b64", "")),
+        "timed_out": bool(payload.get("timed_out", False)),
+        "wrapper_error": bool(payload.get("wrapper_error", False)),
+    }
+
+
+def _decode_stream(data: bytes) -> str:
+    return data.decode("utf-8", errors="replace")
+
+
+def _format_sync_exec_json(
+    *,
+    host: HostSpec,
+    command: tuple[str, ...],
+    args: argparse.Namespace,
+    result: dict[str, Any],
+) -> str:
+    return json.dumps(
+        {
+            "host": host.name,
+            "ssh_host": host.ssh_host,
+            "command": list(command),
+            "cwd": args.cwd,
+            "timeout": None if args.timeout == 0 else args.timeout,
+            "timed_out": result["timed_out"],
+            "returncode": result["returncode"],
+            "stdout": _decode_stream(result["stdout"]),
+            "stderr": _decode_stream(result["stderr"]),
+        },
+        indent=2,
+        sort_keys=True,
+    )
+
+
+def run_exec_sync(
+    args: argparse.Namespace,
+    *,
+    host: HostSpec,
+    command: tuple[str, ...],
+    stdin_body: str | None,
+    runner=subprocess.run,
+) -> int:
+    if args.dry_run:
+        print(_sync_exec_dry_run_summary(args, host, command))
+        return 0
+    ensure_knuckles_master(runner=runner)
+    env = _resolve_env(args, host, runner=runner)
+    params = {
+        "mode": "stdin" if args.stdin else "command",
+        "argv": list(command),
+        "stdin_b64": base64.b64encode((stdin_body or "").encode("utf-8")).decode("ascii"),
+        "env": dict(env),
+        "shell": args.shell,
+        "cwd": args.cwd,
+        "timeout": args.timeout,
+    }
+    proc = runner(
+        _ssh_python_argv(host.ssh_host),
+        input=_sync_exec_source(params),
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
+    if int(getattr(proc, "returncode", 1)) != 0:
+        detail = _strip_remote_noise((getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip())
+        raise RuntimeError(detail or "remote exec wrapper failed")
+    result = _parse_sync_exec_result(getattr(proc, "stdout", "") or "")
+    if args.json:
+        print(_format_sync_exec_json(host=host, command=command, args=args, result=result))
+    else:
+        if result["stdout"]:
+            sys.stdout.write(_decode_stream(result["stdout"]))
+        if result["stderr"]:
+            sys.stderr.write(_decode_stream(result["stderr"]))
+    return int(result["returncode"])
+
+
 def run_run(args: argparse.Namespace, *, runner=subprocess.run, popener=subprocess.Popen) -> int:
     host = _resolve_one_host(args.host, catalog_path=args.catalog)
     if args.dry_run:
@@ -330,6 +660,8 @@ def run_exec(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     host = _resolve_one_host(args.host, catalog_path=args.catalog)
     command = _strip_remainder(args.exec_command)
     stdin_body = sys.stdin.read() if args.stdin else None
+    if not args.detach:
+        return run_exec_sync(args, host=host, command=command, stdin_body=stdin_body, runner=runner)
     if args.dry_run:
         plan = build_exec_plan(
             host=host,
@@ -595,25 +927,23 @@ print(END)
 """
 
 
-def _split_exec_argv(argv: list[str]) -> tuple[list[str], tuple[str, ...]]:
-    if not argv or argv[0] != "exec":
-        return argv, ()
-    if "--" not in argv:
-        return argv, ()
-    idx = argv.index("--")
-    return argv[:idx], tuple(argv[idx + 1 :])
-
-
 def main(argv: list[str] | None = None, *, runner=subprocess.run, popener=subprocess.Popen) -> int:
     parser = build_parser()
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    parse_argv, exec_command = _split_exec_argv(raw_argv)
+    if raw_argv and raw_argv[0] == "exec":
+        try:
+            args = _parse_exec_argv(raw_argv[1:])
+        except SystemExit as exc:
+            return int(exc.code or 0)
+        try:
+            return run_exec(args, runner=runner)
+        except Exception as exc:  # noqa: BLE001 - CLI should render concise failures.
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
     try:
-        args = parser.parse_args(parse_argv)
+        args = parser.parse_args(raw_argv)
     except SystemExit as exc:
         return int(exc.code or 0)
-    if args.command == "exec":
-        args.exec_command = exec_command
     try:
         if args.command == "status":
             return run_status(args, runner=runner)
@@ -621,8 +951,6 @@ def main(argv: list[str] | None = None, *, runner=subprocess.run, popener=subpro
             return run_doctor(args, runner=runner)
         if args.command == "run":
             return run_run(args, runner=runner, popener=popener)
-        if args.command == "exec":
-            return run_exec(args, runner=runner)
         if args.command == "tail":
             return run_tail(args, runner=runner, popener=popener)
         if args.command == "fetch":
