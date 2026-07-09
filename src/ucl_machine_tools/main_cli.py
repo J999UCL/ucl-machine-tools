@@ -35,6 +35,7 @@ CLEAN_SENTINEL_BEGIN = "UCL_CLEAN_JSON_BEGIN"
 CLEAN_SENTINEL_END = "UCL_CLEAN_JSON_END"
 EXEC_SENTINEL_BEGIN = "UCL_EXEC_JSON_BEGIN"
 EXEC_SENTINEL_END = "UCL_EXEC_JSON_END"
+ERROR_SNIPPET_CHARS = 800
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -520,8 +521,67 @@ print(END)
 """
 
 
-def _parse_sync_exec_result(stdout: str) -> dict[str, Any]:
-    payload = json.loads(_extract_between(stdout, EXEC_SENTINEL_BEGIN, EXEC_SENTINEL_END, label="exec"))
+def _compact_text(text: str, *, limit: int = ERROR_SNIPPET_CHARS) -> str:
+    compact = "\n".join(line.rstrip() for line in text.strip().splitlines() if line.strip())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3].rstrip() + "..."
+
+
+def _wrapper_stream_detail(stdout: str, stderr: str) -> str:
+    parts = []
+    clean_stderr = _compact_text(_strip_remote_noise(stderr))
+    clean_stdout = _compact_text(_strip_remote_noise(stdout))
+    if clean_stderr:
+        parts.append(f"stderr: {clean_stderr}")
+    if clean_stdout:
+        parts.append(f"stdout: {clean_stdout}")
+    return "; ".join(parts)
+
+
+def _exec_wrapper_failure_message(*, host: HostSpec, returncode: int, stdout: str, stderr: str) -> str:
+    raw = "\n".join(part for part in (stderr, stdout) if part)
+    detail = _wrapper_stream_detail(stdout, stderr)
+    prefix = f"SSH failed before remote exec wrapper started on {host.name} (exit {returncode})"
+    if returncode == 255:
+        if "Stdio forwarding request failed" in raw or "UNKNOWN port 65535" in raw:
+            return (
+                f"{prefix}: ProxyJump/control-master forwarding was refused. "
+                "The knuckles control master may be stale, or the target host may be unreachable. "
+                "Check `ucl status {host}` or restart the knuckles master."
+            ).format(host=host.name)
+        if "No route to host" in raw:
+            return f"{prefix}: target host is unreachable from the jump host. {detail}".strip()
+        if "Connection refused" in raw:
+            return f"{prefix}: SSH connection was refused. {detail}".strip()
+        if "Permission denied" in raw:
+            return f"{prefix}: SSH authentication failed. {detail}".strip()
+        if "Could not resolve hostname" in raw or "Name or service not known" in raw:
+            return f"{prefix}: hostname could not be resolved. {detail}".strip()
+        if detail:
+            return f"{prefix}: {detail}"
+        return f"{prefix}: no stderr/stdout was returned; the host or jump connection is likely unreachable."
+    if detail:
+        return f"Remote exec wrapper failed before it could return a result on {host.name} (exit {returncode}): {detail}"
+    return f"Remote exec wrapper failed before it could return a result on {host.name} (exit {returncode}); no stderr/stdout was returned."
+
+
+def _parse_sync_exec_result(*, host: HostSpec, stdout: str, stderr: str) -> dict[str, Any]:
+    try:
+        raw_payload = _extract_between(stdout, EXEC_SENTINEL_BEGIN, EXEC_SENTINEL_END, label="exec")
+    except RuntimeError as exc:
+        detail = _wrapper_stream_detail(stdout, stderr)
+        message = f"Remote exec wrapper on {host.name} did not return sentinel JSON"
+        if detail:
+            message += f": {detail}"
+        else:
+            message += "."
+        raise RuntimeError(message) from exc
+    try:
+        payload = json.loads(raw_payload)
+    except json.JSONDecodeError as exc:
+        snippet = _compact_text(raw_payload)
+        raise RuntimeError(f"Remote exec wrapper on {host.name} returned malformed sentinel JSON: {snippet}") from exc
     if payload.get("schema_version") != 1:
         raise RuntimeError(f"unsupported exec result schema: {payload.get('schema_version')!r}")
     return {
@@ -552,6 +612,7 @@ def _format_sync_exec_json(
             "cwd": args.cwd,
             "timeout": None if args.timeout == 0 else args.timeout,
             "timed_out": result["timed_out"],
+            "wrapper_error": result["wrapper_error"],
             "returncode": result["returncode"],
             "stdout": _decode_stream(result["stdout"]),
             "stderr": _decode_stream(result["stderr"]),
@@ -591,15 +652,29 @@ def run_exec_sync(
         shell=False,
     )
     if int(getattr(proc, "returncode", 1)) != 0:
-        detail = _strip_remote_noise((getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip())
-        raise RuntimeError(detail or "remote exec wrapper failed")
-    result = _parse_sync_exec_result(getattr(proc, "stdout", "") or "")
+        raise RuntimeError(
+            _exec_wrapper_failure_message(
+                host=host,
+                returncode=int(getattr(proc, "returncode", 1)),
+                stdout=getattr(proc, "stdout", "") or "",
+                stderr=getattr(proc, "stderr", "") or "",
+            )
+        )
+    result = _parse_sync_exec_result(
+        host=host,
+        stdout=getattr(proc, "stdout", "") or "",
+        stderr=getattr(proc, "stderr", "") or "",
+    )
     if args.json:
         print(_format_sync_exec_json(host=host, command=command, args=args, result=result))
     else:
         if result["stdout"]:
             sys.stdout.write(_decode_stream(result["stdout"]))
-        if result["stderr"]:
+        if result["wrapper_error"]:
+            stderr_text = _decode_stream(result["stderr"])
+            detail = stderr_text.strip() or "unknown wrapper error"
+            sys.stderr.write(f"Remote exec wrapper on {host.name} failed before the command could run: {detail}\n")
+        elif result["stderr"]:
             sys.stderr.write(_decode_stream(result["stderr"]))
     return int(result["returncode"])
 

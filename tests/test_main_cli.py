@@ -67,6 +67,7 @@ def exec_stdout(
     stderr: bytes = b"",
     returncode: int = 0,
     timed_out: bool = False,
+    wrapper_error: bool = False,
     outside_noise: str = "VBoxManage: error: wrapper noise\n",
 ) -> str:
     payload = {
@@ -75,7 +76,7 @@ def exec_stdout(
         "stdout_b64": base64.b64encode(stdout).decode("ascii"),
         "stderr_b64": base64.b64encode(stderr).decode("ascii"),
         "timed_out": timed_out,
-        "wrapper_error": False,
+        "wrapper_error": wrapper_error,
     }
     return "\n".join(
         [
@@ -268,6 +269,166 @@ def test_ucl_exec_sync_returns_remote_nonzero_and_timeout(capsys: pytest.Capture
     assert capsys.readouterr().err == "bad\n"
     assert main_cli.main(["exec", "barbury-l", "--timeout", "1", "sleep", "5"], runner=runner) == 124
     assert "timed out" in capsys.readouterr().err
+
+
+def test_ucl_exec_sync_reports_empty_ssh_255_smartly(capsys: pytest.CaptureFixture[str]) -> None:
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+            return SimpleNamespace(returncode=255, stdout="", stderr="")
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["exec", "barbury-l", "hostname"], runner=runner) == 2
+
+    err = capsys.readouterr().err
+    assert "SSH failed before remote exec wrapper started on barbury-l (exit 255)" in err
+    assert "no stderr/stdout" in err
+
+
+def test_ucl_exec_sync_reports_refused_jump_forwarding(capsys: pytest.CaptureFixture[str]) -> None:
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+            return SimpleNamespace(
+                returncode=255,
+                stdout="",
+                stderr=(
+                    "Stdio forwarding request failed: Session open refused by peer\n"
+                    "Connection closed by UNKNOWN port 65535\n"
+                ),
+            )
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["exec", "barbury-l", "hostname"], runner=runner) == 2
+
+    err = capsys.readouterr().err
+    assert "ProxyJump/control-master forwarding was refused" in err
+    assert "knuckles control master may be stale" in err
+
+
+def test_ucl_exec_sync_reports_no_route_to_host(capsys: pytest.CaptureFixture[str]) -> None:
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+            return SimpleNamespace(
+                returncode=255,
+                stdout="",
+                stderr="channel 0: open failed: connect failed: No route to host\nstdio forwarding failed\n",
+            )
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["exec", "barbury-l", "hostname"], runner=runner) == 2
+
+    err = capsys.readouterr().err
+    assert "target host is unreachable from the jump host" in err
+    assert "No route to host" in err
+
+
+def test_ucl_exec_sync_reports_wrapper_stderr(capsys: pytest.CaptureFixture[str]) -> None:
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+            return SimpleNamespace(returncode=127, stdout="", stderr="python3: command not found\n")
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["exec", "barbury-l", "hostname"], runner=runner) == 2
+
+    err = capsys.readouterr().err
+    assert "Remote exec wrapper failed before it could return a result on barbury-l (exit 127)" in err
+    assert "python3: command not found" in err
+
+
+def test_ucl_exec_sync_reports_missing_sentinel(capsys: pytest.CaptureFixture[str]) -> None:
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+            return ok(stdout="not sentinel output\n", stderr="wrapper warning\n")
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["exec", "barbury-l", "hostname"], runner=runner) == 2
+
+    err = capsys.readouterr().err
+    assert "Remote exec wrapper on barbury-l did not return sentinel JSON" in err
+    assert "wrapper warning" in err
+    assert "not sentinel output" in err
+
+
+def test_ucl_exec_sync_reports_malformed_sentinel_json(capsys: pytest.CaptureFixture[str]) -> None:
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+            return ok(
+                stdout="\n".join(
+                    [
+                        main_cli.EXEC_SENTINEL_BEGIN,
+                        "{not-json",
+                        main_cli.EXEC_SENTINEL_END,
+                    ]
+                )
+            )
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["exec", "barbury-l", "hostname"], runner=runner) == 2
+
+    assert "malformed sentinel JSON" in capsys.readouterr().err
+
+
+def test_ucl_exec_sync_distinguishes_wrapper_error_payload(capsys: pytest.CaptureFixture[str]) -> None:
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+            return ok(
+                stdout=exec_stdout(
+                    stderr=b"FileNotFoundError: [Errno 2] No such file or directory: 'missing-command'\n",
+                    returncode=127,
+                    wrapper_error=True,
+                )
+            )
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["exec", "barbury-l", "missing-command"], runner=runner) == 127
+
+    err = capsys.readouterr().err
+    assert "Remote exec wrapper on barbury-l failed before the command could run" in err
+    assert "FileNotFoundError" in err
+
+
+def test_ucl_exec_sync_json_includes_wrapper_error(capsys: pytest.CaptureFixture[str]) -> None:
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+            return ok(stdout=exec_stdout(stderr=b"unknown wrapper error\n", returncode=127, wrapper_error=True))
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["exec", "barbury-l", "--json", "missing-command"], runner=runner) == 127
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["wrapper_error"] is True
+    assert payload["returncode"] == 127
+    assert payload["stderr"] == "unknown wrapper error\n"
+
+
+def test_ucl_exec_sync_filters_wrapper_startup_noise_from_errors(capsys: pytest.CaptureFixture[str]) -> None:
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+            return SimpleNamespace(returncode=255, stdout="", stderr="VBoxManage: noisy startup failure\n")
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["exec", "barbury-l", "hostname"], runner=runner) == 2
+
+    err = capsys.readouterr().err
+    assert "VBoxManage" not in err
+    assert "no stderr/stdout" in err
 
 
 def test_ucl_exec_sync_stdin_uses_selected_shell(capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
