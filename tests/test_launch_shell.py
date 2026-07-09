@@ -63,6 +63,20 @@ def test_env_and_gpu_are_plain_exports_not_profiles(tmp_path: Path) -> None:
 
 
 def test_tmux_sentinel_parser_ignores_noise_and_exec_auto_requires_single_session() -> None:
+    assert launch.build_tmux_list_argv(host(), timeout_seconds=8) == [
+        "ssh",
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "LogLevel=ERROR",
+        "-o",
+        "ConnectTimeout=8",
+        "barbury-l",
+        "python3",
+        "-",
+    ]
+
     stdout = "\n".join(
         [
             "Last login noise",

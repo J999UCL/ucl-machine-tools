@@ -25,7 +25,7 @@ from ucl_machine_tools.launch import (
     write_launcher_files,
 )
 from ucl_machine_tools.registry import RunRecord, read_record, write_record
-from ucl_machine_tools.ssh import ensure_knuckles_master
+from ucl_machine_tools.ssh import build_remote_python_argv, ensure_knuckles_master
 
 TAIL_SENTINEL_BEGIN = "UCL_TAIL_TEXT_BEGIN"
 TAIL_SENTINEL_END = "UCL_TAIL_TEXT_END"
@@ -405,7 +405,7 @@ def run_doctor(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     host = _resolve_one_host(args.host, catalog_path=args.catalog)
     ensure_knuckles_master(runner=runner)
     row = inventory.collect([host], runner=runner, jobs=1, timeout_seconds=args.timeout_seconds)[0]
-    sessions = list_remote_sessions(host, runner=runner)
+    sessions = list_remote_sessions(host, runner=runner, timeout_seconds=args.timeout_seconds)
     print(f"host:          {host.name}")
     print(f"status:        {row.get('status')}")
     print(f"tmp_scratch:  {'yes' if (row.get('scratch') or {}).get('exists') else 'no'}")
@@ -848,7 +848,7 @@ def _strip_remote_noise(text: str) -> str:
 
 
 def _ssh_python_argv(host: str) -> list[str]:
-    return ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", host, "python3", "-"]
+    return build_remote_python_argv(host)
 
 
 def run_tail(args: argparse.Namespace, *, runner=subprocess.run, popener=subprocess.Popen) -> int:

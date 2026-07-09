@@ -17,6 +17,15 @@ def build_master_start_argv(master_host: str = "knuckles") -> list[str]:
     return ["ssh", "-MNf", master_host]
 
 
+def build_remote_python_argv(host: str, *, timeout_seconds: int | None = None) -> list[str]:
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    argv = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR"]
+    if timeout_seconds is not None:
+        argv += ["-o", f"ConnectTimeout={int(timeout_seconds)}"]
+    return [*argv, host, "python3", "-"]
+
+
 def ensure_knuckles_master(
     *,
     runner: Runner = subprocess.run,

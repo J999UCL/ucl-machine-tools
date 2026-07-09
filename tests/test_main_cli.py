@@ -30,6 +30,13 @@ def tmux_stdout(sessions: list[str]) -> str:
     )
 
 
+def remote_python_argv(host: str = "barbury-l", *, timeout_seconds: int | None = None) -> list[str]:
+    argv = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR"]
+    if timeout_seconds is not None:
+        argv += ["-o", f"ConnectTimeout={timeout_seconds}"]
+    return [*argv, host, "python3", "-"]
+
+
 def inventory_stdout(host: str = "barbury-l", *, busy: bool = False) -> str:
     gpu = {
         "index": 0,
@@ -152,7 +159,7 @@ def test_ucl_run_full_fake_path_writes_registry(
         joined = " ".join(argv)
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "barbury-l", "python3", "-"] and "UCL_TMUX_JSON_BEGIN" in kwargs.get("input", ""):
+        if argv == remote_python_argv() and "UCL_TMUX_JSON_BEGIN" in kwargs.get("input", ""):
             return ok(stdout=tmux_stdout(["work"]))
         if "tar -xf -" in joined:
             return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
@@ -501,7 +508,7 @@ def test_ucl_exec_detach_preserves_tmux_path(
         joined = " ".join(argv)
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "barbury-l", "python3", "-"] and "UCL_TMUX_JSON_BEGIN" in kwargs.get("input", ""):
+        if argv == remote_python_argv() and "UCL_TMUX_JSON_BEGIN" in kwargs.get("input", ""):
             return ok(stdout=tmux_stdout(["work"]))
         if "mkdir -p" in joined and "tar -xf" not in joined:
             return ok()
@@ -527,7 +534,7 @@ def test_ucl_exec_detach_requires_explicit_session_when_no_existing_tmux(
         calls.append(argv)
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "barbury-l", "python3", "-"] and "UCL_TMUX_JSON_BEGIN" in kwargs.get("input", ""):
+        if argv == remote_python_argv() and "UCL_TMUX_JSON_BEGIN" in kwargs.get("input", ""):
             return ok(stdout=tmux_stdout([]))
         raise AssertionError(f"unexpected argv after failed tmux decision: {argv}")
 
@@ -545,9 +552,9 @@ def test_ucl_doctor_reports_host_state(capsys: pytest.CaptureFixture[str]) -> No
         joined = " ".join(argv)
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "barbury-l", "python3", "-"] and "UCL_TMUX_JSON_BEGIN" in kwargs.get("input", ""):
+        if argv == remote_python_argv(timeout_seconds=8) and "UCL_TMUX_JSON_BEGIN" in kwargs.get("input", ""):
             return ok(stdout=tmux_stdout(["work"]))
-        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=8", "barbury-l", "python3", "-"]:
+        if argv == remote_python_argv(timeout_seconds=8):
             return ok(stdout=inventory_stdout())
         raise AssertionError(f"unexpected argv: {argv}")
 

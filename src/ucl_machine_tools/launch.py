@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from ucl_machine_tools.hosts import HostSpec
+from ucl_machine_tools.ssh import build_remote_python_argv
 
 
 Runner = Callable[..., subprocess.CompletedProcess]
@@ -312,8 +313,8 @@ def build_write_file_argv(host: HostSpec, remote_dir: str, name: str) -> list[st
     return remote_bash_argv(host, command)
 
 
-def build_tmux_list_argv(host: HostSpec) -> list[str]:
-    return ["ssh", host.ssh_host, "python3", "-"]
+def build_tmux_list_argv(host: HostSpec, *, timeout_seconds: int | None = None) -> list[str]:
+    return build_remote_python_argv(host.ssh_host, timeout_seconds=timeout_seconds)
 
 
 def build_tmux_list_source() -> str:
@@ -444,17 +445,31 @@ def write_launcher_files(plan: RemoteJobPlan, *, runner: Runner = subprocess.run
     return launcher_name
 
 
-def list_remote_sessions(host: HostSpec, *, runner: Runner = subprocess.run) -> tuple[str, ...]:
+def list_remote_sessions(
+    host: HostSpec,
+    *,
+    runner: Runner = subprocess.run,
+    timeout_seconds: int | None = None,
+) -> tuple[str, ...]:
     proc = runner(
-        build_tmux_list_argv(host),
+        build_tmux_list_argv(host, timeout_seconds=timeout_seconds),
         input=build_tmux_list_source(),
         capture_output=True,
         text=True,
         shell=False,
     )
     if int(getattr(proc, "returncode", 1)) != 0:
-        raise RuntimeError((getattr(proc, "stderr", "") or "failed to list tmux sessions").strip())
-    return parse_tmux_sessions(getattr(proc, "stdout", "") or "")
+        stderr = (getattr(proc, "stderr", "") or "").strip()
+        stdout = (getattr(proc, "stdout", "") or "").strip()
+        detail = stderr or stdout or f"exit {getattr(proc, 'returncode', 'unknown')}"
+        raise RuntimeError(f"failed to list tmux sessions on {host.name}: {detail}")
+    try:
+        return parse_tmux_sessions(getattr(proc, "stdout", "") or "")
+    except ValueError as exc:
+        stderr = (getattr(proc, "stderr", "") or "").strip()
+        stdout = (getattr(proc, "stdout", "") or "").strip()
+        detail = stderr or stdout or str(exc)
+        raise RuntimeError(f"failed to parse tmux sessions on {host.name}: {detail}") from exc
 
 
 def launch_tmux(plan: RemoteJobPlan, decision: TmuxDecision, launcher_name: str, *, runner: Runner = subprocess.run) -> None:

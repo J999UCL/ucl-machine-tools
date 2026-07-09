@@ -9,6 +9,7 @@ from collections import Counter
 from typing import Any, Callable, Iterable
 
 from ucl_machine_tools.hosts import HostSpec
+from ucl_machine_tools.ssh import build_remote_python_argv
 
 
 INVENTORY_SENTINEL = "UCL_INVENTORY_JSON"
@@ -30,21 +31,7 @@ def restart_text(policy: str) -> str:
 
 
 def build_ssh_argv(host: HostSpec, *, timeout_seconds: int = 8) -> list[str]:
-    if timeout_seconds <= 0:
-        raise ValueError("timeout_seconds must be positive")
-    return [
-        "ssh",
-        "-T",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "LogLevel=ERROR",
-        "-o",
-        f"ConnectTimeout={int(timeout_seconds)}",
-        host.ssh_host,
-        "python3",
-        "-",
-    ]
+    return build_remote_python_argv(host.ssh_host, timeout_seconds=timeout_seconds)
 
 
 def build_remote_probe_source(*, host: HostSpec, root: str, sizes: bool = False) -> str:
