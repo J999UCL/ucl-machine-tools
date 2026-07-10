@@ -58,6 +58,8 @@ Common use:
       Check one host, scratch state, and tmux sessions before work.
   ucl exec barbury-l df -h /tmp
       Run a short remote check and print output now.
+  ucl exec barbury-l canada-l -- hostname
+      Run the same short remote check on multiple hosts.
   ucl exec barbury-l --cwd /tmp --timeout 60 pwd
       Run from a remote directory with a bounded timeout.
   ucl exec barbury-l --stdin < check.sh
@@ -206,6 +208,8 @@ def _configure_exec_parser(parser: argparse.ArgumentParser) -> None:
     parser.epilog = """\
 Examples:
   ucl exec barbury-l df -h /tmp
+  ucl exec barbury-l canada-l -- hostname
+  ucl exec 3090ti -- df -h /tmp
   ucl exec barbury-l -- python3 -c 'print("hi")'
   ucl exec barbury-l --cwd /tmp --timeout 60 pwd
   ucl exec barbury-l --stdin < check.sh
@@ -237,16 +241,38 @@ def _build_exec_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _exec_catalog_path_from_tokens(tokens: list[str]) -> Path | None:
+    for idx, token in enumerate(tokens):
+        if token == "--":
+            break
+        if token == "--catalog" and idx + 1 < len(tokens):
+            return Path(tokens[idx + 1])
+    return None
+
+
+def _is_exec_target_token(token: str, *, catalog_path: Path | None) -> bool:
+    if token.startswith("-"):
+        return False
+    try:
+        parse_selector(token, catalog=load_catalog(catalog_path))
+    except Exception:  # noqa: BLE001 - parser uses this only as a yes/no discriminator.
+        return False
+    return True
+
+
 def _parse_exec_argv(tokens: list[str]) -> argparse.Namespace:
     parser = _build_exec_parser()
     if not tokens or tokens[0] in {"-h", "--help"}:
         return parser.parse_args(tokens)
-    host = tokens[0]
-    if host.startswith("-"):
+    catalog_path_hint = _exec_catalog_path_from_tokens(tokens)
+    first_host = tokens[0]
+    if first_host.startswith("-"):
         parser.error("HOST is required before exec options")
+    hosts = [first_host]
     values: dict[str, Any] = {
         "command": "exec",
-        "host": host,
+        "host": first_host,
+        "hosts": tuple(hosts),
         "catalog": None,
         "env": [],
         "gpu": None,
@@ -321,9 +347,14 @@ def _parse_exec_argv(tokens: list[str]) -> argparse.Namespace:
             continue
         if token.startswith("-"):
             parser.error(f"unknown ucl exec option: {token}; use '--' before remote commands that start with '-'")
+        if "--" in rest[idx + 1 :] and _is_exec_target_token(token, catalog_path=catalog_path_hint):
+            hosts.append(token)
+            idx += 1
+            continue
         command = rest[idx:]
         break
 
+    values["hosts"] = tuple(hosts)
     values["exec_command"] = tuple(command)
     if values["timeout"] < 0:
         parser.error("--timeout must be >= 0")
@@ -344,6 +375,8 @@ def _parse_exec_argv(tokens: list[str]) -> argparse.Namespace:
     if not values["detach"] and tmux_only:
         parser.error(f"{', '.join(tmux_only)} require --detach")
     if values["detach"]:
+        if len(values["hosts"]) != 1:
+            parser.error("multi-host exec is synchronous only; remove --detach or run separate detached jobs")
         sync_only = []
         if values["cwd"] is not None:
             sync_only.append("--cwd")
@@ -362,6 +395,11 @@ def _resolve_one_host(selector: str, *, catalog_path: Path | None) -> HostSpec:
     if len(hosts) != 1:
         raise ValueError(f"selector must resolve to exactly one host, got {len(hosts)} for {selector!r}")
     return hosts[0]
+
+
+def _resolve_exec_hosts(args: argparse.Namespace) -> list[HostSpec]:
+    catalog = load_catalog(args.catalog)
+    return _resolve_status_targets(tuple(getattr(args, "hosts", (args.host,))), catalog=catalog)
 
 
 def _status_mode_and_targets(items: list[str], selector: str | None) -> tuple[str, tuple[str, ...]]:
@@ -807,6 +845,50 @@ def run_exec_sync(
     return int(result["returncode"])
 
 
+def run_exec_multi_sync(
+    args: argparse.Namespace,
+    *,
+    hosts: list[HostSpec],
+    command: tuple[str, ...],
+    stdin_body: str | None,
+    runner=subprocess.run,
+) -> int:
+    if args.dry_run:
+        print(
+            "\n".join(
+                [
+                    "dry_run: true",
+                    "command:    exec",
+                    "mode:       multi-sync",
+                    f"hosts:      {', '.join(host.name for host in hosts)}",
+                    f"shell:      {args.shell}",
+                    f"cwd:        {args.cwd or '-'}",
+                    f"timeout:    {'none' if args.timeout == 0 else args.timeout:g}",
+                    f"stdin:      {'yes' if args.stdin else 'no'}",
+                    f"argv:       {json.dumps(list(command))}",
+                ]
+            )
+        )
+        return 0
+    ensure_knuckles_master(runner=runner)
+    rows: list[dict[str, Any]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(max(len(hosts), 1), 8)) as executor:
+        future_to_host = {executor.submit(_fanout_one, host, args, command, stdin_body, runner=runner): host for host in hosts}
+        by_host: dict[str, dict[str, Any]] = {}
+        for future in concurrent.futures.as_completed(future_to_host):
+            row = future.result()
+            by_host[row["host"]] = row
+        rows = [by_host[host.name] for host in hosts]
+    if args.json:
+        print(json.dumps({"results": rows}, indent=2, sort_keys=True))
+    else:
+        for row in rows:
+            status = "ok" if row.get("ok") else "fail"
+            first = (row.get("stdout") or row.get("stderr") or row.get("error") or "").strip().splitlines()
+            print(f"{row['host']}: {status} rc={row.get('returncode')} {first[0] if first else ''}".rstrip())
+    return 0 if all(row.get("ok") for row in rows) else 2
+
+
 def run_run(args: argparse.Namespace, *, runner=subprocess.run, popener=subprocess.Popen) -> int:
     host = _resolve_one_host(args.host, catalog_path=args.catalog)
     if args.dry_run:
@@ -860,11 +942,16 @@ def run_run(args: argparse.Namespace, *, runner=subprocess.run, popener=subproce
 
 
 def run_exec(args: argparse.Namespace, *, runner=subprocess.run) -> int:
-    host = _resolve_one_host(args.host, catalog_path=args.catalog)
+    hosts = _resolve_exec_hosts(args)
+    host = hosts[0]
     command = _strip_remainder(args.exec_command)
     stdin_body = sys.stdin.read() if args.stdin else None
     if not args.detach:
+        if len(hosts) > 1:
+            return run_exec_multi_sync(args, hosts=hosts, command=command, stdin_body=stdin_body, runner=runner)
         return run_exec_sync(args, host=host, command=command, stdin_body=stdin_body, runner=runner)
+    if len(hosts) != 1:
+        raise RuntimeError("multi-host exec is synchronous only; remove --detach or run separate detached jobs")
     if args.dry_run:
         plan = build_exec_plan(
             host=host,
@@ -1311,15 +1398,16 @@ def run_env(args: argparse.Namespace, *, runner=subprocess.run) -> int:
 
 
 def _fanout_one(host: HostSpec, args: argparse.Namespace, command: tuple[str, ...], stdin_body: str | None, *, runner=subprocess.run) -> dict[str, Any]:
+    timeout_value = float(getattr(args, "timeout_seconds", getattr(args, "timeout", 60.0)))
     local_args = argparse.Namespace(
         dry_run=False,
         stdin=args.stdin,
         shell=args.shell,
-        timeout=float(args.timeout_seconds),
-        cwd=None,
+        timeout=timeout_value,
+        cwd=getattr(args, "cwd", None),
         json=False,
         gpu=args.gpu,
-        env=[],
+        env=getattr(args, "env", []),
     )
     try:
         env = _resolve_env(local_args, host, runner=runner)
@@ -1329,8 +1417,8 @@ def _fanout_one(host: HostSpec, args: argparse.Namespace, command: tuple[str, ..
             "stdin_b64": base64.b64encode((stdin_body or "").encode("utf-8")).decode("ascii"),
             "env": dict(env),
             "shell": args.shell,
-            "cwd": None,
-            "timeout": float(args.timeout_seconds),
+            "cwd": getattr(args, "cwd", None),
+            "timeout": timeout_value,
         }
         proc = runner(
             _ssh_python_argv(host.ssh_host),

@@ -358,6 +358,100 @@ def test_ucl_exec_sync_command_prints_output_and_preserves_argv(
     assert not any("UCL_TMUX_JSON_BEGIN" in str(call) for call in calls)
 
 
+def test_ucl_exec_sync_accepts_multiple_hosts_with_delimiter(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    catalog = write_status_catalog(tmp_path)
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv[-2:] == ["python3", "-"]:
+            host = argv[-3]
+            params = embedded_exec_params(kwargs["input"])
+            assert params["argv"] == ["hostname"]
+            assert params["cwd"] == "/tmp"
+            assert params["timeout"] == 2.0
+            assert params["env"]["DEMO"] == "1"
+            return ok(stdout=exec_stdout(stdout=f"{host}\n".encode()))
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    rc = main_cli.main(
+        [
+            "exec",
+            "barbury-l",
+            "canada-l",
+            "--catalog",
+            str(catalog),
+            "--cwd",
+            "/tmp",
+            "--timeout",
+            "2",
+            "--env",
+            "DEMO=1",
+            "--json",
+            "--",
+            "hostname",
+        ],
+        runner=runner,
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [row["host"] for row in payload["results"]] == ["barbury-l", "canada-l"]
+    assert [row["stdout"] for row in payload["results"]] == ["barbury-l\n", "canada-l\n"]
+
+
+def test_ucl_exec_single_host_command_can_contain_delimiter(capsys: pytest.CaptureFixture[str]) -> None:
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv():
+            params = embedded_exec_params(kwargs["input"])
+            assert params["argv"] == ["python3", "--", "-c"]
+            return ok(stdout=exec_stdout(stdout=b"ok\n"))
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    rc = main_cli.main(["exec", "barbury-l", "python3", "--", "-c"], runner=runner)
+
+    assert rc == 0
+    assert capsys.readouterr().out == "ok\n"
+
+
+def test_ucl_exec_sync_expands_selector_to_multiple_hosts(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    catalog = write_status_catalog(tmp_path)
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv[-2:] == ["python3", "-"]:
+            host = argv[-3]
+            return ok(stdout=exec_stdout(stdout=f"{host}\n".encode()))
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    rc = main_cli.main(["exec", "3090ti", "--catalog", str(catalog), "--json", "--", "hostname"], runner=runner)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [row["host"] for row in payload["results"]] == ["barbury-l", "canada-l"]
+
+
+def test_ucl_exec_rejects_detach_with_multiple_hosts(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    catalog = write_status_catalog(tmp_path)
+
+    rc = main_cli.main(["exec", "barbury-l", "canada-l", "--catalog", str(catalog), "--detach", "--", "hostname"])
+
+    assert rc == 2
+    assert "multi-host exec is synchronous only" in capsys.readouterr().err
+
+
 def test_ucl_exec_sync_supports_options_cwd_json_timeout_and_gpu_auto(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

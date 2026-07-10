@@ -8,6 +8,8 @@ scripts/ucl status 3090ti
 scripts/ucl status barbury-l canada-l
 scripts/ucl doctor barbury-l
 scripts/ucl exec barbury-l hostname
+scripts/ucl exec barbury-l canada-l -- hostname
+scripts/ucl exec 3090ti -- df -h /tmp
 scripts/ucl exec barbury-l --cwd /tmp --timeout 60 pwd
 scripts/ucl exec barbury-l --shell csh --stdin < setup_python.csh
 scripts/ucl exec barbury-l --detach --new-session -- hostname
@@ -28,9 +30,9 @@ work.
 - `ucl status [target]` checks GPU availability, `/tmp` free space,
   `/tmp/ucl-machine-tools`, and restart policy.
 - `ucl doctor HOST` checks one host, tmux visibility, and scratch state.
-- `ucl exec HOST COMMAND...` runs a short remote command synchronously and
-  prints stdout/stderr directly. Use `--cwd DIR`, `--timeout SECONDS`, or
-  `--json` when helpful.
+- `ucl exec HOST_OR_SELECTOR [HOST_OR_SELECTOR ...] COMMAND...` runs a short
+  remote command synchronously. For multiple hosts, use `--` before the command,
+  e.g. `ucl exec barbury-l canada-l -- hostname`.
 - `ucl exec HOST --stdin` runs a stdin script synchronously, avoiding nested
   quote problems for multi-line commands. Use `--shell csh` when the script
   needs to source UCL `.csh` setup files.
@@ -44,8 +46,8 @@ work.
   `--verify size` or `--verify sha256` when you want explicit transfer checks.
 - `ucl env HOST --remote-root DIR` checks reachability, scratch/root state, TSG
   setup scripts, `/tmp` space, and optional GPU availability.
-- `ucl fanout --hosts TARGET... -- COMMAND...` runs one synchronous check across
-  multiple selected hosts.
+- `ucl fanout --hosts TARGET... -- COMMAND...` is kept as the explicit fanout
+  spelling, but `ucl exec HOST HOST -- COMMAND...` is the preferred form.
 
 ## Environment Setup
 
