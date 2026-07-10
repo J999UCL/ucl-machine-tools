@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,12 @@ class RunRecord:
     remote_dir: str
     log_path: str
     command: tuple[str, ...]
+    created_at: str = ""
+    updated_at: str = ""
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def registry_root() -> Path:
@@ -37,6 +44,9 @@ def write_record(record: RunRecord, *, root: Path | None = None) -> None:
     target_root = root or registry_root()
     target_root.mkdir(parents=True, exist_ok=True)
     payload = asdict(record)
+    now = utc_now()
+    payload["created_at"] = payload.get("created_at") or now
+    payload["updated_at"] = now
     payload["command"] = list(record.command)
     text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     _record_path(record.run_id, root=target_root).write_text(text, encoding="utf-8")
@@ -50,4 +60,21 @@ def read_record(ref: str = "last", *, root: Path | None = None) -> RunRecord:
         raise ValueError(f"run record not found: {ref}")
     payload: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
     payload["command"] = tuple(payload.get("command") or ())
+    payload.setdefault("created_at", "")
+    payload.setdefault("updated_at", "")
     return RunRecord(**payload)
+
+
+def list_records(*, root: Path | None = None) -> list[RunRecord]:
+    target_root = root or registry_root()
+    if not target_root.exists():
+        return []
+    records: list[RunRecord] = []
+    for path in sorted(target_root.glob("*.json")):
+        if path.name == "latest.json":
+            continue
+        try:
+            records.append(read_record(path.stem, root=target_root))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            continue
+    return sorted(records, key=lambda record: record.updated_at or record.created_at or record.run_id)

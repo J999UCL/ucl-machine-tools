@@ -14,10 +14,14 @@ scripts/ucl exec barbury-l --detach --new-session -- hostname
 scripts/ucl run --host barbury-l --local-dir ./bundle --script run.sh
 scripts/ucl tail last
 scripts/ucl fetch last
+scripts/ucl jobs
+scripts/ucl copy ./data barbury-l:/tmp/ucl-machine-tools/data --verify size
+scripts/ucl env barbury-l --remote-root /tmp/ucl-machine-tools/fpt --json
+scripts/ucl fanout --hosts barbury-l canada-l -- hostname
 ```
 
 The tool always checks/starts the `knuckles` SSH master connection before remote
-work. Remote transfers use SSH/tar streams, not `scp`, `sftp`, or `rsync`.
+work.
 
 ## Commands
 
@@ -34,8 +38,14 @@ work. Remote transfers use SSH/tar streams, not `scp`, `sftp`, or `rsync`.
   and records the run for `tail`/`fetch`.
 - `ucl run` uploads a local bundle, writes launcher files, and starts the bundle
   script in tmux.
-- `ucl tail last`, `ucl fetch last`, and `ucl clean HOST` operate on recorded
-  run metadata.
+- `ucl jobs`, `ucl info`, `ucl stop`, `ucl tail`, `ucl fetch`, and `ucl clean`
+  operate on recorded run metadata.
+- `ucl copy SRC DST` copies local or remote endpoints with `rsync`; add
+  `--verify size` or `--verify sha256` when you want explicit transfer checks.
+- `ucl env HOST --remote-root DIR` checks reachability, scratch/root state, TSG
+  setup scripts, `/tmp` space, and optional GPU availability.
+- `ucl fanout --hosts TARGET... -- COMMAND...` runs one synchronous check across
+  multiple selected hosts.
 
 ## Environment Setup
 

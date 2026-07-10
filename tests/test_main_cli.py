@@ -12,7 +12,8 @@ from typing import Any
 
 import pytest
 
-from ucl_machine_tools import launch, main_cli
+from ucl_machine_tools import copy as copy_tools
+from ucl_machine_tools import envcheck, launch, main_cli
 from ucl_machine_tools.registry import RunRecord, write_record
 
 
@@ -571,6 +572,44 @@ def test_ucl_exec_sync_json_includes_wrapper_error(capsys: pytest.CaptureFixture
     assert payload["stderr"] == "unknown wrapper error\n"
 
 
+def test_ucl_exec_json_is_clean_for_ssh_failure(capsys: pytest.CaptureFixture[str]) -> None:
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv():
+            return SimpleNamespace(returncode=255, stdout="VBoxManage noise\n", stderr="")
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["exec", "barbury-l", "--json", "hostname"], runner=runner) == 2
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["ok"] is False
+    assert payload["wrapper_error"] is True
+    assert payload["returncode"] == 255
+    assert "SSH failed before remote exec wrapper started" in payload["error"]
+    assert "VBoxManage" not in payload["stdout"]
+
+
+def test_ucl_exec_json_reports_command_failure_without_human_text(capsys: pytest.CaptureFixture[str]) -> None:
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv():
+            return ok(stdout=exec_stdout(stderr=b"bad\n", returncode=7))
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["exec", "barbury-l", "--json", "false"], runner=runner) == 7
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert captured.err == ""
+    assert payload["ok"] is False
+    assert payload["wrapper_error"] is False
+    assert payload["stderr"] == "bad\n"
+
+
 def test_ucl_exec_sync_filters_wrapper_startup_noise_from_errors(capsys: pytest.CaptureFixture[str]) -> None:
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         if argv[:3] == ["ssh", "-O", "check"]:
@@ -920,6 +959,146 @@ def test_ucl_clean_filters_login_noise(capsys: pytest.CaptureFixture[str]) -> No
     assert "VBoxManage" not in captured.err
 
 
+def test_ucl_jobs_info_and_stop_use_registry_and_tmux(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
+    write_record(
+        RunRecord(
+            run_id="demo",
+            kind="run",
+            host="barbury-l",
+            ssh_host="barbury-l",
+            session="demo",
+            window="run",
+            remote_dir="/tmp/ucl-machine-tools/launchers/demo",
+            log_path="/tmp/ucl-machine-tools/launchers/demo/run.log",
+            command=("bash", "run.sh"),
+        )
+    )
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        assert kwargs.get("shell", False) is False
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv(timeout_seconds=8) and "UCL_TMUX_JSON_BEGIN" in kwargs.get("input", ""):
+            return ok(stdout=tmux_stdout(["demo"]))
+        if argv == remote_python_argv() and "kill-window" in kwargs.get("input", ""):
+            return ok(stdout='{"returncode": 0, "stdout": "", "stderr": ""}\n')
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["jobs", "--json"], runner=runner) == 0
+    jobs_payload = json.loads(capsys.readouterr().out)
+    assert jobs_payload["jobs"][0]["status"] == "running"
+
+    assert main_cli.main(["info", "demo", "--json"], runner=runner) == 0
+    info_payload = json.loads(capsys.readouterr().out)
+    assert info_payload["run_id"] == "demo"
+    assert info_payload["status"] == "running"
+
+    assert main_cli.main(["stop", "demo", "--json"], runner=runner) == 0
+    stop_payload = json.loads(capsys.readouterr().out)
+    assert stop_payload["returncode"] == 0
+    assert stop_payload["session"] == "demo"
+
+
+def test_ucl_copy_dry_run_and_size_verify(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()
+    (src / "a.txt").write_text("hello", encoding="utf-8")
+
+    assert main_cli.main(["copy", str(src), str(dst), "--dry-run", "--partial", "--json"]) == 0
+    dry = json.loads(capsys.readouterr().out)
+    assert dry["dry_run"] is True
+    assert "--partial" in dry["argv"]
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        assert kwargs.get("shell", False) is False
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        assert argv[0] == "rsync"
+        (dst / "a.txt").write_text("hello", encoding="utf-8")
+        return ok(stdout="copied\n", stderr="VBoxManage: noisy login\n")
+
+    assert main_cli.main(["copy", str(src), str(dst), "--verify", "size", "--json"], runner=runner) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["verify"]["ok"] is True
+    assert "VBoxManage" not in payload["stderr"]
+
+
+def test_ucl_env_json_parses_remote_preflight(capsys: pytest.CaptureFixture[str]) -> None:
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv():
+            assert "/tmp/ucl-machine-tools/fpt" in kwargs["input"]
+            return ok(
+                stdout="\n".join(
+                    [
+                        envcheck.ENV_BEGIN,
+                        json.dumps(
+                            {
+                                "schema_version": 1,
+                                "remote_root": "/tmp/ucl-machine-tools/fpt",
+                                "root_exists": True,
+                                "root_created": False,
+                                "tmp_free_gb": 500,
+                                "cuda_visibility_script": "/usr/local/cuda/CUDA_VISIBILITY.csh",
+                                "cuda_visibility_exists": True,
+                                "python_setup_script": "/opt/Python/Python-3.11.5_Setup.csh",
+                                "python_setup_exists": True,
+                                "gpu": None,
+                                "gpu_info": None,
+                                "ok": True,
+                                "errors": [],
+                            }
+                        ),
+                        envcheck.ENV_END,
+                    ]
+                )
+            )
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    rc = main_cli.main(["env", "barbury-l", "--remote-root", "/tmp/ucl-machine-tools/fpt", "--json"], runner=runner)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["host"] == "barbury-l"
+    assert payload["root_exists"] is True
+
+
+def test_ucl_fanout_runs_command_in_catalog_order(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    catalog = write_status_catalog(tmp_path)
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv[-2:] == ["python3", "-"]:
+            host = argv[-3]
+            return ok(stdout=exec_stdout(stdout=f"{host}\n".encode()))
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    rc = main_cli.main(
+        ["fanout", "--hosts", "barbury-l", "canada-l", "--catalog", str(catalog), "--json", "--", "hostname"],
+        runner=runner,
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [row["host"] for row in payload["results"]] == ["barbury-l", "canada-l"]
+    assert [row["stdout"] for row in payload["results"]] == ["barbury-l\n", "canada-l\n"]
+
+
 def test_generated_remote_python_sources_compile() -> None:
     compile(
         main_cli._sync_exec_source({"mode": "command", "argv": ["hostname"], "timeout": 60.0}),
@@ -931,6 +1110,8 @@ def test_generated_remote_python_sources_compile() -> None:
     compile(main_cli._fetch_source("/tmp/demo"), "<fetch-source>", "exec")
     compile(main_cli._clean_source(7, False), "<clean-source>", "exec")
     compile(main_cli._clean_source(7, True), "<clean-source-execute>", "exec")
+    compile(envcheck.env_source(remote_root="/tmp/ucl-machine-tools/fpt", create=False, gpu=None), "<env-source>", "exec")
+    compile(copy_tools.manifest_source("/tmp/demo", sha256=False), "<copy-manifest-source>", "exec")
 
 
 def test_help_exposes_unified_commands_and_not_legacy_scripts(capsys: pytest.CaptureFixture[str]) -> None:

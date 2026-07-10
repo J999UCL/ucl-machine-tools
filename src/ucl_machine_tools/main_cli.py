@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import json
 import subprocess
 import sys
+import shlex
 from pathlib import Path
 from typing import Any
 
 from ucl_machine_tools.hosts import HostSpec, load_catalog, parse_selector
+from ucl_machine_tools import copy as copy_tools
+from ucl_machine_tools import envcheck
 from ucl_machine_tools import inventory
 from ucl_machine_tools.launch import (
     build_exec_plan,
@@ -24,7 +28,7 @@ from ucl_machine_tools.launch import (
     upload_bundle,
     write_launcher_files,
 )
-from ucl_machine_tools.registry import RunRecord, read_record, write_record
+from ucl_machine_tools.registry import RunRecord, list_records, read_record, write_record
 from ucl_machine_tools.ssh import build_remote_python_argv, ensure_knuckles_master
 
 TAIL_SENTINEL_BEGIN = "UCL_TAIL_TEXT_BEGIN"
@@ -70,6 +74,14 @@ Common use:
       Fetch small log/config/text artifacts from the latest recorded run.
   ucl clean barbury-l
       List old launcher dirs; add --execute only when deletion is intended.
+  ucl jobs
+      List recorded tmux-backed jobs and their current status.
+  ucl copy /tmp/a barbury-l:/tmp/a --verify size
+      Copy with rsync and optionally verify size/count or sha256 manifests.
+  ucl env barbury-l --remote-root /tmp/ucl-machine-tools/fpt --json
+      Check scratch, TSG setup scripts, and optional GPU availability.
+  ucl fanout --hosts barbury-l canada-l -- hostname
+      Run one small command across several selected hosts.
 
 Use 'ucl COMMAND --help' for command-specific flags.
 """,
@@ -110,6 +122,52 @@ Use 'ucl COMMAND --help' for command-specific flags.
     clean.add_argument("--catalog", type=Path)
     clean.add_argument("--execute", action="store_true", help="delete listed launcher directories")
     clean.add_argument("--older-than-days", type=int, default=7)
+
+    jobs = subparsers.add_parser("jobs", help="List recorded tmux-backed jobs.")
+    jobs.add_argument("--json", action="store_true")
+    jobs.add_argument("--all", action="store_true")
+    jobs.add_argument("--catalog", type=Path)
+    jobs.add_argument("--timeout-seconds", type=int, default=8)
+
+    info = subparsers.add_parser("info", help="Show one recorded job.")
+    info.add_argument("run_ref", nargs="?", default="last")
+    info.add_argument("--json", action="store_true")
+    info.add_argument("--catalog", type=Path)
+    info.add_argument("--timeout-seconds", type=int, default=8)
+
+    stop = subparsers.add_parser("stop", help="Stop one recorded tmux job.")
+    stop.add_argument("run_ref", nargs="?", default="last")
+    stop.add_argument("--signal", choices=("TERM", "KILL"), default="TERM")
+    stop.add_argument("--json", action="store_true")
+    stop.add_argument("--timeout-seconds", type=int, default=8)
+
+    copy = subparsers.add_parser("copy", help="Copy local/remote paths with rsync.")
+    copy.add_argument("src")
+    copy.add_argument("dst")
+    copy.add_argument("--catalog", type=Path)
+    copy.add_argument("--verify", choices=("size", "sha256", "none"), default="none")
+    copy.add_argument("--partial", action="store_true")
+    copy.add_argument("--dry-run", action="store_true")
+    copy.add_argument("--json", action="store_true")
+
+    env = subparsers.add_parser("env", help="Check one host and a remote scratch root.")
+    env.add_argument("host")
+    env.add_argument("--catalog", type=Path)
+    env.add_argument("--remote-root", required=True)
+    env.add_argument("--gpu", help="GPU id or auto")
+    env.add_argument("--create", action="store_true")
+    env.add_argument("--json", action="store_true")
+
+    fanout = subparsers.add_parser("fanout", help="Run a synchronous command across hosts.")
+    fanout.add_argument("--hosts", nargs="+", required=True)
+    fanout.add_argument("--catalog", type=Path)
+    fanout.add_argument("--jobs", type=int, default=4)
+    fanout.add_argument("--timeout-seconds", type=int, default=60)
+    fanout.add_argument("--json", action="store_true")
+    fanout.add_argument("--stdin", action="store_true")
+    fanout.add_argument("--shell", choices=("bash", "csh"), default="bash")
+    fanout.add_argument("--gpu", help="GPU id or auto")
+    fanout.add_argument("fanout_command", nargs=argparse.REMAINDER, metavar="COMMAND")
 
     return parser
 
@@ -610,8 +668,12 @@ def _format_sync_exec_json(
     args: argparse.Namespace,
     result: dict[str, Any],
 ) -> str:
+    decoded_stdout = _decode_stream(result["stdout"])
+    decoded_stderr = _decode_stream(result["stderr"])
+    ok = int(result["returncode"]) == 0 and not result["timed_out"] and not result["wrapper_error"]
     return json.dumps(
         {
+            "ok": ok,
             "host": host.name,
             "ssh_host": host.ssh_host,
             "command": list(command),
@@ -620,8 +682,41 @@ def _format_sync_exec_json(
             "timed_out": result["timed_out"],
             "wrapper_error": result["wrapper_error"],
             "returncode": result["returncode"],
-            "stdout": _decode_stream(result["stdout"]),
-            "stderr": _decode_stream(result["stderr"]),
+            "stdout": decoded_stdout,
+            "stderr": decoded_stderr,
+            "error": "" if ok else (decoded_stderr.strip() or f"remote command exited {result['returncode']}"),
+        },
+        indent=2,
+        sort_keys=True,
+    )
+
+
+def _format_sync_exec_error_json(
+    *,
+    host: HostSpec,
+    command: tuple[str, ...],
+    args: argparse.Namespace,
+    error: str,
+    returncode: int = 2,
+    stdout: str = "",
+    stderr: str = "",
+    wrapper_error: bool = True,
+    timed_out: bool = False,
+) -> str:
+    return json.dumps(
+        {
+            "ok": False,
+            "host": host.name,
+            "ssh_host": host.ssh_host,
+            "command": list(command),
+            "cwd": args.cwd,
+            "timeout": None if args.timeout == 0 else args.timeout,
+            "timed_out": timed_out,
+            "wrapper_error": wrapper_error,
+            "returncode": returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "error": error,
         },
         indent=2,
         sort_keys=True,
@@ -658,19 +753,46 @@ def run_exec_sync(
         shell=False,
     )
     if int(getattr(proc, "returncode", 1)) != 0:
-        raise RuntimeError(
-            _exec_wrapper_failure_message(
-                host=host,
-                returncode=int(getattr(proc, "returncode", 1)),
-                stdout=getattr(proc, "stdout", "") or "",
-                stderr=getattr(proc, "stderr", "") or "",
-            )
+        message = _exec_wrapper_failure_message(
+            host=host,
+            returncode=int(getattr(proc, "returncode", 1)),
+            stdout=getattr(proc, "stdout", "") or "",
+            stderr=getattr(proc, "stderr", "") or "",
         )
-    result = _parse_sync_exec_result(
-        host=host,
-        stdout=getattr(proc, "stdout", "") or "",
-        stderr=getattr(proc, "stderr", "") or "",
-    )
+        if args.json:
+            print(
+                _format_sync_exec_error_json(
+                    host=host,
+                    command=command,
+                    args=args,
+                    error=message,
+                    returncode=int(getattr(proc, "returncode", 1)),
+                    stdout=_strip_remote_noise(getattr(proc, "stdout", "") or ""),
+                    stderr=_strip_remote_noise(getattr(proc, "stderr", "") or ""),
+                )
+            )
+            return 2
+        raise RuntimeError(message)
+    try:
+        result = _parse_sync_exec_result(
+            host=host,
+            stdout=getattr(proc, "stdout", "") or "",
+            stderr=getattr(proc, "stderr", "") or "",
+        )
+    except RuntimeError as exc:
+        if args.json:
+            print(
+                _format_sync_exec_error_json(
+                    host=host,
+                    command=command,
+                    args=args,
+                    error=str(exc),
+                    stdout=_strip_remote_noise(getattr(proc, "stdout", "") or ""),
+                    stderr=_strip_remote_noise(getattr(proc, "stderr", "") or ""),
+                )
+            )
+            return 2
+        raise
     if args.json:
         print(_format_sync_exec_json(host=host, command=command, args=args, result=result))
     else:
@@ -978,6 +1100,297 @@ def run_clean(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     return int(getattr(proc, "returncode", 0))
 
 
+def _record_status(record: RunRecord, *, runner=subprocess.run, timeout_seconds: int = 8) -> dict[str, Any]:
+    host = HostSpec(name=record.host, ssh_host=record.ssh_host)
+    try:
+        sessions = list_remote_sessions(host, runner=runner, timeout_seconds=timeout_seconds)
+    except Exception as exc:  # noqa: BLE001 - status should report per-job failures.
+        return {"status": "unreachable", "error": str(exc), "sessions": []}
+    if record.session in sessions:
+        return {"status": "running", "error": "", "sessions": list(sessions)}
+    return {"status": "exited_or_missing", "error": "", "sessions": list(sessions)}
+
+
+def _record_payload(record: RunRecord, *, runner=subprocess.run, timeout_seconds: int = 8) -> dict[str, Any]:
+    status = _record_status(record, runner=runner, timeout_seconds=timeout_seconds)
+    return {
+        "run_id": record.run_id,
+        "kind": record.kind,
+        "host": record.host,
+        "ssh_host": record.ssh_host,
+        "session": record.session,
+        "window": record.window,
+        "remote_dir": record.remote_dir,
+        "log_path": record.log_path,
+        "command": list(record.command),
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+        **status,
+    }
+
+
+def _format_jobs_table(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return "RUN_ID  STATUS  HOST  SESSION  WINDOW  KIND  UPDATED"
+    columns = ("RUN_ID", "STATUS", "HOST", "SESSION", "WINDOW", "KIND", "UPDATED")
+    data = [
+        [
+            row.get("run_id", ""),
+            row.get("status", ""),
+            row.get("host", ""),
+            row.get("session", ""),
+            row.get("window", ""),
+            row.get("kind", ""),
+            row.get("updated_at") or row.get("created_at") or "",
+        ]
+        for row in rows
+    ]
+    widths = [len(col) for col in columns]
+    for row in data:
+        widths = [max(width, len(str(cell))) for width, cell in zip(widths, row)]
+    lines = ["  ".join(col.ljust(width) for col, width in zip(columns, widths))]
+    lines.extend("  ".join(str(cell).ljust(width) for cell, width in zip(row, widths)) for row in data)
+    return "\n".join(lines)
+
+
+def run_jobs(args: argparse.Namespace, *, runner=subprocess.run) -> int:
+    ensure_knuckles_master(runner=runner)
+    rows = [_record_payload(record, runner=runner, timeout_seconds=args.timeout_seconds) for record in list_records()]
+    if args.json:
+        print(json.dumps({"jobs": rows}, indent=2, sort_keys=True))
+    else:
+        print(_format_jobs_table(rows))
+    return 0
+
+
+def run_info(args: argparse.Namespace, *, runner=subprocess.run) -> int:
+    ensure_knuckles_master(runner=runner)
+    row = _record_payload(read_record(args.run_ref), runner=runner, timeout_seconds=args.timeout_seconds)
+    if args.json:
+        print(json.dumps(row, indent=2, sort_keys=True))
+    else:
+        for key in ("run_id", "status", "kind", "host", "session", "window", "remote_dir", "log_path", "command", "created_at", "updated_at", "error"):
+            value = row.get(key)
+            if isinstance(value, list):
+                value = " ".join(str(item) for item in value)
+            print(f"{key}: {value}")
+    return 0
+
+
+def _stop_source(session: str, window: str, signal: str) -> str:
+    return f"""
+import json
+import os
+import signal as signal_mod
+import subprocess
+SESSION={json.dumps(session)}
+WINDOW={json.dumps(window)}
+SIGNAL={json.dumps(signal)}
+target = SESSION + ":" + WINDOW
+sig = signal_mod.SIGKILL if SIGNAL == "KILL" else signal_mod.SIGTERM
+pane = subprocess.run(["tmux", "display-message", "-p", "-t", target, "#{{pane_pid}}"], capture_output=True, text=True)
+signal_error = ""
+if pane.returncode == 0 and pane.stdout.strip().isdigit():
+    pid = int(pane.stdout.strip())
+    try:
+        os.killpg(os.getpgid(pid), sig)
+    except Exception as exc:
+        signal_error = f"{{type(exc).__name__}}: {{exc}}"
+proc = subprocess.run(["tmux", "kill-window", "-t", target], capture_output=True, text=True)
+if proc.returncode != 0 and "can't find window" in proc.stderr:
+    proc = subprocess.run(["tmux", "kill-session", "-t", SESSION], capture_output=True, text=True)
+print(json.dumps({{"returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "signal_error": signal_error}}, sort_keys=True))
+raise SystemExit(proc.returncode)
+"""
+
+
+def run_stop(args: argparse.Namespace, *, runner=subprocess.run) -> int:
+    record = read_record(args.run_ref)
+    ensure_knuckles_master(runner=runner)
+    proc = runner(
+        _ssh_python_argv(record.ssh_host),
+        input=_stop_source(record.session, record.window, args.signal),
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
+    payload: dict[str, Any] = {
+        "run_id": record.run_id,
+        "host": record.host,
+        "session": record.session,
+        "window": record.window,
+        "returncode": int(getattr(proc, "returncode", 1)),
+        "stdout": getattr(proc, "stdout", "") or "",
+        "stderr": getattr(proc, "stderr", "") or "",
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(f"run_id: {record.run_id}")
+        print(f"target: {record.session}:{record.window}")
+        print("status: stopped" if payload["returncode"] == 0 else "status: stop_failed")
+        if payload["stderr"]:
+            print(payload["stderr"], file=sys.stderr, end="")
+    return 0 if payload["returncode"] == 0 else 2
+
+
+def _copy_endpoint_manifest(endpoint: copy_tools.Endpoint, *, verify: str, runner=subprocess.run) -> dict[str, Any]:
+    return copy_tools.read_manifest(endpoint, sha256=(verify == "sha256"), runner=runner)
+
+
+def run_copy(args: argparse.Namespace, *, runner=subprocess.run) -> int:
+    src = copy_tools.parse_endpoint(args.src)
+    dst = copy_tools.parse_endpoint(args.dst)
+    if src.host:
+        copy_tools.resolve_endpoint_host(src, args.catalog)
+    if dst.host:
+        copy_tools.resolve_endpoint_host(dst, args.catalog)
+    ensure_knuckles_master(runner=runner)
+    before = None
+    if args.verify != "none" and not args.dry_run:
+        before = _copy_endpoint_manifest(src, verify=args.verify, runner=runner)
+    if src.host and dst.host:
+        argv = copy_tools.build_remote_to_remote_argv(src, dst, partial=args.partial, dry_run=args.dry_run)
+    else:
+        argv = copy_tools.build_rsync_argv(src, dst, partial=args.partial, dry_run=args.dry_run)
+    if args.dry_run:
+        payload = {"src": args.src, "dst": args.dst, "argv": argv, "dry_run": True, "verify": args.verify}
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print(" ".join(shlex.quote(part) for part in argv))
+        return 0
+    proc = runner(argv, capture_output=True, text=True, shell=False)
+    ok = int(getattr(proc, "returncode", 1)) == 0
+    verify_payload: dict[str, Any] = {"mode": args.verify, "ok": None, "message": "skipped"}
+    if ok and args.verify != "none" and before is not None:
+        after = _copy_endpoint_manifest(dst, verify=args.verify, runner=runner)
+        verify_ok, message = copy_tools.compare_manifests(before, after, sha256=(args.verify == "sha256"))
+        verify_payload = {"mode": args.verify, "ok": verify_ok, "message": message}
+        ok = ok and verify_ok
+    payload = {
+        "ok": ok,
+        "src": args.src,
+        "dst": args.dst,
+        "returncode": int(getattr(proc, "returncode", 1)),
+        "stdout": _strip_remote_noise(getattr(proc, "stdout", "") or ""),
+        "stderr": _strip_remote_noise(getattr(proc, "stderr", "") or ""),
+        "verify": verify_payload,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        if payload["stdout"]:
+            print(payload["stdout"], end="")
+        if payload["stderr"]:
+            print(payload["stderr"], file=sys.stderr, end="")
+        print(f"verify: {verify_payload['message']}")
+    return 0 if ok else 2
+
+
+def run_env(args: argparse.Namespace, *, runner=subprocess.run) -> int:
+    host = _resolve_one_host(args.host, catalog_path=args.catalog)
+    ensure_knuckles_master(runner=runner)
+    gpu = args.gpu
+    if gpu == "auto":
+        rows = inventory.collect([host], runner=runner, jobs=1)
+        gpu = _best_free_gpu(rows[0], min_free_vram_gb=4.0)
+    payload = envcheck.run_env_check(host, remote_root=args.remote_root, create=args.create, gpu=gpu, runner=runner)
+    payload.update({"host": host.name, "ssh_host": host.ssh_host})
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(f"host: {host.name}")
+        print(f"remote_root: {payload['remote_root']}")
+        print(f"root_exists: {payload['root_exists']}")
+        print(f"tmp_free_gb: {payload['tmp_free_gb']}")
+        print(f"cuda_visibility: {'yes' if payload['cuda_visibility_exists'] else 'no'}")
+        print(f"python_setup: {'yes' if payload['python_setup_exists'] else 'no'}")
+        print(f"ok: {payload['ok']}")
+    return 0 if payload.get("ok") else 2
+
+
+def _fanout_one(host: HostSpec, args: argparse.Namespace, command: tuple[str, ...], stdin_body: str | None, *, runner=subprocess.run) -> dict[str, Any]:
+    local_args = argparse.Namespace(
+        dry_run=False,
+        stdin=args.stdin,
+        shell=args.shell,
+        timeout=float(args.timeout_seconds),
+        cwd=None,
+        json=False,
+        gpu=args.gpu,
+        env=[],
+    )
+    try:
+        env = _resolve_env(local_args, host, runner=runner)
+        params = {
+            "mode": "stdin" if args.stdin else "command",
+            "argv": list(command),
+            "stdin_b64": base64.b64encode((stdin_body or "").encode("utf-8")).decode("ascii"),
+            "env": dict(env),
+            "shell": args.shell,
+            "cwd": None,
+            "timeout": float(args.timeout_seconds),
+        }
+        proc = runner(
+            _ssh_python_argv(host.ssh_host),
+            input=_sync_exec_source(params),
+            capture_output=True,
+            text=True,
+            shell=False,
+        )
+        if int(getattr(proc, "returncode", 1)) != 0:
+            return {
+                "host": host.name,
+                "ok": False,
+                "returncode": int(getattr(proc, "returncode", 1)),
+                "stdout": _strip_remote_noise(getattr(proc, "stdout", "") or ""),
+                "stderr": _strip_remote_noise(getattr(proc, "stderr", "") or ""),
+                "error": _exec_wrapper_failure_message(host=host, returncode=int(getattr(proc, "returncode", 1)), stdout=getattr(proc, "stdout", "") or "", stderr=getattr(proc, "stderr", "") or ""),
+            }
+        result = _parse_sync_exec_result(host=host, stdout=getattr(proc, "stdout", "") or "", stderr=getattr(proc, "stderr", "") or "")
+        return {
+            "host": host.name,
+            "ok": int(result["returncode"]) == 0 and not result["timed_out"] and not result["wrapper_error"],
+            "returncode": int(result["returncode"]),
+            "stdout": _decode_stream(result["stdout"]),
+            "stderr": _decode_stream(result["stderr"]),
+            "timed_out": result["timed_out"],
+            "wrapper_error": result["wrapper_error"],
+            "error": "",
+        }
+    except Exception as exc:  # noqa: BLE001 - fanout reports per-host errors.
+        return {"host": host.name, "ok": False, "returncode": 2, "stdout": "", "stderr": "", "error": str(exc)}
+
+
+def run_fanout(args: argparse.Namespace, *, runner=subprocess.run) -> int:
+    command = _strip_remainder(args.fanout_command)
+    if args.stdin and command:
+        raise RuntimeError("--stdin cannot be used with COMMAND arguments")
+    if not args.stdin and not command:
+        raise RuntimeError("fanout requires COMMAND or --stdin")
+    catalog = load_catalog(args.catalog)
+    hosts = _resolve_status_targets(tuple(args.hosts), catalog=catalog)
+    ensure_knuckles_master(runner=runner)
+    stdin_body = sys.stdin.read() if args.stdin else None
+    rows: list[dict[str, Any]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(args.jobs))) as executor:
+        future_to_host = {executor.submit(_fanout_one, host, args, command, stdin_body, runner=runner): host for host in hosts}
+        by_host: dict[str, dict[str, Any]] = {}
+        for future in concurrent.futures.as_completed(future_to_host):
+            row = future.result()
+            by_host[row["host"]] = row
+        rows = [by_host[host.name] for host in hosts]
+    if args.json:
+        print(json.dumps({"results": rows}, indent=2, sort_keys=True))
+    else:
+        for row in rows:
+            status = "ok" if row.get("ok") else "fail"
+            first = (row.get("stdout") or row.get("stderr") or row.get("error") or "").strip().splitlines()
+            print(f"{row['host']}: {status} rc={row.get('returncode')} {first[0] if first else ''}".rstrip())
+    return 0 if all(row.get("ok") for row in rows) else 2
+
+
 def _clean_source(days: int, execute: bool) -> str:
     return f"""
 import json
@@ -1038,6 +1451,18 @@ def main(argv: list[str] | None = None, *, runner=subprocess.run, popener=subpro
             return run_fetch(args, runner=runner, popener=popener)
         if args.command == "clean":
             return run_clean(args, runner=runner)
+        if args.command == "jobs":
+            return run_jobs(args, runner=runner)
+        if args.command == "info":
+            return run_info(args, runner=runner)
+        if args.command == "stop":
+            return run_stop(args, runner=runner)
+        if args.command == "copy":
+            return run_copy(args, runner=runner)
+        if args.command == "env":
+            return run_env(args, runner=runner)
+        if args.command == "fanout":
+            return run_fanout(args, runner=runner)
     except Exception as exc:  # noqa: BLE001 - CLI should render concise failures.
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
