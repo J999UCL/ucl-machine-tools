@@ -138,8 +138,9 @@ Use 'ucl COMMAND --help' for command-specific flags.
     info.add_argument("--timeout-seconds", type=int, default=8)
 
     stop = subparsers.add_parser("stop", help="Stop one recorded tmux job.")
-    stop.add_argument("run_ref", nargs="?", default="last")
+    stop.add_argument("run_ref", help="run id to stop; use 'last --yes' only when intentional")
     stop.add_argument("--signal", choices=("TERM", "KILL"), default="TERM")
+    stop.add_argument("--yes", action="store_true", help="allow stopping the latest recorded run via 'last'")
     stop.add_argument("--json", action="store_true")
     stop.add_argument("--timeout-seconds", type=int, default=8)
 
@@ -1307,6 +1308,8 @@ raise SystemExit(proc.returncode)
 
 
 def run_stop(args: argparse.Namespace, *, runner=subprocess.run) -> int:
+    if args.run_ref == "last" and not args.yes:
+        raise RuntimeError("refusing to stop 'last' without --yes; pass an explicit run id or use 'ucl stop last --yes'")
     record = read_record(args.run_ref)
     ensure_knuckles_master(runner=runner)
     proc = runner(

@@ -1114,6 +1114,52 @@ def test_ucl_jobs_info_and_stop_use_registry_and_tmux(
     assert stop_payload["session"] == "demo"
 
 
+def test_ucl_stop_requires_explicit_ref_or_yes_for_last(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
+    write_record(
+        RunRecord(
+            run_id="demo",
+            kind="run",
+            host="barbury-l",
+            ssh_host="barbury-l",
+            session="demo",
+            window="run",
+            remote_dir="/tmp/ucl-machine-tools/launchers/demo",
+            log_path="/tmp/ucl-machine-tools/launchers/demo/run.log",
+            command=("bash", "run.sh"),
+        )
+    )
+
+    assert main_cli.main(["stop"]) == 2
+    assert "run_ref" in capsys.readouterr().err
+
+    calls: list[list[str]] = []
+    stop_payload_seen = False
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        nonlocal stop_payload_seen
+        calls.append(argv)
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv() and "kill-window" in kwargs.get("input", ""):
+            stop_payload_seen = True
+            return ok(stdout='{"returncode": 0, "stdout": "", "stderr": ""}\n')
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["stop", "last"], runner=runner) == 2
+    assert "refusing to stop 'last' without --yes" in capsys.readouterr().err
+    assert calls == []
+
+    assert main_cli.main(["stop", "last", "--yes", "--json"], runner=runner) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["run_id"] == "demo"
+    assert stop_payload_seen is True
+
+
 def test_ucl_copy_dry_run_and_size_verify(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
