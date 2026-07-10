@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import hashlib
 import io
 import json
 import re
@@ -14,7 +15,7 @@ import pytest
 
 from ucl_machine_tools import copy as copy_tools
 from ucl_machine_tools import envcheck, launch, main_cli
-from ucl_machine_tools.registry import RunRecord, write_record
+from ucl_machine_tools.registry import RunRecord, read_record, write_record
 
 
 def ok(stdout: str = "", stderr: str = "") -> SimpleNamespace:
@@ -317,6 +318,7 @@ def test_ucl_run_full_fake_path_writes_registry(
         if "cat >" in joined:
             assert "exec > >(tee -a" in kwargs["input"]
             assert "export CUDA_VISIBLE_DEVICES=0" in kwargs["input"]
+            assert "export SECRET_TOKEN=abc" in kwargs["input"]
             return ok()
         if "tmux new-window" in joined:
             return ok()
@@ -331,6 +333,10 @@ def test_ucl_run_full_fake_path_writes_registry(
             "auto",
             "--min-free-vram-gb",
             "22",
+            "--env",
+            "SECRET_TOKEN=abc",
+            "--project",
+            "fpt",
             "--session",
             "work",
             "--local-dir",
@@ -349,7 +355,19 @@ def test_ucl_run_full_fake_path_writes_registry(
     assert "session:    work" in out
     latest = tmp_path / "cache" / "runs" / "latest.json"
     assert latest.exists()
-    assert json.loads(latest.read_text(encoding="utf-8"))["kind"] == "run"
+    payload = json.loads(latest.read_text(encoding="utf-8"))
+    assert payload["kind"] == "run"
+    provenance = payload["provenance"]
+    assert provenance["project"] == "fpt"
+    assert provenance["selected_gpu"] == "0"
+    assert provenance["bundle_path"] == str(bundle.resolve())
+    expected_script_sha = hashlib.sha256((bundle / "run.sh").read_bytes()).hexdigest()
+    assert provenance["script_sha256"] == expected_script_sha
+    assert "local_git_sha" in provenance
+    assert "CUDA_VISIBLE_DEVICES" in provenance["env_keys"]
+    assert "SECRET_TOKEN" in provenance["env_keys"]
+    assert provenance["env"]["SECRET_TOKEN"] == "<redacted>"
+    assert "abc" not in json.dumps(provenance)
 
 
 def test_ucl_run_requires_explicit_session(
@@ -362,6 +380,32 @@ def test_ucl_run_requires_explicit_session(
 
     assert rc == 2
     assert "ucl run requires --session NAME or --new-session" in capsys.readouterr().err
+
+
+def test_run_registry_backfills_missing_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
+    runs = tmp_path / "cache" / "runs"
+    runs.mkdir(parents=True)
+    payload = {
+        "run_id": "old",
+        "kind": "run",
+        "host": "barbury-l",
+        "ssh_host": "barbury-l",
+        "session": "old",
+        "window": "run",
+        "remote_dir": "/tmp/ucl-machine-tools/launchers/old",
+        "log_path": "/tmp/ucl-machine-tools/launchers/old/run.log",
+        "command": ["bash", "run.sh"],
+    }
+    (runs / "old.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    record = read_record("old")
+
+    assert record.command == ("bash", "run.sh")
+    assert record.provenance == {}
 
 
 def test_ucl_exec_sync_command_prints_output_and_preserves_argv(
@@ -931,10 +975,37 @@ def test_ucl_exec_detach_preserves_tmux_path(
             return ok()
         raise AssertionError(f"unexpected argv: {argv}")
 
-    assert main_cli.main(["exec", "barbury-l", "--detach", "--", "hostname"], runner=runner) == 0
+    assert (
+        main_cli.main(
+            [
+                "exec",
+                "barbury-l",
+                "--detach",
+                "--gpu",
+                "1",
+                "--env",
+                "SECRET_TOKEN=abc",
+                "--project",
+                "smoke",
+                "--",
+                "hostname",
+            ],
+            runner=runner,
+        )
+        == 0
+    )
 
     assert "session:    work" in capsys.readouterr().out
     assert any("tmux new-window" in " ".join(call) for call in calls)
+    payload = json.loads((tmp_path / "cache" / "runs" / "latest.json").read_text(encoding="utf-8"))
+    provenance = payload["provenance"]
+    assert provenance["project"] == "smoke"
+    assert provenance["selected_gpu"] == "1"
+    assert provenance["bundle_path"] == ""
+    assert provenance["script_sha256"] == ""
+    assert "local_git_sha" in provenance
+    assert provenance["env"]["SECRET_TOKEN"] == "<redacted>"
+    assert "abc" not in json.dumps(provenance)
 
 
 def test_ucl_exec_detach_requires_explicit_session_when_no_existing_tmux(
@@ -1114,6 +1185,7 @@ def test_ucl_fetch_filters_login_noise(
             remote_dir="/tmp/ucl-machine-tools/launchers/demo",
             log_path="/tmp/ucl-machine-tools/launchers/demo/run.log",
             command=("bash", "run.sh"),
+            provenance={"project": "fpt", "selected_gpu": "0"},
         )
     )
     tar_buf = io.BytesIO()
@@ -1222,6 +1294,7 @@ def test_ucl_jobs_info_and_stop_use_registry_and_tmux(
             remote_dir="/tmp/ucl-machine-tools/launchers/demo",
             log_path="/tmp/ucl-machine-tools/launchers/demo/run.log",
             command=("bash", "run.sh"),
+            provenance={"project": "fpt", "selected_gpu": "0"},
         )
     )
 
@@ -1238,11 +1311,14 @@ def test_ucl_jobs_info_and_stop_use_registry_and_tmux(
     assert main_cli.main(["jobs", "--json"], runner=runner) == 0
     jobs_payload = json.loads(capsys.readouterr().out)
     assert jobs_payload["jobs"][0]["status"] == "running"
+    assert jobs_payload["jobs"][0]["project"] == "fpt"
+    assert jobs_payload["jobs"][0]["selected_gpu"] == "0"
 
     assert main_cli.main(["info", "demo", "--json"], runner=runner) == 0
     info_payload = json.loads(capsys.readouterr().out)
     assert info_payload["run_id"] == "demo"
     assert info_payload["status"] == "running"
+    assert info_payload["provenance"]["project"] == "fpt"
 
     assert main_cli.main(["stop", "demo", "--json"], runner=runner) == 0
     stop_payload = json.loads(capsys.readouterr().out)

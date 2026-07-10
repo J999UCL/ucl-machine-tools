@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import concurrent.futures
+import hashlib
 import json
 import subprocess
 import sys
@@ -202,6 +203,7 @@ def _add_launch_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--env", action="append", default=[], help="remote env KEY=VALUE; repeat for multiple vars")
     parser.add_argument("--gpu", help="GPU id or auto")
     parser.add_argument("--min-free-vram-gb", type=float, default=DEFAULT_AUTO_GPU_MIN_FREE_VRAM_GB, help="minimum free VRAM for --gpu auto")
+    parser.add_argument("--project", help="project tag stored in run provenance")
     parser.add_argument("--shell", choices=("bash", "csh"), default="bash", help="shell used for the generated payload")
     parser.add_argument("--session", help="tmux session to use or create")
     parser.add_argument("--new-session", action="store_true", help="force creating a new tmux session")
@@ -231,6 +233,7 @@ Examples:
     parser.add_argument("--env", action="append", default=[], help="remote env KEY=VALUE; repeat for multiple vars")
     parser.add_argument("--gpu", help="GPU id or auto")
     parser.add_argument("--min-free-vram-gb", type=float, default=DEFAULT_AUTO_GPU_MIN_FREE_VRAM_GB, help="minimum free VRAM for --gpu auto")
+    parser.add_argument("--project", help="project tag stored in run provenance")
     parser.add_argument("--shell", choices=("bash", "csh"), default="bash", help="shell used only with --stdin")
     parser.add_argument("--stdin", action="store_true", help="read a script from stdin")
     parser.add_argument("--timeout", type=float, default=60.0, help="remote command timeout in seconds; 0 disables")
@@ -289,6 +292,7 @@ def _parse_exec_argv(tokens: list[str]) -> argparse.Namespace:
         "env": [],
         "gpu": None,
         "min_free_vram_gb": DEFAULT_AUTO_GPU_MIN_FREE_VRAM_GB,
+        "project": None,
         "shell": "bash",
         "stdin": False,
         "timeout": 60.0,
@@ -317,6 +321,7 @@ def _parse_exec_argv(tokens: list[str]) -> argparse.Namespace:
         "--env": "env",
         "--gpu": "gpu",
         "--min-free-vram-gb": "min_free_vram_gb",
+        "--project": "project",
         "--shell": "shell",
         "--timeout": "timeout",
         "--connect-timeout": "connect_timeout",
@@ -491,6 +496,77 @@ def _gpu_env(
 
 def _resolve_env(args: argparse.Namespace, host: HostSpec, *, runner) -> tuple[tuple[str, str], ...]:
     return (*parse_env(args.env), *_gpu_env(args, host, runner=runner))
+
+
+def _selected_gpu(env: tuple[tuple[str, str], ...]) -> str:
+    for key, value in env:
+        if key == "CUDA_VISIBLE_DEVICES":
+            return value
+    return ""
+
+
+def _git_sha(path: Path | None) -> str:
+    if path is None:
+        return ""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            shell=False,
+        )
+    except Exception:
+        return ""
+    if int(getattr(proc, "returncode", 1)) != 0:
+        return ""
+    return (getattr(proc, "stdout", "") or "").strip()
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _script_path_for_plan(plan) -> Path | None:
+    if plan.local_dir is None or not plan.command:
+        return None
+    if plan.command[0] != "bash" or len(plan.command) < 2:
+        return None
+    return (plan.local_dir / plan.command[1]).resolve()
+
+
+def _provenance_for_plan(
+    plan,
+    *,
+    args: argparse.Namespace,
+    env: tuple[tuple[str, str], ...],
+    stdin_body: str | None,
+) -> dict[str, Any]:
+    script_path = _script_path_for_plan(plan)
+    script_sha = ""
+    if script_path is not None and script_path.is_file():
+        script_sha = _file_sha256(script_path)
+    elif stdin_body is not None:
+        script_sha = _sha256_bytes(stdin_body.encode("utf-8"))
+    bundle_path = str(plan.local_dir) if plan.local_dir is not None else ""
+    git_path = plan.local_dir or Path.cwd()
+    return {
+        "project": getattr(args, "project", None) or "",
+        "local_git_sha": _git_sha(git_path),
+        "script_sha256": script_sha,
+        "bundle_path": bundle_path,
+        "selected_gpu": _selected_gpu(env),
+        "env": {key: "<redacted>" for key, _ in sorted(env)},
+        "env_keys": sorted({key for key, _ in env}),
+        "remote_root": plan.remote_root,
+    }
 
 
 def _filter_status_rows(mode: str, args: argparse.Namespace, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -981,7 +1057,8 @@ def run_run(args: argparse.Namespace, *, runner=subprocess.run, popener=subproce
     upload_bundle(plan, runner=runner, popener=popener)
     launcher = write_launcher_files(plan, runner=runner)
     launch_tmux(plan, decision, launcher, runner=runner)
-    write_record(_record_from_plan(plan, decision))
+    provenance = _provenance_for_plan(plan, args=args, env=env, stdin_body=None)
+    write_record(_record_from_plan(plan, decision, provenance=provenance))
     print(format_summary(plan, decision))
     return 0
 
@@ -1041,12 +1118,13 @@ def run_exec(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     create_remote_dir(plan, runner=runner)
     launcher = write_launcher_files(plan, runner=runner)
     launch_tmux(plan, decision, launcher, runner=runner)
-    write_record(_record_from_plan(plan, decision))
+    provenance = _provenance_for_plan(plan, args=args, env=env, stdin_body=stdin_body)
+    write_record(_record_from_plan(plan, decision, provenance=provenance))
     print(format_summary(plan, decision))
     return 0
 
 
-def _record_from_plan(plan, decision) -> RunRecord:
+def _record_from_plan(plan, decision, *, provenance: dict[str, Any] | None = None) -> RunRecord:
     return RunRecord(
         run_id=plan.run_id,
         kind=plan.kind,
@@ -1057,6 +1135,7 @@ def _record_from_plan(plan, decision) -> RunRecord:
         remote_dir=plan.remote_dir,
         log_path=plan.log_path,
         command=plan.command,
+        provenance=provenance or {},
     )
 
 
@@ -1249,6 +1328,7 @@ def _record_status(record: RunRecord, *, runner=subprocess.run, timeout_seconds:
 
 def _record_payload(record: RunRecord, *, runner=subprocess.run, timeout_seconds: int = 8) -> dict[str, Any]:
     status = _record_status(record, runner=runner, timeout_seconds=timeout_seconds)
+    provenance = record.provenance or {}
     return {
         "run_id": record.run_id,
         "kind": record.kind,
@@ -1261,19 +1341,24 @@ def _record_payload(record: RunRecord, *, runner=subprocess.run, timeout_seconds
         "command": list(record.command),
         "created_at": record.created_at,
         "updated_at": record.updated_at,
+        "project": provenance.get("project", ""),
+        "selected_gpu": provenance.get("selected_gpu", ""),
+        "provenance": provenance,
         **status,
     }
 
 
 def _format_jobs_table(rows: list[dict[str, Any]]) -> str:
     if not rows:
-        return "RUN_ID  STATUS  HOST  SESSION  WINDOW  KIND  UPDATED"
-    columns = ("RUN_ID", "STATUS", "HOST", "SESSION", "WINDOW", "KIND", "UPDATED")
+        return "RUN_ID  STATUS  PROJECT  HOST  GPU  SESSION  WINDOW  KIND  UPDATED"
+    columns = ("RUN_ID", "STATUS", "PROJECT", "HOST", "GPU", "SESSION", "WINDOW", "KIND", "UPDATED")
     data = [
         [
             row.get("run_id", ""),
             row.get("status", ""),
+            row.get("project", ""),
             row.get("host", ""),
+            row.get("selected_gpu", ""),
             row.get("session", ""),
             row.get("window", ""),
             row.get("kind", ""),
@@ -1305,10 +1390,28 @@ def run_info(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     if args.json:
         print(json.dumps(row, indent=2, sort_keys=True))
     else:
-        for key in ("run_id", "status", "kind", "host", "session", "window", "remote_dir", "log_path", "command", "created_at", "updated_at", "error"):
+        for key in (
+            "run_id",
+            "status",
+            "project",
+            "kind",
+            "host",
+            "selected_gpu",
+            "session",
+            "window",
+            "remote_dir",
+            "log_path",
+            "command",
+            "created_at",
+            "updated_at",
+            "provenance",
+            "error",
+        ):
             value = row.get(key)
             if isinstance(value, list):
                 value = " ".join(str(item) for item in value)
+            if isinstance(value, dict):
+                value = json.dumps(value, sort_keys=True)
             print(f"{key}: {value}")
     return 0
 

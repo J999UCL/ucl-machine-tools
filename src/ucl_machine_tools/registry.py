@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,6 +23,7 @@ class RunRecord:
     command: tuple[str, ...]
     created_at: str = ""
     updated_at: str = ""
+    provenance: dict[str, Any] = field(default_factory=dict)
 
 
 def utc_now() -> str:
@@ -62,6 +63,7 @@ def read_record(ref: str = "last", *, root: Path | None = None) -> RunRecord:
     payload["command"] = tuple(payload.get("command") or ())
     payload.setdefault("created_at", "")
     payload.setdefault("updated_at", "")
+    payload.setdefault("provenance", {})
     return RunRecord(**payload)
 
 

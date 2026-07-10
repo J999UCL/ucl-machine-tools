@@ -43,6 +43,10 @@ work.
   script in tmux. It requires `--session NAME` or `--new-session`.
 - `ucl jobs`, `ucl info`, `ucl stop`, `ucl tail`, `ucl fetch`, and `ucl clean`
   operate on recorded run metadata.
+- Recorded `ucl run` and detached `ucl exec` jobs include provenance: project
+  tag, local git SHA when available, script hash, bundle path, selected GPU,
+  remote root, and env keys with values redacted. Add `--project NAME` when
+  you want `ucl jobs` to disambiguate work across projects.
 - `ucl copy SRC DST` copies local or remote endpoints with `rsync`; add
   `--verify size` or `--verify sha256` when you want explicit transfer checks.
 - `ucl env HOST --remote-root DIR` checks reachability, scratch/root state, TSG
