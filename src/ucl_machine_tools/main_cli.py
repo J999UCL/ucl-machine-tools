@@ -202,6 +202,7 @@ def _configure_exec_parser(parser: argparse.ArgumentParser) -> None:
 Examples:
   ucl exec barbury-l df -h /tmp
   ucl exec barbury-l canada-l -- hostname
+  ucl exec barbury-l canada-l barnacle-l -- hostname
   ucl exec 3090ti -- df -h /tmp
   ucl exec barbury-l -- python3 -c 'print("hi")'
   ucl exec barbury-l --cwd /tmp --timeout 60 --connect-timeout 30 pwd
@@ -209,7 +210,7 @@ Examples:
   ucl exec barbury-l --shell csh --stdin < check_torch.csh
   ucl exec barbury-l --detach --new-session -- hostname
 """
-    parser.add_argument("host")
+    parser.add_argument("host", metavar="HOST_OR_SELECTOR", help="first host/selector; add more before -- for multi-host sync exec")
     parser.add_argument("--catalog", type=Path)
     parser.add_argument("--env", action="append", default=[], help="remote env KEY=VALUE; repeat for multiple vars")
     parser.add_argument("--gpu", help="GPU id or auto")
@@ -228,7 +229,7 @@ Examples:
     parser.add_argument("--remote-dir", help="remote bundle dir under /tmp/ucl-machine-tools/launchers; requires --detach")
     parser.add_argument("--log", help="remote log path; requires --detach")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("exec_command", nargs=argparse.REMAINDER, metavar="COMMAND")
+    parser.add_argument("exec_command", nargs=argparse.REMAINDER, metavar="[HOST_OR_SELECTOR ...] -- COMMAND")
 
 
 def _build_exec_parser() -> argparse.ArgumentParser:

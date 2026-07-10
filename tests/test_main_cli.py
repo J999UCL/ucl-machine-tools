@@ -1764,3 +1764,13 @@ def test_help_exposes_unified_commands_and_not_legacy_scripts(capsys: pytest.Cap
     assert "fanout" not in help_text
     assert "ucl-inventory" not in help_text
     assert "ucl-launch" not in help_text
+
+
+def test_exec_help_mentions_multiple_hosts(capsys: pytest.CaptureFixture[str]) -> None:
+    parser = main_cli._build_exec_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--help"])
+    help_text = capsys.readouterr().out
+    assert "HOST_OR_SELECTOR" in help_text
+    assert "[HOST_OR_SELECTOR ...] -- COMMAND" in help_text
+    assert "ucl exec barbury-l canada-l barnacle-l -- hostname" in help_text
