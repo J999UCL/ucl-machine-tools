@@ -343,7 +343,7 @@ def test_ucl_exec_sync_command_prints_output_and_preserves_argv(
         assert kwargs.get("shell", False) is False
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+        if argv == remote_python_argv(timeout_seconds=30):
             source = kwargs["input"]
             assert embedded_exec_params(source)["argv"] == ["python3", "-c", 'print("hi")', "--remote-flag"]
             assert "shell=True" not in source
@@ -368,6 +368,8 @@ def test_ucl_exec_sync_accepts_multiple_hosts_with_delimiter(
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
         if argv[-2:] == ["python3", "-"]:
+            assert "-o" in argv
+            assert "ConnectTimeout=30" in argv
             host = argv[-3]
             params = embedded_exec_params(kwargs["input"])
             assert params["argv"] == ["hostname"]
@@ -407,7 +409,7 @@ def test_ucl_exec_single_host_command_can_contain_delimiter(capsys: pytest.Captu
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == remote_python_argv():
+        if argv == remote_python_argv(timeout_seconds=30):
             params = embedded_exec_params(kwargs["input"])
             assert params["argv"] == ["python3", "--", "-c"]
             return ok(stdout=exec_stdout(stdout=b"ok\n"))
@@ -463,7 +465,7 @@ def test_ucl_exec_sync_supports_options_cwd_json_timeout_and_gpu_auto(
             return ok()
         if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=8", "barbury-l", "python3", "-"]:
             return ok(stdout=inventory_stdout())
-        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+        if argv == remote_python_argv(timeout_seconds=30):
             source = kwargs["input"]
             params = embedded_exec_params(source)
             assert params["cwd"] == "/tmp"
@@ -485,20 +487,34 @@ def test_ucl_exec_sync_supports_options_cwd_json_timeout_and_gpu_auto(
     assert payload["timed_out"] is False
 
 
+def test_ucl_exec_sync_separates_command_and_connect_timeouts(capsys: pytest.CaptureFixture[str]) -> None:
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv(timeout_seconds=7):
+            params = embedded_exec_params(kwargs["input"])
+            assert params["timeout"] == 9.0
+            return ok(stdout=exec_stdout(stdout=b"ok\n"))
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["exec", "barbury-l", "--timeout", "9", "--connect-timeout", "7", "hostname"], runner=runner) == 0
+    assert capsys.readouterr().out == "ok\n"
+
+
 def test_ucl_exec_sync_accepts_delimiter_for_dash_command_and_timeout_zero(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+        if argv == remote_python_argv():
             params = embedded_exec_params(kwargs["input"])
             assert params["argv"] == ["-remote-command", "arg"]
             assert params["timeout"] == 0.0
             return ok(stdout=exec_stdout(stdout=b"dash-ok\n"))
         raise AssertionError(f"unexpected argv: {argv}")
 
-    assert main_cli.main(["exec", "barbury-l", "--timeout", "0", "--", "-remote-command", "arg"], runner=runner) == 0
+    assert main_cli.main(["exec", "barbury-l", "--timeout", "0", "--connect-timeout", "0", "--", "-remote-command", "arg"], runner=runner) == 0
     assert capsys.readouterr().out == "dash-ok\n"
 
 
@@ -511,7 +527,7 @@ def test_ucl_exec_sync_returns_remote_nonzero_and_timeout(capsys: pytest.Capture
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+        if argv == remote_python_argv(timeout_seconds=30):
             return ok(stdout=responses.pop(0))
         raise AssertionError(f"unexpected argv: {argv}")
 
@@ -525,7 +541,7 @@ def test_ucl_exec_sync_reports_empty_ssh_255_smartly(capsys: pytest.CaptureFixtu
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+        if argv == remote_python_argv(timeout_seconds=30):
             return SimpleNamespace(returncode=255, stdout="", stderr="")
         raise AssertionError(f"unexpected argv: {argv}")
 
@@ -540,7 +556,7 @@ def test_ucl_exec_sync_reports_refused_jump_forwarding(capsys: pytest.CaptureFix
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+        if argv == remote_python_argv(timeout_seconds=30):
             return SimpleNamespace(
                 returncode=255,
                 stdout="",
@@ -562,7 +578,7 @@ def test_ucl_exec_sync_reports_no_route_to_host(capsys: pytest.CaptureFixture[st
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+        if argv == remote_python_argv(timeout_seconds=30):
             return SimpleNamespace(
                 returncode=255,
                 stdout="",
@@ -581,7 +597,7 @@ def test_ucl_exec_sync_reports_wrapper_stderr(capsys: pytest.CaptureFixture[str]
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+        if argv == remote_python_argv(timeout_seconds=30):
             return SimpleNamespace(returncode=127, stdout="", stderr="python3: command not found\n")
         raise AssertionError(f"unexpected argv: {argv}")
 
@@ -596,7 +612,7 @@ def test_ucl_exec_sync_reports_missing_sentinel(capsys: pytest.CaptureFixture[st
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+        if argv == remote_python_argv(timeout_seconds=30):
             return ok(stdout="not sentinel output\n", stderr="wrapper warning\n")
         raise AssertionError(f"unexpected argv: {argv}")
 
@@ -612,7 +628,7 @@ def test_ucl_exec_sync_reports_malformed_sentinel_json(capsys: pytest.CaptureFix
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+        if argv == remote_python_argv(timeout_seconds=30):
             return ok(
                 stdout="\n".join(
                     [
@@ -633,7 +649,7 @@ def test_ucl_exec_sync_distinguishes_wrapper_error_payload(capsys: pytest.Captur
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+        if argv == remote_python_argv(timeout_seconds=30):
             return ok(
                 stdout=exec_stdout(
                     stderr=b"FileNotFoundError: [Errno 2] No such file or directory: 'missing-command'\n",
@@ -654,7 +670,7 @@ def test_ucl_exec_sync_json_includes_wrapper_error(capsys: pytest.CaptureFixture
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+        if argv == remote_python_argv(timeout_seconds=30):
             return ok(stdout=exec_stdout(stderr=b"unknown wrapper error\n", returncode=127, wrapper_error=True))
         raise AssertionError(f"unexpected argv: {argv}")
 
@@ -670,7 +686,7 @@ def test_ucl_exec_json_is_clean_for_ssh_failure(capsys: pytest.CaptureFixture[st
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == remote_python_argv():
+        if argv == remote_python_argv(timeout_seconds=30):
             return SimpleNamespace(returncode=255, stdout="VBoxManage noise\n", stderr="")
         raise AssertionError(f"unexpected argv: {argv}")
 
@@ -690,7 +706,7 @@ def test_ucl_exec_json_reports_command_failure_without_human_text(capsys: pytest
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == remote_python_argv():
+        if argv == remote_python_argv(timeout_seconds=30):
             return ok(stdout=exec_stdout(stderr=b"bad\n", returncode=7))
         raise AssertionError(f"unexpected argv: {argv}")
 
@@ -708,7 +724,7 @@ def test_ucl_exec_sync_filters_wrapper_startup_noise_from_errors(capsys: pytest.
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+        if argv == remote_python_argv(timeout_seconds=30):
             return SimpleNamespace(returncode=255, stdout="", stderr="VBoxManage: noisy startup failure\n")
         raise AssertionError(f"unexpected argv: {argv}")
 
@@ -729,7 +745,7 @@ def test_ucl_exec_sync_stdin_uses_selected_shell(capsys: pytest.CaptureFixture[s
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+        if argv == remote_python_argv(timeout_seconds=30):
             source = kwargs["input"]
             params = embedded_exec_params(source)
             assert params["mode"] == "stdin"
@@ -875,7 +891,7 @@ def test_ucl_tail_filters_login_noise(
         assert kwargs.get("shell", False) is False
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+        if argv == remote_python_argv():
             assert "/tmp/ucl-machine-tools/launchers/demo/run.log" in kwargs["input"]
             return ok(
                 stdout="\n".join(
@@ -936,7 +952,7 @@ def test_ucl_tail_follow_filters_login_noise(
 
     class FakeFollowPopen:
         def __init__(self, argv: list[str], **kwargs: Any) -> None:
-            assert argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]
+            assert argv == remote_python_argv()
             self.stdin = FakePipe()
             self.stdout = FakePipe(
                 [
@@ -999,7 +1015,7 @@ def test_ucl_fetch_filters_login_noise(
         assert kwargs.get("shell", False) is False
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+        if argv == remote_python_argv():
             assert "/tmp/ucl-machine-tools/launchers/demo" in kwargs["input"]
             return ok(
                 stdout="\n".join(
@@ -1030,7 +1046,7 @@ def test_ucl_clean_filters_login_noise(capsys: pytest.CaptureFixture[str]) -> No
         assert kwargs.get("shell", False) is False
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury-l", "python3", "-"]:
+        if argv == remote_python_argv():
             assert "DAYS=7" in kwargs["input"]
             return ok(
                 stdout="\n".join(

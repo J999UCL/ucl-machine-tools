@@ -60,8 +60,8 @@ Common use:
       Run a short remote check and print output now.
   ucl exec barbury-l canada-l -- hostname
       Run the same short remote check on multiple hosts.
-  ucl exec barbury-l --cwd /tmp --timeout 60 pwd
-      Run from a remote directory with a bounded timeout.
+  ucl exec barbury-l --cwd /tmp --timeout 60 --connect-timeout 30 pwd
+      Run from a remote directory with bounded command and SSH timeouts.
   ucl exec barbury-l --stdin < check.sh
       Run a multi-line bash snippet from stdin and print output now.
   ucl exec barbury-l --shell csh --stdin < check_torch.csh
@@ -211,7 +211,7 @@ Examples:
   ucl exec barbury-l canada-l -- hostname
   ucl exec 3090ti -- df -h /tmp
   ucl exec barbury-l -- python3 -c 'print("hi")'
-  ucl exec barbury-l --cwd /tmp --timeout 60 pwd
+  ucl exec barbury-l --cwd /tmp --timeout 60 --connect-timeout 30 pwd
   ucl exec barbury-l --stdin < check.sh
   ucl exec barbury-l --shell csh --stdin < check_torch.csh
   ucl exec barbury-l --detach --new-session -- hostname
@@ -223,6 +223,7 @@ Examples:
     parser.add_argument("--shell", choices=("bash", "csh"), default="bash", help="shell used only with --stdin")
     parser.add_argument("--stdin", action="store_true", help="read a script from stdin")
     parser.add_argument("--timeout", type=float, default=60.0, help="remote command timeout in seconds; 0 disables")
+    parser.add_argument("--connect-timeout", type=int, default=30, help="SSH connect timeout in seconds; 0 disables")
     parser.add_argument("--cwd", help="remote working directory for synchronous exec")
     parser.add_argument("--json", action="store_true", help="emit returncode/stdout/stderr as JSON")
     parser.add_argument("--detach", action="store_true", help="launch in tmux and record a run instead of printing output now")
@@ -279,6 +280,7 @@ def _parse_exec_argv(tokens: list[str]) -> argparse.Namespace:
         "shell": "bash",
         "stdin": False,
         "timeout": 60.0,
+        "connect_timeout": 30,
         "cwd": None,
         "json": False,
         "detach": False,
@@ -303,6 +305,7 @@ def _parse_exec_argv(tokens: list[str]) -> argparse.Namespace:
         "--gpu": "gpu",
         "--shell": "shell",
         "--timeout": "timeout",
+        "--connect-timeout": "connect_timeout",
         "--cwd": "cwd",
         "--session": "session",
         "--window": "window",
@@ -337,6 +340,11 @@ def _parse_exec_argv(tokens: list[str]) -> argparse.Namespace:
                     values[key] = float(raw_value)
                 except ValueError:
                     parser.error(f"{token} must be a number")
+            elif key == "connect_timeout":
+                try:
+                    values[key] = int(raw_value)
+                except ValueError:
+                    parser.error(f"{token} must be an integer")
             elif key == "shell":
                 if raw_value not in {"bash", "csh"}:
                     parser.error("--shell must be one of: bash, csh")
@@ -358,6 +366,8 @@ def _parse_exec_argv(tokens: list[str]) -> argparse.Namespace:
     values["exec_command"] = tuple(command)
     if values["timeout"] < 0:
         parser.error("--timeout must be >= 0")
+    if values["connect_timeout"] < 0:
+        parser.error("--connect-timeout must be >= 0")
     if values["stdin"] and command:
         parser.error("--stdin cannot be used with COMMAND arguments")
     if not values["stdin"] and not command:
@@ -384,6 +394,8 @@ def _parse_exec_argv(tokens: list[str]) -> argparse.Namespace:
             sync_only.append("--json")
         if values["timeout"] != 60.0:
             sync_only.append("--timeout")
+        if values["connect_timeout"] != 30:
+            sync_only.append("--connect-timeout")
         if sync_only:
             parser.error(f"{', '.join(sync_only)} are only supported for synchronous exec")
     return argparse.Namespace(**values)
@@ -546,6 +558,7 @@ def _sync_exec_dry_run_summary(args: argparse.Namespace, host: HostSpec, command
             f"shell:      {args.shell}",
             f"cwd:        {args.cwd or '-'}",
             f"timeout:    {'none' if args.timeout == 0 else args.timeout:g}",
+            f"connect:    {'none' if args.connect_timeout == 0 else args.connect_timeout}",
             f"stdin:      {'yes' if args.stdin else 'no'}",
             f"argv:       {json.dumps(list(command))}",
         ]
@@ -784,7 +797,7 @@ def run_exec_sync(
         "timeout": args.timeout,
     }
     proc = runner(
-        _ssh_python_argv(host.ssh_host),
+        _ssh_python_argv(host.ssh_host, connect_timeout=int(args.connect_timeout)),
         input=_sync_exec_source(params),
         capture_output=True,
         text=True,
@@ -864,6 +877,7 @@ def run_exec_multi_sync(
                     f"shell:      {args.shell}",
                     f"cwd:        {args.cwd or '-'}",
                     f"timeout:    {'none' if args.timeout == 0 else args.timeout:g}",
+                    f"connect:    {'none' if args.connect_timeout == 0 else args.connect_timeout}",
                     f"stdin:      {'yes' if args.stdin else 'no'}",
                     f"argv:       {json.dumps(list(command))}",
                 ]
@@ -1062,8 +1076,9 @@ def _strip_remote_noise(text: str) -> str:
     return "".join(line for line in text.splitlines(keepends=True) if not any(marker in line for marker in noisy_markers))
 
 
-def _ssh_python_argv(host: str) -> list[str]:
-    return build_remote_python_argv(host)
+def _ssh_python_argv(host: str, *, connect_timeout: int | None = None) -> list[str]:
+    timeout = None if connect_timeout in (None, 0) else int(connect_timeout)
+    return build_remote_python_argv(host, timeout_seconds=timeout)
 
 
 def run_tail(args: argparse.Namespace, *, runner=subprocess.run, popener=subprocess.Popen) -> int:
@@ -1399,6 +1414,7 @@ def run_env(args: argparse.Namespace, *, runner=subprocess.run) -> int:
 
 def _fanout_one(host: HostSpec, args: argparse.Namespace, command: tuple[str, ...], stdin_body: str | None, *, runner=subprocess.run) -> dict[str, Any]:
     timeout_value = float(getattr(args, "timeout_seconds", getattr(args, "timeout", 60.0)))
+    connect_timeout = int(getattr(args, "connect_timeout", 30))
     local_args = argparse.Namespace(
         dry_run=False,
         stdin=args.stdin,
@@ -1421,7 +1437,7 @@ def _fanout_one(host: HostSpec, args: argparse.Namespace, command: tuple[str, ..
             "timeout": timeout_value,
         }
         proc = runner(
-            _ssh_python_argv(host.ssh_host),
+            _ssh_python_argv(host.ssh_host, connect_timeout=connect_timeout),
             input=_sync_exec_source(params),
             capture_output=True,
             text=True,
