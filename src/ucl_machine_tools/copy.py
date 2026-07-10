@@ -10,14 +10,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from ucl_machine_tools.hosts import HostSpec, load_catalog
+from ucl_machine_tools.hosts import HostSpec, load_catalog, parse_selector
 from ucl_machine_tools.ssh import build_remote_python_argv
 
 
 Runner = Callable[..., subprocess.CompletedProcess]
 MANIFEST_BEGIN = "UCL_COPY_MANIFEST_BEGIN"
 MANIFEST_END = "UCL_COPY_MANIFEST_END"
-SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+RSYNC_SSH = "ssh -o BatchMode=yes -o LogLevel=ERROR"
+SSH_BASE = ("ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR")
+SAFE_SELECTOR_RE = re.compile(r"^[A-Za-z0-9_.!,:-]+$")
 
 
 @dataclass(frozen=True)
@@ -41,8 +43,8 @@ def parse_endpoint(value: str) -> Endpoint:
         raise ValueError("copy endpoint must be non-empty")
     if ":" in value and not value.startswith("/"):
         host, path = value.split(":", 1)
-        if not SAFE_HOST_RE.match(host):
-            raise ValueError(f"unsafe remote host in endpoint: {value!r}")
+        if not SAFE_SELECTOR_RE.match(host):
+            raise ValueError(f"unsafe remote selector in endpoint: {value!r}")
         if not path.startswith("/"):
             raise ValueError(f"remote endpoint path must be absolute: {value!r}")
         return Endpoint(raw=value, host=host, path=path)
@@ -53,28 +55,60 @@ def resolve_endpoint_host(endpoint: Endpoint, catalog_path: Path | None = None) 
     if endpoint.host is None:
         return None
     catalog = load_catalog(catalog_path)
-    for spec in catalog.values():
-        if endpoint.host in {spec.name, spec.ssh_host, *spec.aliases}:
-            return spec
-    raise ValueError(f"unknown remote copy host: {endpoint.host}")
+    hosts = parse_selector(endpoint.host, catalog=catalog)
+    if len(hosts) != 1:
+        raise ValueError(f"copy endpoint selector must resolve to exactly one host, got {len(hosts)} for {endpoint.host!r}")
+    return hosts[0]
 
 
-def build_rsync_argv(src: Endpoint, dst: Endpoint, *, partial: bool = False, dry_run: bool = False) -> list[str]:
-    argv = ["rsync", "-a", "--human-readable"]
+def resolve_endpoint(endpoint: Endpoint, catalog_path: Path | None = None) -> Endpoint:
+    host = resolve_endpoint_host(endpoint, catalog_path)
+    if host is None:
+        return endpoint
+    return Endpoint(raw=endpoint.raw, host=host.ssh_host, path=endpoint.path)
+
+
+def build_rsync_argv(
+    src: Endpoint,
+    dst: Endpoint,
+    *,
+    partial: bool = False,
+    progress: bool = False,
+    dry_run: bool = False,
+    rsync_args: tuple[str, ...] = (),
+) -> list[str]:
+    argv = ["rsync", "-a", "--human-readable", "-e", RSYNC_SSH]
     if partial:
-        argv += ["--partial", "--append-verify"]
+        argv.append("--partial")
+    if progress:
+        argv.append("--info=progress2")
     if dry_run:
         argv.append("--dry-run")
-    argv += ["-e", "ssh -o BatchMode=yes -o LogLevel=ERROR", src.rsync_spec(), dst.rsync_spec()]
+    argv += [*rsync_args, src.rsync_spec(), dst.rsync_spec()]
     return argv
 
 
-def build_remote_to_remote_argv(src: Endpoint, dst: Endpoint, *, partial: bool = False, dry_run: bool = False) -> list[str]:
+def build_remote_to_remote_argv(
+    src: Endpoint,
+    dst: Endpoint,
+    *,
+    partial: bool = False,
+    progress: bool = False,
+    dry_run: bool = False,
+    rsync_args: tuple[str, ...] = (),
+) -> list[str]:
     if src.host is None or dst.host is None:
         raise ValueError("remote-to-remote rsync requires two remote endpoints")
-    rsync = build_rsync_argv(Endpoint(src.path, None, src.path), dst, partial=partial, dry_run=dry_run)
+    rsync = build_rsync_argv(
+        Endpoint(src.path, None, src.path),
+        dst,
+        partial=partial,
+        progress=progress,
+        dry_run=dry_run,
+        rsync_args=rsync_args,
+    )
     command = " ".join(shlex.quote(part) for part in rsync)
-    return ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", src.host, "bash", "-lc", command]
+    return [*SSH_BASE, src.host, "bash", "-lc", shlex.quote(command)]
 
 
 def manifest_source(path: str, *, sha256: bool) -> str:

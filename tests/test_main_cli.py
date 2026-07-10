@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import re
+import shlex
 import tarfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -1400,6 +1401,292 @@ def test_ucl_copy_dry_run_and_size_verify(
     assert payload["ok"] is True
     assert payload["verify"]["ok"] is True
     assert "VBoxManage" not in payload["stderr"]
+
+
+def test_ucl_copy_passes_raw_rsync_args_after_delimiter(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+
+    rc = main_cli.main(
+        [
+            "copy",
+            str(src),
+            str(dst),
+            "--dry-run",
+            "--progress",
+            "--json",
+            "--",
+            "--exclude",
+            "*.pt",
+            "--dry-run",
+        ]
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mode"] == "rsync"
+    assert payload["argv"] == [
+        "rsync",
+        "-a",
+        "--human-readable",
+        "-e",
+        copy_tools.RSYNC_SSH,
+        "--info=progress2",
+        "--dry-run",
+        "--exclude",
+        "*.pt",
+        "--dry-run",
+        str(src),
+        str(dst),
+    ]
+
+
+def test_ucl_copy_rejects_unknown_wrapper_options_before_delimiter(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+
+    rc = main_cli.main(["copy", str(src), str(dst), "--delete"])
+
+    assert rc == 2
+    assert "unknown ucl copy option: --delete" in capsys.readouterr().err
+
+
+def test_ucl_copy_resolves_aliases_and_rejects_multi_host_selectors(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    catalog = tmp_path / "ucl_hosts.json"
+    catalog.write_text(
+        json.dumps(
+            {
+                "groups": {"3090ti": ["barbury-l", "canada-l"]},
+                "hosts": {
+                    "barbury-l": {"ssh": "barbury.internal", "aliases": ["barb"], "gpu_class": "3090ti"},
+                    "canada-l": {"ssh": "canada.internal", "gpu_class": "3090ti"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rc = main_cli.main(
+        [
+            "copy",
+            "barb:/tmp/src",
+            "canada-l:/tmp/dst",
+            "--catalog",
+            str(catalog),
+            "--dry-run",
+            "--json",
+        ]
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["resolved_src"] == "barbury.internal:/tmp/src"
+    assert payload["resolved_dst"] == "canada.internal:/tmp/dst"
+
+    def no_runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        raise AssertionError(f"unexpected runner call: {argv}")
+
+    rc = main_cli.main(
+        ["copy", "3090ti:/tmp/src", str(tmp_path / "dst"), "--catalog", str(catalog), "--dry-run"],
+        runner=no_runner,
+    )
+
+    assert rc == 2
+    assert "copy endpoint selector must resolve to exactly one host" in capsys.readouterr().err
+
+
+def test_ucl_copy_remote_to_remote_runs_rsync_from_source_host(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    catalog = tmp_path / "ucl_hosts.json"
+    catalog.write_text(
+        json.dumps(
+            {
+                "hosts": {
+                    "barbury-l": {"ssh": "barbury.internal", "aliases": ["barb"], "gpu_class": "3090ti"},
+                    "barnacle-l": {"ssh": "barnacle.internal", "aliases": ["barn"], "gpu_class": "3090ti"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        calls.append(argv)
+        assert kwargs.get("shell", False) is False
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        assert argv[:6] == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR"]
+        assert argv[6] == "barbury.internal"
+        assert argv[7:9] == ["bash", "-lc"]
+        inner = shlex.split(shlex.split(argv[9])[0])
+        assert inner[:5] == ["rsync", "-a", "--human-readable", "-e", copy_tools.RSYNC_SSH]
+        assert inner[5:7] == ["--partial", "--exclude"]
+        assert inner[7] == "*.pt"
+        assert inner[-2:] == ["/tmp/src ' path", "barnacle.internal:/tmp/dst ' path"]
+        return ok(stdout="copied\n")
+
+    rc = main_cli.main(
+        [
+            "copy",
+            "barb:/tmp/src ' path",
+            "barn:/tmp/dst ' path",
+            "--catalog",
+            str(catalog),
+            "--partial",
+            "--json",
+            "--",
+            "--exclude",
+            "*.pt",
+        ],
+        runner=runner,
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mode"] == "remote-to-remote"
+    assert payload["ok"] is True
+    assert not any(call[0] == "rsync" for call in calls)
+
+
+def test_ucl_copy_remote_to_remote_verify_reads_each_endpoint_host(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    catalog = tmp_path / "ucl_hosts.json"
+    catalog.write_text(
+        json.dumps(
+            {
+                "hosts": {
+                    "barbury-l": {"ssh": "barbury.internal", "gpu_class": "3090ti"},
+                    "barnacle-l": {"ssh": "barnacle.internal", "gpu_class": "3090ti"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_hosts: list[str] = []
+    transfer_hosts: list[str] = []
+
+    def manifest_stdout() -> str:
+        payload = {"schema_version": 1, "exists": True, "file_count": 1, "total_bytes": 5, "files": [{"path": "a.txt", "bytes": 5}]}
+        return "\n".join([copy_tools.MANIFEST_BEGIN, json.dumps(payload), copy_tools.MANIFEST_END])
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        assert kwargs.get("shell", False) is False
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv("barbury.internal"):
+            manifest_hosts.append("barbury.internal")
+            assert "/tmp/src" in kwargs["input"]
+            return ok(stdout=manifest_stdout())
+        if argv == remote_python_argv("barnacle.internal"):
+            manifest_hosts.append("barnacle.internal")
+            assert "/tmp/dst" in kwargs["input"]
+            return ok(stdout=manifest_stdout())
+        if argv[:7] == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury.internal"]:
+            transfer_hosts.append("barbury.internal")
+            return ok()
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    rc = main_cli.main(
+        [
+            "copy",
+            "barbury-l:/tmp/src",
+            "barnacle-l:/tmp/dst",
+            "--catalog",
+            str(catalog),
+            "--verify",
+            "size",
+            "--json",
+        ],
+        runner=runner,
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verify"]["ok"] is True
+    assert manifest_hosts == ["barbury.internal", "barnacle.internal"]
+    assert transfer_hosts == ["barbury.internal"]
+
+
+def test_ucl_copy_verify_failure_cases(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()
+    (src / "a.txt").write_text("hello", encoding="utf-8")
+
+    def failed_rsync(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        assert argv[0] == "rsync"
+        return SimpleNamespace(returncode=23, stdout="", stderr="rsync failed\n")
+
+    rc = main_cli.main(["copy", str(src), str(dst), "--verify", "size", "--json"], runner=failed_rsync)
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 2
+    assert payload["verify"]["ok"] is None
+    assert payload["returncode"] == 23
+
+    def mismatch_rsync(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        assert argv[0] == "rsync"
+        (dst / "a.txt").write_text("different-size", encoding="utf-8")
+        return ok()
+
+    rc = main_cli.main(["copy", str(src), str(dst), "--verify", "size", "--json"], runner=mismatch_rsync)
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 2
+    assert payload["verify"]["ok"] is False
+    assert "total_bytes differs" in payload["verify"]["message"]
+
+    dst.joinpath("a.txt").unlink()
+
+    def sha_mismatch_rsync(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        assert argv[0] == "rsync"
+        (dst / "a.txt").write_text("HELLO", encoding="utf-8")
+        return ok()
+
+    rc = main_cli.main(["copy", str(src), str(dst), "--verify", "sha256", "--json"], runner=sha_mismatch_rsync)
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 2
+    assert payload["verify"]["ok"] is False
+    assert payload["verify"]["message"] == "sha256 manifest differs"
+
+
+def test_copy_endpoint_parsing_edge_cases(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    local_colon = copy_tools.parse_endpoint("/tmp/path:with-colon")
+    assert local_colon.host is None
+    assert local_colon.path == "/tmp/path:with-colon"
+
+    home_local = copy_tools.parse_endpoint("~/local")
+    assert home_local.host is None
+    assert home_local.path == str(tmp_path / "local")
+
+    with pytest.raises(ValueError, match="remote endpoint path must be absolute"):
+        copy_tools.parse_endpoint("host:relative")
+    with pytest.raises(ValueError, match="remote endpoint path must be absolute"):
+        copy_tools.parse_endpoint("host:")
+    with pytest.raises(ValueError, match="remote endpoint path must be absolute"):
+        copy_tools.parse_endpoint("host:~/x")
+    with pytest.raises(ValueError, match="unsafe remote selector"):
+        copy_tools.parse_endpoint("bad host:/tmp/x")
 
 
 def test_ucl_env_json_parses_remote_preflight(capsys: pytest.CaptureFixture[str]) -> None:

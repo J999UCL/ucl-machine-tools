@@ -85,6 +85,8 @@ Common use:
       List recorded tmux-backed jobs and their current status.
   ucl copy /tmp/a barbury-l:/tmp/a --verify size
       Copy with rsync and optionally verify size/count or sha256 manifests.
+  ucl copy barbury-l:/tmp/a barnacle-l:/tmp/a -- --partial --info=progress2 --exclude '*.pt'
+      Pass raw rsync args through after a literal --.
   ucl env barbury-l --remote-root /tmp/ucl-machine-tools/fpt --json
       Check scratch, TSG setup scripts, and optional GPU availability.
   ucl fanout --hosts barbury-l canada-l -- hostname
@@ -156,6 +158,7 @@ Use 'ucl COMMAND --help' for command-specific flags.
     copy.add_argument("--catalog", type=Path)
     copy.add_argument("--verify", choices=("size", "sha256", "none"), default="none")
     copy.add_argument("--partial", action="store_true")
+    copy.add_argument("--progress", action="store_true")
     copy.add_argument("--dry-run", action="store_true")
     copy.add_argument("--json", action="store_true")
 
@@ -426,6 +429,89 @@ def _parse_exec_argv(tokens: list[str]) -> argparse.Namespace:
             sync_only.append("--connect-timeout")
         if sync_only:
             parser.error(f"{', '.join(sync_only)} are only supported for synchronous exec")
+    return argparse.Namespace(**values)
+
+
+def _build_copy_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ucl copy",
+        description="Copy local/remote paths with rsync.",
+        epilog="Use '--' before raw rsync args, e.g. ucl copy SRC DST -- --exclude '*.pt'.",
+    )
+    parser.add_argument("src")
+    parser.add_argument("dst")
+    parser.add_argument("--catalog", type=Path)
+    parser.add_argument("--verify", choices=("size", "sha256", "none"), default="none")
+    parser.add_argument("--partial", action="store_true", help="add rsync --partial")
+    parser.add_argument("--progress", action="store_true", help="add rsync --info=progress2")
+    parser.add_argument("--dry-run", action="store_true", help="print/perform rsync dry-run")
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def _parse_copy_argv(tokens: list[str]) -> argparse.Namespace:
+    parser = _build_copy_parser()
+    if not tokens or tokens[0] in {"-h", "--help"}:
+        return parser.parse_args(tokens)
+    values: dict[str, Any] = {
+        "command": "copy",
+        "src": None,
+        "dst": None,
+        "catalog": None,
+        "verify": "none",
+        "partial": False,
+        "progress": False,
+        "dry_run": False,
+        "json": False,
+        "rsync_args": (),
+    }
+    operands: list[str] = []
+    raw_rsync_args: list[str] = []
+    no_value_flags = {
+        "--partial": "partial",
+        "--progress": "progress",
+        "--dry-run": "dry_run",
+        "--json": "json",
+    }
+    value_flags = {
+        "--catalog": "catalog",
+        "--verify": "verify",
+    }
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        if token == "--":
+            raw_rsync_args = tokens[idx + 1 :]
+            break
+        if token in {"-h", "--help"}:
+            return parser.parse_args(["--help"])
+        if token in no_value_flags:
+            values[no_value_flags[token]] = True
+            idx += 1
+            continue
+        if token in value_flags:
+            if idx + 1 >= len(tokens):
+                parser.error(f"{token} requires a value")
+            raw_value = tokens[idx + 1]
+            key = value_flags[token]
+            if key == "catalog":
+                values[key] = Path(raw_value)
+            elif key == "verify":
+                if raw_value not in {"size", "sha256", "none"}:
+                    parser.error("--verify must be one of: size, sha256, none")
+                values[key] = raw_value
+            idx += 2
+            continue
+        if token.startswith("-"):
+            parser.error(f"unknown ucl copy option: {token}; use '--' before raw rsync options")
+        operands.append(token)
+        idx += 1
+
+    if len(operands) != 2:
+        parser.error("copy requires exactly SRC and DST")
+    values["src"] = operands[0]
+    values["dst"] = operands[1]
+    values["rsync_args"] = tuple(raw_rsync_args)
     return argparse.Namespace(**values)
 
 
@@ -1480,22 +1566,45 @@ def _copy_endpoint_manifest(endpoint: copy_tools.Endpoint, *, verify: str, runne
 
 
 def run_copy(args: argparse.Namespace, *, runner=subprocess.run) -> int:
-    src = copy_tools.parse_endpoint(args.src)
-    dst = copy_tools.parse_endpoint(args.dst)
-    if src.host:
-        copy_tools.resolve_endpoint_host(src, args.catalog)
-    if dst.host:
-        copy_tools.resolve_endpoint_host(dst, args.catalog)
-    ensure_knuckles_master(runner=runner)
+    src = copy_tools.resolve_endpoint(copy_tools.parse_endpoint(args.src), args.catalog)
+    dst = copy_tools.resolve_endpoint(copy_tools.parse_endpoint(args.dst), args.catalog)
+    needs_ssh = bool(src.host or dst.host)
+    if needs_ssh and not args.dry_run:
+        ensure_knuckles_master(runner=runner)
     before = None
     if args.verify != "none" and not args.dry_run:
         before = _copy_endpoint_manifest(src, verify=args.verify, runner=runner)
     if src.host and dst.host:
-        argv = copy_tools.build_remote_to_remote_argv(src, dst, partial=args.partial, dry_run=args.dry_run)
+        mode = "remote-to-remote"
+        argv = copy_tools.build_remote_to_remote_argv(
+            src,
+            dst,
+            partial=args.partial,
+            progress=args.progress,
+            dry_run=args.dry_run,
+            rsync_args=tuple(args.rsync_args),
+        )
     else:
-        argv = copy_tools.build_rsync_argv(src, dst, partial=args.partial, dry_run=args.dry_run)
+        mode = "rsync"
+        argv = copy_tools.build_rsync_argv(
+            src,
+            dst,
+            partial=args.partial,
+            progress=args.progress,
+            dry_run=args.dry_run,
+            rsync_args=tuple(args.rsync_args),
+        )
     if args.dry_run:
-        payload = {"src": args.src, "dst": args.dst, "argv": argv, "dry_run": True, "verify": args.verify}
+        payload = {
+            "src": args.src,
+            "dst": args.dst,
+            "resolved_src": src.rsync_spec(),
+            "resolved_dst": dst.rsync_spec(),
+            "mode": mode,
+            "argv": argv,
+            "dry_run": True,
+            "verify": args.verify,
+        }
         if args.json:
             print(json.dumps(payload, indent=2, sort_keys=True))
         else:
@@ -1513,6 +1622,10 @@ def run_copy(args: argparse.Namespace, *, runner=subprocess.run) -> int:
         "ok": ok,
         "src": args.src,
         "dst": args.dst,
+        "resolved_src": src.rsync_spec(),
+        "resolved_dst": dst.rsync_spec(),
+        "mode": mode,
+        "argv": argv,
         "returncode": int(getattr(proc, "returncode", 1)),
         "stdout": _strip_remote_noise(getattr(proc, "stdout", "") or ""),
         "stderr": _strip_remote_noise(getattr(proc, "stderr", "") or ""),
@@ -1525,6 +1638,9 @@ def run_copy(args: argparse.Namespace, *, runner=subprocess.run) -> int:
             print(payload["stdout"], end="")
         if payload["stderr"]:
             print(payload["stderr"], file=sys.stderr, end="")
+        print(f"mode: {mode}")
+        print(f"argv: {shlex.join(argv)}")
+        print(f"returncode: {payload['returncode']}")
         print(f"verify: {verify_payload['message']}")
     return 0 if ok else 2
 
@@ -1677,6 +1793,16 @@ def main(argv: list[str] | None = None, *, runner=subprocess.run, popener=subpro
             return int(exc.code or 0)
         try:
             return run_exec(args, runner=runner)
+        except Exception as exc:  # noqa: BLE001 - CLI should render concise failures.
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+    if raw_argv and raw_argv[0] == "copy":
+        try:
+            args = _parse_copy_argv(raw_argv[1:])
+        except SystemExit as exc:
+            return int(exc.code or 0)
+        try:
+            return run_copy(args, runner=runner)
         except Exception as exc:  # noqa: BLE001 - CLI should render concise failures.
             print(f"ERROR: {exc}", file=sys.stderr)
             return 2

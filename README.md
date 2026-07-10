@@ -19,6 +19,7 @@ scripts/ucl tail last
 scripts/ucl fetch last
 scripts/ucl jobs
 scripts/ucl copy ./data barbury-l:/tmp/ucl-machine-tools/data --verify size
+scripts/ucl copy barbury-l:/tmp/a barnacle-l:/tmp/a -- --partial --info=progress2 --exclude '*.pt'
 scripts/ucl env barbury-l --remote-root /tmp/ucl-machine-tools/fpt --json
 scripts/ucl fanout --hosts barbury-l canada-l -- hostname
 ```
@@ -47,8 +48,11 @@ work.
   tag, local git SHA when available, script hash, bundle path, selected GPU,
   remote root, and env keys with values redacted. Add `--project NAME` when
   you want `ucl jobs` to disambiguate work across projects.
-- `ucl copy SRC DST` copies local or remote endpoints with `rsync`; add
-  `--verify size` or `--verify sha256` when you want explicit transfer checks.
+- `ucl copy SRC DST [-- RSYNC_ARGS...]` is a thin `rsync` wrapper. Endpoints
+  can be local paths or `HOST:/absolute/path`; host aliases/selectors must
+  resolve to exactly one UCL host. For lab-machine-to-lab-machine copies, rsync
+  runs from the source host so data stays inside UCL. Add `--verify size` or
+  `--verify sha256` when you want explicit transfer checks.
 - `ucl env HOST --remote-root DIR` checks reachability, scratch/root state, TSG
   setup scripts, `/tmp` space, and optional GPU availability.
 - `ucl fanout --hosts TARGET... -- COMMAND...` is kept as the explicit fanout
