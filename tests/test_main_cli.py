@@ -68,6 +68,29 @@ def inventory_stdout(host: str = "barbury-l", *, busy: bool = False) -> str:
     )
 
 
+def write_status_catalog(tmp_path: Path) -> Path:
+    path = tmp_path / "ucl_hosts.json"
+    path.write_text(
+        json.dumps(
+            {
+                "defaults": {"scratch_root": "/tmp/ucl-machine-tools"},
+                "groups": {
+                    "3090ti": ["barbury-l", "canada-l"],
+                    "timeshare": ["cream"],
+                },
+                "hosts": {
+                    "barbury-l": {"gpu_class": "3090ti", "restart_policy": "lab_pc"},
+                    "canada-l": {"gpu_class": "3090ti", "restart_policy": "lab_pc"},
+                    "cream": {"gpu_class": "rtx6000", "restart_policy": "timeshare"},
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def exec_stdout(
     *,
     stdout: bytes = b"",
@@ -142,6 +165,131 @@ def test_ucl_status_routes_inventory_json(capsys: pytest.CaptureFixture[str]) ->
     payload = json.loads(capsys.readouterr().out)
     assert payload["hosts"][0]["host"] == "barbury-l"
     assert calls[0] == ["ssh", "-O", "check", "knuckles"]
+
+
+def test_ucl_status_accepts_multiple_positional_targets(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    catalog = write_status_catalog(tmp_path)
+    probed: list[str] = []
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        assert kwargs.get("shell", False) is False
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        host = argv[-3]
+        probed.append(host)
+        return ok(stdout=inventory_stdout(host=host))
+
+    rc = main_cli.main(["status", "barbury-l", "canada-l", "--catalog", str(catalog), "--json"], runner=runner)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [row["host"] for row in payload["hosts"]] == ["barbury-l", "canada-l"]
+    assert probed == ["barbury-l", "canada-l"]
+
+
+def test_ucl_status_modes_accept_multiple_targets_and_selector_override(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    catalog = write_status_catalog(tmp_path)
+    calls: list[str] = []
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        host = argv[-3]
+        calls.append(host)
+        return ok(stdout=inventory_stdout(host=host, busy=(host == "canada-l")))
+
+    assert (
+        main_cli.main(
+            ["status", "recommend", "barbury-l", "canada-l", "--catalog", str(catalog), "--json"],
+            runner=runner,
+        )
+        == 0
+    )
+    recommend_payload = json.loads(capsys.readouterr().out)
+    assert [row["host"] for row in recommend_payload["hosts"]] == ["barbury-l"]
+    assert calls == ["barbury-l", "canada-l"]
+
+    calls.clear()
+    assert (
+        main_cli.main(
+            ["status", "gpus", "barbury-l", "canada-l", "--catalog", str(catalog), "--json"],
+            runner=runner,
+        )
+        == 0
+    )
+    gpus_payload = json.loads(capsys.readouterr().out)
+    assert [row["host"] for row in gpus_payload["hosts"]] == ["barbury-l", "canada-l"]
+    assert calls == ["barbury-l", "canada-l"]
+
+    calls.clear()
+    assert (
+        main_cli.main(
+            ["status", "--selector", "barbury-l", "canada-l", "--catalog", str(catalog), "--json"],
+            runner=runner,
+        )
+        == 0
+    )
+    override_payload = json.loads(capsys.readouterr().out)
+    assert [row["host"] for row in override_payload["hosts"]] == ["barbury-l"]
+    assert calls == ["barbury-l"]
+
+
+def test_ucl_status_expands_multiple_selectors_in_catalog_order(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    catalog = write_status_catalog(tmp_path)
+    probed: list[str] = []
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        host = argv[-3]
+        probed.append(host)
+        return ok(stdout=inventory_stdout(host=host))
+
+    assert main_cli.main(["status", "3090ti", "timeshare", "--catalog", str(catalog), "--json"], runner=runner) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [row["host"] for row in payload["hosts"]] == ["barbury-l", "canada-l", "cream"]
+    assert probed == ["barbury-l", "canada-l", "cream"]
+
+    probed.clear()
+    assert main_cli.main(["status", "barbury-l", "3090ti", "--catalog", str(catalog), "--json"], runner=runner) == 0
+    dedupe_payload = json.loads(capsys.readouterr().out)
+    assert [row["host"] for row in dedupe_payload["hosts"]] == ["barbury-l", "canada-l"]
+    assert probed == ["barbury-l", "canada-l"]
+
+    probed.clear()
+    assert main_cli.main(["status", "all", "!cream", "--catalog", str(catalog), "--json"], runner=runner) == 0
+    exclusion_payload = json.loads(capsys.readouterr().out)
+    assert [row["host"] for row in exclusion_payload["hosts"]] == ["barbury-l", "canada-l"]
+    assert probed == ["barbury-l", "canada-l"]
+
+
+def test_ucl_status_defaults_to_all_targets(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    catalog = write_status_catalog(tmp_path)
+    probed: list[str] = []
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        host = argv[-3]
+        probed.append(host)
+        return ok(stdout=inventory_stdout(host=host))
+
+    assert main_cli.main(["status", "--catalog", str(catalog), "--json"], runner=runner) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [row["host"] for row in payload["hosts"]] == ["barbury-l", "canada-l", "cream"]
+    assert probed == ["barbury-l", "canada-l", "cream"]
 
 
 def test_ucl_run_full_fake_path_writes_registry(

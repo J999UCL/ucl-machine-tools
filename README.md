@@ -5,6 +5,7 @@ script launches.
 
 ```bash
 scripts/ucl status 3090ti
+scripts/ucl status barbury-l canada-l
 scripts/ucl doctor barbury-l
 scripts/ucl exec barbury-l hostname
 scripts/ucl exec barbury-l --cwd /tmp --timeout 60 pwd

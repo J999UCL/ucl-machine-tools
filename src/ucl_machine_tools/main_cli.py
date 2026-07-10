@@ -46,6 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
 Common use:
   ucl status 3090ti
       Show GPU availability, /tmp space, /tmp/ucl-machine-tools, and restart policy.
+  ucl status barbury-l canada-l
+      Check multiple explicit targets in one call.
   ucl status recommend 3090ti --min-free-vram-gb 20
       Pick the best currently usable matching host.
   ucl doctor barbury-l
@@ -75,7 +77,7 @@ Use 'ucl COMMAND --help' for command-specific flags.
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     status = subparsers.add_parser("status", help="Check GPU, scratch, and host state.")
-    status.add_argument("items", nargs="*", help="optional mode and target, e.g. recommend 3090ti")
+    status.add_argument("items", nargs="*", help="optional mode and one or more targets, e.g. recommend 3090ti timeshare")
     _add_inventory_flags(status)
 
     doctor = subparsers.add_parser("doctor", help="Check one host, scratch, and tmux state.")
@@ -304,14 +306,18 @@ def _resolve_one_host(selector: str, *, catalog_path: Path | None) -> HostSpec:
     return hosts[0]
 
 
-def _status_mode_and_target(items: list[str], selector: str | None) -> tuple[str, str]:
+def _status_mode_and_targets(items: list[str], selector: str | None) -> tuple[str, tuple[str, ...]]:
     if selector:
-        return "check", selector
+        return "check", (selector,)
     if not items:
-        return "check", "all"
+        return "check", ("all",)
     if items[0] in {"check", "gpus", "state", "recommend"}:
-        return items[0], items[1] if len(items) > 1 else "all"
-    return "check", items[0]
+        return items[0], tuple(items[1:] or ("all",))
+    return "check", tuple(items)
+
+
+def _resolve_status_targets(targets: tuple[str, ...], *, catalog: dict[str, HostSpec]) -> list[HostSpec]:
+    return parse_selector(",".join(targets), catalog=catalog)
 
 
 def _best_free_gpu(row: dict[str, Any], *, min_free_vram_gb: float) -> str:
@@ -378,9 +384,9 @@ def _best_vram_mb(row: dict[str, Any]) -> float:
 
 
 def run_status(args: argparse.Namespace, *, runner=subprocess.run) -> int:
-    mode, target = _status_mode_and_target(args.items, args.selector)
+    mode, targets = _status_mode_and_targets(args.items, args.selector)
     catalog = load_catalog(args.catalog)
-    selected = parse_selector(target, catalog=catalog)
+    selected = _resolve_status_targets(targets, catalog=catalog)
     ensure_knuckles_master(runner=runner)
     rows = inventory.collect(
         selected,
