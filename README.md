@@ -13,8 +13,8 @@ scripts/ucl exec 3090ti --gpu auto --min-free-vram-gb 20 -- nvidia-smi
 scripts/ucl exec barbury-l --cwd /tmp --timeout 60 pwd
 scripts/ucl exec barbury-l --shell csh --stdin < setup_python.csh
 scripts/ucl exec barbury-l --detach --new-session -- hostname
-scripts/ucl run --host barbury-l --gpu auto --min-free-vram-gb 20 --local-dir ./bundle --script run.sh
-scripts/ucl run --host barbury-l --remote-root /tmp/ucl-machine-tools/fpt/launchers --local-dir ./bundle --script run.sh
+scripts/ucl run --host barbury-l --new-session --gpu auto --min-free-vram-gb 20 --local-dir ./bundle --script run.sh
+scripts/ucl run --host barbury-l --session my_run --remote-root /tmp/ucl-machine-tools/fpt/launchers --local-dir ./bundle --script run.sh
 scripts/ucl tail last
 scripts/ucl fetch last
 scripts/ucl jobs
@@ -40,7 +40,7 @@ work.
 - `ucl exec HOST --detach -- COMMAND...` uses the old tmux-backed async path
   and records the run for `tail`/`fetch`.
 - `ucl run` uploads a local bundle, writes launcher files, and starts the bundle
-  script in tmux.
+  script in tmux. It requires `--session NAME` or `--new-session`.
 - `ucl jobs`, `ucl info`, `ucl stop`, `ucl tail`, `ucl fetch`, and `ucl clean`
   operate on recorded run metadata.
 - `ucl copy SRC DST` copies local or remote endpoints with `rsync`; add
@@ -89,8 +89,9 @@ intentionally conservative:
 - zero sessions: fail unless `--session` or `--new-session` is passed
 - multiple sessions: fail unless `--session` or `--new-session` is passed
 
-`ucl run` may create a generated session when no tmux session exists, because it
-is always the long-job launch path.
+`ucl run` is also explicit: pass `--session NAME` to use/create a named session,
+or `--new-session` to create a generated session. It never silently reuses the
+only existing tmux session.
 
 ## TSG Restart Notes
 

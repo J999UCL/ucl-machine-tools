@@ -72,7 +72,7 @@ Common use:
       Run UCL/TSG csh setup snippets, such as Python/CUDA setup.
   ucl exec barbury-l --detach -- hostname
       Launch a small command in tmux and record it like a run.
-  ucl run --host barbury-l --gpu auto --min-free-vram-gb 20 --local-dir ./bundle --script run.sh
+  ucl run --host barbury-l --new-session --gpu auto --min-free-vram-gb 20 --local-dir ./bundle --script run.sh
       Upload a local bundle and launch its script in tmux.
   ucl tail last
       Print the latest recorded run log without login noise.
@@ -931,6 +931,8 @@ def run_exec_multi_sync(
 
 def run_run(args: argparse.Namespace, *, runner=subprocess.run, popener=subprocess.Popen) -> int:
     host = _resolve_one_host(args.host, catalog_path=args.catalog)
+    if not args.session and not args.new_session:
+        raise RuntimeError("ucl run requires --session NAME or --new-session")
     if args.dry_run:
         plan = build_run_plan(
             host=host,
@@ -974,6 +976,7 @@ def run_run(args: argparse.Namespace, *, runner=subprocess.run, popener=subproce
         requested_session=plan.requested_session,
         new_session=plan.new_session,
         window=plan.window,
+        require_explicit_when_not_single=True,
     )
     upload_bundle(plan, runner=runner, popener=popener)
     launcher = write_launcher_files(plan, runner=runner)

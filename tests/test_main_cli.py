@@ -331,6 +331,8 @@ def test_ucl_run_full_fake_path_writes_registry(
             "auto",
             "--min-free-vram-gb",
             "22",
+            "--session",
+            "work",
             "--local-dir",
             str(bundle),
             "--script",
@@ -348,6 +350,18 @@ def test_ucl_run_full_fake_path_writes_registry(
     latest = tmp_path / "cache" / "runs" / "latest.json"
     assert latest.exists()
     assert json.loads(latest.read_text(encoding="utf-8"))["kind"] == "run"
+
+
+def test_ucl_run_requires_explicit_session(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bundle = make_bundle(tmp_path)
+
+    rc = main_cli.main(["run", "--host", "barbury-l", "--local-dir", str(bundle), "--script", "run.sh"])
+
+    assert rc == 2
+    assert "ucl run requires --session NAME or --new-session" in capsys.readouterr().err
 
 
 def test_ucl_exec_sync_command_prints_output_and_preserves_argv(
@@ -837,6 +851,7 @@ def test_ucl_run_and_detached_exec_accept_remote_root(
                 "run.sh",
                 "--remote-root",
                 "/tmp/ucl-machine-tools/fpt/launchers",
+                "--new-session",
                 "--dry-run",
             ]
         )
@@ -1401,7 +1416,7 @@ def test_help_exposes_unified_commands_and_not_legacy_scripts(capsys: pytest.Cap
     assert "Common use:" in help_text
     assert "ucl exec barbury-l df -h /tmp" in help_text
     assert "ucl exec barbury-l --detach -- hostname" in help_text
-    assert "ucl run --host barbury-l --gpu auto" in help_text
+    assert "ucl run --host barbury-l --new-session --gpu auto" in help_text
     assert "Use 'ucl COMMAND --help'" in help_text
     assert "ucl-inventory" not in help_text
     assert "ucl-launch" not in help_text
