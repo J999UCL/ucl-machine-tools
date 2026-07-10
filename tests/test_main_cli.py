@@ -774,6 +774,58 @@ def test_ucl_exec_stdin_dry_run_reads_stdin(monkeypatch: pytest.MonkeyPatch, cap
     assert "shell:      bash" in out
 
 
+def test_ucl_run_and_detached_exec_accept_remote_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bundle = make_bundle(tmp_path)
+
+    assert (
+        main_cli.main(
+            [
+                "run",
+                "--host",
+                "barbury-l",
+                "--local-dir",
+                str(bundle),
+                "--script",
+                "run.sh",
+                "--remote-root",
+                "/tmp/ucl-machine-tools/fpt/launchers",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+    run_out = capsys.readouterr().out
+    assert "remote_dir: /tmp/ucl-machine-tools/fpt/launchers/run_" in run_out
+    assert "remote_root: /tmp/ucl-machine-tools/fpt/launchers" in run_out
+
+    class FakeStdin:
+        def read(self) -> str:
+            return "echo hello\n"
+
+    monkeypatch.setattr("sys.stdin", FakeStdin())
+    assert (
+        main_cli.main(
+            [
+                "exec",
+                "barbury-l",
+                "--detach",
+                "--stdin",
+                "--remote-root",
+                "/tmp/ucl-machine-tools/fpt/launchers",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+    exec_out = capsys.readouterr().out
+    assert "remote_dir: /tmp/ucl-machine-tools/fpt/launchers/exec_stdin_" in exec_out
+    assert "remote_root: /tmp/ucl-machine-tools/fpt/launchers" in exec_out
+
+
 def test_ucl_exec_rejects_bad_command_shapes(capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeStdin:
         def read(self) -> str:
@@ -1069,6 +1121,27 @@ def test_ucl_clean_filters_login_noise(capsys: pytest.CaptureFixture[str]) -> No
     assert "VBoxManage" not in captured.err
 
 
+def test_ucl_clean_uses_configured_remote_root(capsys: pytest.CaptureFixture[str]) -> None:
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv():
+            assert 'ROOT="/tmp/ucl-machine-tools/fpt/launchers"' in kwargs["input"]
+            return ok(
+                stdout="\n".join(
+                    [
+                        main_cli.CLEAN_SENTINEL_BEGIN,
+                        json.dumps({"schema_version": 1, "paths": []}),
+                        main_cli.CLEAN_SENTINEL_END,
+                    ]
+                )
+            )
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["clean", "barbury-l", "--remote-root", "/tmp/ucl-machine-tools/fpt/launchers"], runner=runner) == 0
+    assert capsys.readouterr().out == ""
+
+
 def test_ucl_jobs_info_and_stop_use_registry_and_tmux(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1264,8 +1337,8 @@ def test_generated_remote_python_sources_compile() -> None:
     compile(main_cli._tail_source("/tmp/demo/run.log", 20), "<tail-source>", "exec")
     compile(main_cli._tail_follow_source("/tmp/demo/run.log", 20), "<tail-follow-source>", "exec")
     compile(main_cli._fetch_source("/tmp/demo"), "<fetch-source>", "exec")
-    compile(main_cli._clean_source(7, False), "<clean-source>", "exec")
-    compile(main_cli._clean_source(7, True), "<clean-source-execute>", "exec")
+    compile(main_cli._clean_source(7, False, "/tmp/ucl-machine-tools/launchers"), "<clean-source>", "exec")
+    compile(main_cli._clean_source(7, True, "/tmp/ucl-machine-tools/launchers"), "<clean-source-execute>", "exec")
     compile(envcheck.env_source(remote_root="/tmp/ucl-machine-tools/fpt", create=False, gpu=None), "<env-source>", "exec")
     compile(copy_tools.manifest_source("/tmp/demo", sha256=False), "<copy-manifest-source>", "exec")
 

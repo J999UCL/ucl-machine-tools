@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import posixpath
 import re
 import shlex
@@ -18,7 +19,9 @@ from ucl_machine_tools.ssh import build_remote_python_argv
 
 Runner = Callable[..., subprocess.CompletedProcess]
 Popener = Callable[..., subprocess.Popen]
-REMOTE_ROOT = "/tmp/ucl-machine-tools/launchers"
+DEFAULT_REMOTE_ROOT = "/tmp/ucl-machine-tools/launchers"
+REMOTE_ROOT = DEFAULT_REMOTE_ROOT
+REMOTE_ROOT_ENV = "UCL_LAUNCH_ROOT"
 TMUX_SENTINEL_BEGIN = "UCL_TMUX_JSON_BEGIN"
 TMUX_SENTINEL_END = "UCL_TMUX_JSON_END"
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -32,6 +35,7 @@ class RemoteJobPlan:
     host: HostSpec
     run_id: str
     remote_dir: str
+    remote_root: str
     log_path: str
     command: tuple[str, ...]
     env: tuple[tuple[str, str], ...]
@@ -100,15 +104,28 @@ def utc_run_id(stem: str) -> str:
     return f"{safe}_{timestamp}"
 
 
-def validate_remote_dir(remote_dir: str) -> None:
+def default_remote_root() -> str:
+    return posixpath.normpath(os.environ.get(REMOTE_ROOT_ENV, DEFAULT_REMOTE_ROOT))
+
+
+def validate_remote_root(remote_root: str) -> str:
+    if not remote_root.startswith("/"):
+        raise ValueError(f"remote_root must be absolute: {remote_root!r}")
+    normalized = posixpath.normpath(remote_root)
+    if normalized == "/" or ".." in normalized.split("/"):
+        raise ValueError(f"remote_root must not contain '..': {remote_root!r}")
+    return normalized
+
+
+def validate_remote_dir(remote_dir: str, *, remote_root: str | None = None) -> None:
     if not remote_dir.startswith("/"):
         raise ValueError(f"remote_dir must be absolute: {remote_dir!r}")
     normalized = posixpath.normpath(remote_dir)
     if normalized == "/" or ".." in normalized.split("/"):
         raise ValueError(f"remote_dir must not contain '..': {remote_dir!r}")
-    root = REMOTE_ROOT.rstrip("/")
+    root = validate_remote_root(remote_root or default_remote_root()).rstrip("/")
     if normalized != root and not normalized.startswith(root + "/"):
-        raise ValueError(f"remote_dir must be under {REMOTE_ROOT}: {remote_dir!r}")
+        raise ValueError(f"remote_dir must be under {root}: {remote_dir!r}")
 
 
 def resolve_script(local_dir: Path, script: str) -> str:
@@ -130,20 +147,22 @@ def _common_plan_values(
     session: str | None,
     window: str | None,
     remote_dir: str | None,
+    remote_root: str | None,
     log_path: str | None,
-) -> tuple[str, str, str, str]:
+) -> tuple[str, str, str, str, str]:
     run_id = session or utc_run_id(stem)
     validate_name(run_id, "run_id")
     if session is not None:
         validate_name(session, "session")
     window_name = window or stem or run_id
     validate_name(window_name, "window")
-    final_remote_dir = posixpath.normpath(remote_dir or f"{REMOTE_ROOT}/{run_id}")
-    validate_remote_dir(final_remote_dir)
+    final_remote_root = validate_remote_root(remote_root or default_remote_root())
+    final_remote_dir = posixpath.normpath(remote_dir or f"{final_remote_root}/{run_id}")
+    validate_remote_dir(final_remote_dir, remote_root=final_remote_root)
     final_log_path = posixpath.normpath(log_path or posixpath.join(final_remote_dir, "run.log"))
     if not final_log_path.startswith("/"):
         raise ValueError(f"log path must be absolute: {final_log_path!r}")
-    return run_id, window_name, final_remote_dir, final_log_path
+    return run_id, window_name, final_remote_dir, final_remote_root, final_log_path
 
 
 def build_run_plan(
@@ -158,16 +177,18 @@ def build_run_plan(
     new_session: bool = False,
     window: str | None = None,
     remote_dir: str | None = None,
+    remote_root: str | None = None,
     log_path: str | None = None,
     replace: bool = False,
 ) -> RemoteJobPlan:
     validate_shell(shell)
     script_rel = resolve_script(local_dir, script)
-    run_id, window_name, final_remote_dir, final_log_path = _common_plan_values(
+    run_id, window_name, final_remote_dir, final_remote_root, final_log_path = _common_plan_values(
         stem=Path(script_rel).stem or "run",
         session=session,
         window=window,
         remote_dir=remote_dir,
+        remote_root=remote_root,
         log_path=log_path,
     )
     return RemoteJobPlan(
@@ -175,6 +196,7 @@ def build_run_plan(
         host=host,
         run_id=run_id,
         remote_dir=final_remote_dir,
+        remote_root=final_remote_root,
         log_path=final_log_path,
         command=("bash", script_rel, *args),
         env=env,
@@ -198,17 +220,19 @@ def build_exec_plan(
     new_session: bool = False,
     window: str | None = None,
     remote_dir: str | None = None,
+    remote_root: str | None = None,
     log_path: str | None = None,
 ) -> RemoteJobPlan:
     validate_shell(shell)
     if bool(command) == bool(stdin_body is not None):
         raise ValueError("exec requires exactly one of command tokens or --stdin")
     stem = f"exec_{command[0] if command else 'stdin'}"
-    run_id, window_name, final_remote_dir, final_log_path = _common_plan_values(
+    run_id, window_name, final_remote_dir, final_remote_root, final_log_path = _common_plan_values(
         stem=stem,
         session=session,
         window=window,
         remote_dir=remote_dir,
+        remote_root=remote_root,
         log_path=log_path,
     )
     return RemoteJobPlan(
@@ -216,6 +240,7 @@ def build_exec_plan(
         host=host,
         run_id=run_id,
         remote_dir=final_remote_dir,
+        remote_root=final_remote_root,
         log_path=final_log_path,
         command=command,
         env=env,
@@ -281,8 +306,8 @@ def build_launcher_files(plan: RemoteJobPlan) -> tuple[str, dict[str, str]]:
     return ".ucl_payload.sh", {".ucl_payload.sh": _bash_payload_source(plan)}
 
 
-def build_remote_mkdir_command(remote_dir: str, *, replace: bool = False) -> str:
-    validate_remote_dir(remote_dir)
+def build_remote_mkdir_command(remote_dir: str, *, remote_root: str | None = None, replace: bool = False) -> str:
+    validate_remote_dir(remote_dir, remote_root=remote_root)
     remote_q = shlex.quote(remote_dir)
     if replace:
         return f"set -euo pipefail; rm -rf {remote_q}; mkdir -p {remote_q}"
@@ -294,18 +319,18 @@ def build_remote_mkdir_command(remote_dir: str, *, replace: bool = False) -> str
     )
 
 
-def build_remote_mkdir_argv(host: HostSpec, remote_dir: str, *, replace: bool = False) -> list[str]:
-    return remote_bash_argv(host, build_remote_mkdir_command(remote_dir, replace=replace))
+def build_remote_mkdir_argv(host: HostSpec, remote_dir: str, *, remote_root: str | None = None, replace: bool = False) -> list[str]:
+    return remote_bash_argv(host, build_remote_mkdir_command(remote_dir, remote_root=remote_root, replace=replace))
 
 
-def build_upload_argv(host: HostSpec, remote_dir: str, *, replace: bool = False) -> list[str]:
-    mkdir = build_remote_mkdir_command(remote_dir, replace=replace)
+def build_upload_argv(host: HostSpec, remote_dir: str, *, remote_root: str | None = None, replace: bool = False) -> list[str]:
+    mkdir = build_remote_mkdir_command(remote_dir, remote_root=remote_root, replace=replace)
     remote_q = shlex.quote(remote_dir)
     return remote_bash_argv(host, f"{mkdir}; tar -xf - -C {remote_q}")
 
 
-def build_write_file_argv(host: HostSpec, remote_dir: str, name: str) -> list[str]:
-    validate_remote_dir(remote_dir)
+def build_write_file_argv(host: HostSpec, remote_dir: str, name: str, *, remote_root: str | None = None) -> list[str]:
+    validate_remote_dir(remote_dir, remote_root=remote_root)
     if "/" in name or not name:
         raise ValueError(f"remote file name must be a basename: {name!r}")
     path = posixpath.join(remote_dir, name)
@@ -405,7 +430,7 @@ def upload_bundle(plan: RemoteJobPlan, *, runner: Runner = subprocess.run, popen
     tar_proc = popener(["tar", "-cf", "-", "-C", str(plan.local_dir), "."], stdout=subprocess.PIPE)
     try:
         proc = runner(
-            build_upload_argv(plan.host, plan.remote_dir, replace=plan.replace),
+            build_upload_argv(plan.host, plan.remote_dir, remote_root=plan.remote_root, replace=plan.replace),
             stdin=tar_proc.stdout,
             capture_output=True,
             shell=False,
@@ -425,7 +450,7 @@ def upload_bundle(plan: RemoteJobPlan, *, runner: Runner = subprocess.run, popen
 
 
 def create_remote_dir(plan: RemoteJobPlan, *, runner: Runner = subprocess.run) -> None:
-    proc = runner(build_remote_mkdir_argv(plan.host, plan.remote_dir, replace=plan.replace), capture_output=True, text=True, shell=False)
+    proc = runner(build_remote_mkdir_argv(plan.host, plan.remote_dir, remote_root=plan.remote_root, replace=plan.replace), capture_output=True, text=True, shell=False)
     if int(getattr(proc, "returncode", 1)) != 0:
         raise RuntimeError((getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "failed to create remote dir").strip())
 
@@ -434,7 +459,7 @@ def write_launcher_files(plan: RemoteJobPlan, *, runner: Runner = subprocess.run
     launcher_name, files = build_launcher_files(plan)
     for name, source in files.items():
         proc = runner(
-            build_write_file_argv(plan.host, plan.remote_dir, name),
+            build_write_file_argv(plan.host, plan.remote_dir, name, remote_root=plan.remote_root),
             input=source,
             capture_output=True,
             text=True,

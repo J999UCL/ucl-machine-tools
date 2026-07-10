@@ -62,6 +62,34 @@ def test_env_and_gpu_are_plain_exports_not_profiles(tmp_path: Path) -> None:
     assert "export FOO='bar baz'" in files[".ucl_payload.sh"]
 
 
+def test_remote_root_can_be_configured_in_plans(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bundle = make_bundle(tmp_path)
+
+    plan = launch.build_run_plan(
+        host=host(),
+        local_dir=bundle,
+        script="run.sh",
+        session="demo",
+        remote_root="/tmp/ucl-machine-tools/fpt/launchers",
+    )
+    assert plan.remote_root == "/tmp/ucl-machine-tools/fpt/launchers"
+    assert plan.remote_dir == "/tmp/ucl-machine-tools/fpt/launchers/demo"
+
+    with pytest.raises(ValueError, match="under /tmp/ucl-machine-tools/fpt/launchers"):
+        launch.build_exec_plan(
+            host=host(),
+            command=("hostname",),
+            session="demo",
+            remote_root="/tmp/ucl-machine-tools/fpt/launchers",
+            remote_dir="/tmp/ucl-machine-tools/launchers/demo",
+        )
+
+    monkeypatch.setenv("UCL_LAUNCH_ROOT", "/tmp/ucl-machine-tools/env-launchers")
+    env_plan = launch.build_run_plan(host=host(), local_dir=bundle, script="run.sh", session="envdemo")
+    assert env_plan.remote_root == "/tmp/ucl-machine-tools/env-launchers"
+    assert env_plan.remote_dir == "/tmp/ucl-machine-tools/env-launchers/envdemo"
+
+
 def test_tmux_sentinel_parser_ignores_noise_and_exec_auto_requires_single_session() -> None:
     assert launch.build_tmux_list_argv(host(), timeout_seconds=8) == [
         "ssh",

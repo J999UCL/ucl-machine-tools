@@ -14,6 +14,7 @@ scripts/ucl exec barbury-l --cwd /tmp --timeout 60 pwd
 scripts/ucl exec barbury-l --shell csh --stdin < setup_python.csh
 scripts/ucl exec barbury-l --detach --new-session -- hostname
 scripts/ucl run --host barbury-l --local-dir ./bundle --script run.sh
+scripts/ucl run --host barbury-l --remote-root /tmp/ucl-machine-tools/fpt/launchers --local-dir ./bundle --script run.sh
 scripts/ucl tail last
 scripts/ucl fetch last
 scripts/ucl jobs
@@ -48,6 +49,13 @@ work.
   setup scripts, `/tmp` space, and optional GPU availability.
 - `ucl fanout --hosts TARGET... -- COMMAND...` is kept as the explicit fanout
   spelling, but `ucl exec HOST HOST -- COMMAND...` is the preferred form.
+
+## Launcher Root
+
+Detached `ucl exec`, `ucl run`, and `ucl clean` default to
+`/tmp/ucl-machine-tools/launchers`. Override that with `--remote-root DIR` or set
+`UCL_LAUNCH_ROOT`, for example `/tmp/ucl-machine-tools/fpt/launchers`. Explicit
+`--remote-dir` values must stay under the selected root.
 
 ## Environment Setup
 

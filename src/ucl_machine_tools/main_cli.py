@@ -21,6 +21,7 @@ from ucl_machine_tools.launch import (
     build_run_plan,
     create_remote_dir,
     decide_tmux,
+    default_remote_root,
     format_summary,
     launch_tmux,
     list_remote_sessions,
@@ -122,6 +123,7 @@ Use 'ucl COMMAND --help' for command-specific flags.
     clean = subparsers.add_parser("clean", help="List or delete old launcher directories.")
     clean.add_argument("host")
     clean.add_argument("--catalog", type=Path)
+    clean.add_argument("--remote-root", help="remote launcher root; defaults to UCL_LAUNCH_ROOT or /tmp/ucl-machine-tools/launchers")
     clean.add_argument("--execute", action="store_true", help="delete listed launcher directories")
     clean.add_argument("--older-than-days", type=int, default=7)
 
@@ -198,7 +200,8 @@ def _add_launch_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--session", help="tmux session to use or create")
     parser.add_argument("--new-session", action="store_true", help="force creating a new tmux session")
     parser.add_argument("--window", help="tmux window name")
-    parser.add_argument("--remote-dir", help="remote bundle dir under /tmp/ucl-machine-tools/launchers")
+    parser.add_argument("--remote-dir", help="exact remote bundle dir; must be under the selected launcher root")
+    parser.add_argument("--remote-root", help="remote launcher root; defaults to UCL_LAUNCH_ROOT or /tmp/ucl-machine-tools/launchers")
     parser.add_argument("--log", help="remote log path; default is <remote-dir>/run.log")
     parser.add_argument("--dry-run", action="store_true")
 
@@ -289,6 +292,7 @@ def _parse_exec_argv(tokens: list[str]) -> argparse.Namespace:
         "new_session": False,
         "window": None,
         "remote_dir": None,
+        "remote_root": None,
         "log": None,
         "dry_run": False,
         "exec_command": (),
@@ -311,6 +315,7 @@ def _parse_exec_argv(tokens: list[str]) -> argparse.Namespace:
         "--session": "session",
         "--window": "window",
         "--remote-dir": "remote_dir",
+        "--remote-root": "remote_root",
         "--log": "log",
     }
     rest = tokens[1:]
@@ -379,6 +384,7 @@ def _parse_exec_argv(tokens: list[str]) -> argparse.Namespace:
         ("--new-session", "new_session"),
         ("--window", "window"),
         ("--remote-dir", "remote_dir"),
+        ("--remote-root", "remote_root"),
         ("--log", "log"),
     ):
         if values[key]:
@@ -542,6 +548,7 @@ def _dry_run_summary(plan, *, subcommand: str) -> str:
             f"host:       {plan.host.name}",
             f"run_id:     {plan.run_id}",
             f"remote_dir: {plan.remote_dir}",
+            f"remote_root: {plan.remote_root}",
             f"log:        {plan.log_path}",
             f"shell:      {plan.shell}",
             f"tmux:       {'new-session' if plan.new_session else (plan.requested_session or 'auto')}",
@@ -918,6 +925,7 @@ def run_run(args: argparse.Namespace, *, runner=subprocess.run, popener=subproce
             new_session=args.new_session,
             window=args.window,
             remote_dir=args.remote_dir,
+            remote_root=args.remote_root,
             log_path=args.log,
             replace=args.replace,
         )
@@ -937,6 +945,7 @@ def run_run(args: argparse.Namespace, *, runner=subprocess.run, popener=subproce
         new_session=args.new_session,
         window=args.window,
         remote_dir=args.remote_dir,
+        remote_root=args.remote_root,
         log_path=args.log,
         replace=args.replace,
     )
@@ -978,6 +987,7 @@ def run_exec(args: argparse.Namespace, *, runner=subprocess.run) -> int:
             new_session=args.new_session,
             window=args.window,
             remote_dir=args.remote_dir,
+            remote_root=args.remote_root,
             log_path=args.log,
         )
         print(_dry_run_summary(plan, subcommand="exec"))
@@ -995,6 +1005,7 @@ def run_exec(args: argparse.Namespace, *, runner=subprocess.run) -> int:
         new_session=args.new_session,
         window=args.window,
         remote_dir=args.remote_dir,
+        remote_root=args.remote_root,
         log_path=args.log,
     )
     sessions = list_remote_sessions(host, runner=runner)
@@ -1186,10 +1197,11 @@ print(END)
 
 def run_clean(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     host = _resolve_one_host(args.host, catalog_path=args.catalog)
+    remote_root = args.remote_root or default_remote_root()
     ensure_knuckles_master(runner=runner)
     proc = runner(
         _ssh_python_argv(host.ssh_host),
-        input=_clean_source(int(args.older_than_days), bool(args.execute)),
+        input=_clean_source(int(args.older_than_days), bool(args.execute), remote_root),
         capture_output=True,
         text=True,
         shell=False,
@@ -1498,7 +1510,7 @@ def run_fanout(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     return 0 if all(row.get("ok") for row in rows) else 2
 
 
-def _clean_source(days: int, execute: bool) -> str:
+def _clean_source(days: int, execute: bool, remote_root: str) -> str:
     return f"""
 import json
 import os
@@ -1506,7 +1518,7 @@ import shutil
 import time
 BEGIN={json.dumps(CLEAN_SENTINEL_BEGIN)}
 END={json.dumps(CLEAN_SENTINEL_END)}
-ROOT="/tmp/ucl-machine-tools/launchers"
+ROOT={json.dumps(remote_root)}
 DAYS={int(days)}
 EXECUTE={bool(execute)!r}
 cutoff = time.time() - DAYS * 86400
