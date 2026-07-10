@@ -1729,31 +1729,6 @@ def test_ucl_env_json_parses_remote_preflight(capsys: pytest.CaptureFixture[str]
     assert payload["root_exists"] is True
 
 
-def test_ucl_fanout_runs_command_in_catalog_order(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    catalog = write_status_catalog(tmp_path)
-
-    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
-        if argv[:3] == ["ssh", "-O", "check"]:
-            return ok()
-        if argv[-2:] == ["python3", "-"]:
-            host = argv[-3]
-            return ok(stdout=exec_stdout(stdout=f"{host}\n".encode()))
-        raise AssertionError(f"unexpected argv: {argv}")
-
-    rc = main_cli.main(
-        ["fanout", "--hosts", "barbury-l", "canada-l", "--catalog", str(catalog), "--json", "--", "hostname"],
-        runner=runner,
-    )
-
-    assert rc == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert [row["host"] for row in payload["results"]] == ["barbury-l", "canada-l"]
-    assert [row["stdout"] for row in payload["results"]] == ["barbury-l\n", "canada-l\n"]
-
-
 def test_generated_remote_python_sources_compile() -> None:
     compile(
         main_cli._sync_exec_source({"mode": "command", "argv": ["hostname"], "timeout": 60.0}),
@@ -1776,10 +1751,16 @@ def test_help_exposes_unified_commands_and_not_legacy_scripts(capsys: pytest.Cap
     help_text = capsys.readouterr().out
     assert "status" in help_text
     assert "exec" in help_text
-    assert "Common use:" in help_text
+    assert "Common workflows:" in help_text
+    assert "Inspect machines:" in help_text
+    assert "Run quick synchronous commands:" in help_text
+    assert "Launch and manage tmux-backed jobs:" in help_text
+    assert "Copy data:" in help_text
     assert "ucl exec barbury-l df -h /tmp" in help_text
-    assert "ucl exec barbury-l --detach -- hostname" in help_text
+    assert "ucl exec barbury-l --detach --new-session -- hostname" in help_text
     assert "ucl run --host barbury-l --new-session --gpu auto" in help_text
+    assert "ucl copy barbury-l:/tmp/a barnacle-l:/tmp/a -- --partial" in help_text
     assert "Use 'ucl COMMAND --help'" in help_text
+    assert "fanout" not in help_text
     assert "ucl-inventory" not in help_text
     assert "ucl-launch" not in help_text

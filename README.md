@@ -21,7 +21,6 @@ scripts/ucl jobs
 scripts/ucl copy ./data barbury-l:/tmp/ucl-machine-tools/data --verify size
 scripts/ucl copy barbury-l:/tmp/a barnacle-l:/tmp/a -- --partial --info=progress2 --exclude '*.pt'
 scripts/ucl env barbury-l --remote-root /tmp/ucl-machine-tools/fpt --json
-scripts/ucl fanout --hosts barbury-l canada-l -- hostname
 ```
 
 The tool always checks/starts the `knuckles` SSH master connection before remote
@@ -55,10 +54,8 @@ work.
   `--verify sha256` when you want explicit transfer checks.
 - `ucl env HOST --remote-root DIR` checks reachability, scratch/root state, TSG
   setup scripts, `/tmp` space, and optional GPU availability.
-- `ucl fanout --hosts TARGET... -- COMMAND...` is kept as the explicit fanout
-  spelling, but `ucl exec HOST HOST -- COMMAND...` is the preferred form.
-- `--gpu auto` on `exec`, `run`, `fanout`, and `env` requires 20 GB free VRAM
-  by default; tune it with `--min-free-vram-gb`.
+- `--gpu auto` on `exec`, `run`, and `env` requires 20 GB free VRAM by default;
+  tune it with `--min-free-vram-gb`.
 
 ## Launcher Root
 

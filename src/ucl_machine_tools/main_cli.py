@@ -50,47 +50,37 @@ def build_parser() -> argparse.ArgumentParser:
         description="Unified UCL machine helper.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
-Common use:
-  ucl status 3090ti
-      Show GPU availability, /tmp space, /tmp/ucl-machine-tools, and restart policy.
-  ucl status barbury-l canada-l
-      Check multiple explicit targets in one call.
-  ucl status recommend 3090ti --min-free-vram-gb 20
-      Pick the best currently usable matching host.
-  ucl doctor barbury-l
-      Check one host, scratch state, and tmux sessions before work.
-  ucl exec barbury-l df -h /tmp
-      Run a short remote check and print output now.
-  ucl exec barbury-l canada-l -- hostname
-      Run the same short remote check on multiple hosts.
-  ucl exec barbury-l --cwd /tmp --timeout 60 --connect-timeout 30 pwd
-      Run from a remote directory with bounded command and SSH timeouts.
-  ucl exec 3090ti --gpu auto --min-free-vram-gb 20 -- nvidia-smi
-      Select only GPUs with enough free VRAM.
-  ucl exec barbury-l --stdin < check.sh
-      Run a multi-line bash snippet from stdin and print output now.
-  ucl exec barbury-l --shell csh --stdin < check_torch.csh
-      Run UCL/TSG csh setup snippets, such as Python/CUDA setup.
-  ucl exec barbury-l --detach -- hostname
-      Launch a small command in tmux and record it like a run.
-  ucl run --host barbury-l --new-session --gpu auto --min-free-vram-gb 20 --local-dir ./bundle --script run.sh
-      Upload a local bundle and launch its script in tmux.
-  ucl tail last
-      Print the latest recorded run log without login noise.
-  ucl fetch last
-      Fetch small log/config/text artifacts from the latest recorded run.
-  ucl clean barbury-l
-      List old launcher dirs; add --execute only when deletion is intended.
-  ucl jobs
-      List recorded tmux-backed jobs and their current status.
-  ucl copy /tmp/a barbury-l:/tmp/a --verify size
-      Copy with rsync and optionally verify size/count or sha256 manifests.
-  ucl copy barbury-l:/tmp/a barnacle-l:/tmp/a -- --partial --info=progress2 --exclude '*.pt'
-      Pass raw rsync args through after a literal --.
-  ucl env barbury-l --remote-root /tmp/ucl-machine-tools/fpt --json
-      Check scratch, TSG setup scripts, and optional GPU availability.
-  ucl fanout --hosts barbury-l canada-l -- hostname
-      Run one small command across several selected hosts.
+Common workflows:
+  Inspect machines:
+    ucl status 3090ti
+    ucl status barbury-l canada-l
+    ucl status recommend 3090ti --min-free-vram-gb 20
+    ucl doctor barbury-l
+
+  Run quick synchronous commands:
+    ucl exec barbury-l df -h /tmp
+    ucl exec barbury-l canada-l -- hostname
+    ucl exec barbury-l --cwd /tmp --timeout 60 --connect-timeout 30 pwd
+    ucl exec 3090ti --gpu auto --min-free-vram-gb 20 -- nvidia-smi
+    ucl exec barbury-l --stdin < check.sh
+    ucl exec barbury-l --shell csh --stdin < check_torch.csh
+
+  Launch and manage tmux-backed jobs:
+    ucl exec barbury-l --detach --new-session -- hostname
+    ucl run --host barbury-l --new-session --gpu auto --min-free-vram-gb 20 --local-dir ./bundle --script run.sh
+    ucl jobs
+    ucl info last
+    ucl tail last
+    ucl fetch last
+    ucl stop RUN_ID
+    ucl clean barbury-l
+
+  Copy data:
+    ucl copy /tmp/a barbury-l:/tmp/a --verify size
+    ucl copy barbury-l:/tmp/a barnacle-l:/tmp/a -- --partial --info=progress2 --exclude '*.pt'
+
+  Check a remote scratch root:
+    ucl env barbury-l --remote-root /tmp/ucl-machine-tools/fpt --json
 
 Use 'ucl COMMAND --help' for command-specific flags.
 """,
@@ -170,18 +160,6 @@ Use 'ucl COMMAND --help' for command-specific flags.
     env.add_argument("--min-free-vram-gb", type=float, default=DEFAULT_AUTO_GPU_MIN_FREE_VRAM_GB)
     env.add_argument("--create", action="store_true")
     env.add_argument("--json", action="store_true")
-
-    fanout = subparsers.add_parser("fanout", help="Run a synchronous command across hosts.")
-    fanout.add_argument("--hosts", nargs="+", required=True)
-    fanout.add_argument("--catalog", type=Path)
-    fanout.add_argument("--jobs", type=int, default=4)
-    fanout.add_argument("--timeout-seconds", type=int, default=60)
-    fanout.add_argument("--json", action="store_true")
-    fanout.add_argument("--stdin", action="store_true")
-    fanout.add_argument("--shell", choices=("bash", "csh"), default="bash")
-    fanout.add_argument("--gpu", help="GPU id or auto")
-    fanout.add_argument("--min-free-vram-gb", type=float, default=DEFAULT_AUTO_GPU_MIN_FREE_VRAM_GB)
-    fanout.add_argument("fanout_command", nargs=argparse.REMAINDER, metavar="COMMAND")
 
     return parser
 
@@ -1075,7 +1053,7 @@ def run_exec_multi_sync(
     ensure_knuckles_master(runner=runner)
     rows: list[dict[str, Any]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(max(len(hosts), 1), 8)) as executor:
-        future_to_host = {executor.submit(_fanout_one, host, args, command, stdin_body, runner=runner): host for host in hosts}
+        future_to_host = {executor.submit(_multi_exec_one, host, args, command, stdin_body, runner=runner): host for host in hosts}
         by_host: dict[str, dict[str, Any]] = {}
         for future in concurrent.futures.as_completed(future_to_host):
             row = future.result()
@@ -1669,7 +1647,7 @@ def run_env(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     return 0 if payload.get("ok") else 2
 
 
-def _fanout_one(host: HostSpec, args: argparse.Namespace, command: tuple[str, ...], stdin_body: str | None, *, runner=subprocess.run) -> dict[str, Any]:
+def _multi_exec_one(host: HostSpec, args: argparse.Namespace, command: tuple[str, ...], stdin_body: str | None, *, runner=subprocess.run) -> dict[str, Any]:
     timeout_value = float(getattr(args, "timeout_seconds", getattr(args, "timeout", 60.0)))
     connect_timeout = int(getattr(args, "connect_timeout", 30))
     local_args = argparse.Namespace(
@@ -1721,36 +1699,8 @@ def _fanout_one(host: HostSpec, args: argparse.Namespace, command: tuple[str, ..
             "wrapper_error": result["wrapper_error"],
             "error": "",
         }
-    except Exception as exc:  # noqa: BLE001 - fanout reports per-host errors.
+    except Exception as exc:  # noqa: BLE001 - multi-host exec reports per-host errors.
         return {"host": host.name, "ok": False, "returncode": 2, "stdout": "", "stderr": "", "error": str(exc)}
-
-
-def run_fanout(args: argparse.Namespace, *, runner=subprocess.run) -> int:
-    command = _strip_remainder(args.fanout_command)
-    if args.stdin and command:
-        raise RuntimeError("--stdin cannot be used with COMMAND arguments")
-    if not args.stdin and not command:
-        raise RuntimeError("fanout requires COMMAND or --stdin")
-    catalog = load_catalog(args.catalog)
-    hosts = _resolve_status_targets(tuple(args.hosts), catalog=catalog)
-    ensure_knuckles_master(runner=runner)
-    stdin_body = sys.stdin.read() if args.stdin else None
-    rows: list[dict[str, Any]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(args.jobs))) as executor:
-        future_to_host = {executor.submit(_fanout_one, host, args, command, stdin_body, runner=runner): host for host in hosts}
-        by_host: dict[str, dict[str, Any]] = {}
-        for future in concurrent.futures.as_completed(future_to_host):
-            row = future.result()
-            by_host[row["host"]] = row
-        rows = [by_host[host.name] for host in hosts]
-    if args.json:
-        print(json.dumps({"results": rows}, indent=2, sort_keys=True))
-    else:
-        for row in rows:
-            status = "ok" if row.get("ok") else "fail"
-            first = (row.get("stdout") or row.get("stderr") or row.get("error") or "").strip().splitlines()
-            print(f"{row['host']}: {status} rc={row.get('returncode')} {first[0] if first else ''}".rstrip())
-    return 0 if all(row.get("ok") for row in rows) else 2
 
 
 def _clean_source(days: int, execute: bool, remote_root: str) -> str:
@@ -1833,8 +1783,6 @@ def main(argv: list[str] | None = None, *, runner=subprocess.run, popener=subpro
             return run_copy(args, runner=runner)
         if args.command == "env":
             return run_env(args, runner=runner)
-        if args.command == "fanout":
-            return run_fanout(args, runner=runner)
     except Exception as exc:  # noqa: BLE001 - CLI should render concise failures.
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
