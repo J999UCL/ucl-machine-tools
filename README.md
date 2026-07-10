@@ -9,11 +9,11 @@ scripts/ucl status barbury-l canada-l
 scripts/ucl doctor barbury-l
 scripts/ucl exec barbury-l hostname
 scripts/ucl exec barbury-l canada-l -- hostname
-scripts/ucl exec 3090ti -- df -h /tmp
+scripts/ucl exec 3090ti --gpu auto --min-free-vram-gb 20 -- nvidia-smi
 scripts/ucl exec barbury-l --cwd /tmp --timeout 60 pwd
 scripts/ucl exec barbury-l --shell csh --stdin < setup_python.csh
 scripts/ucl exec barbury-l --detach --new-session -- hostname
-scripts/ucl run --host barbury-l --local-dir ./bundle --script run.sh
+scripts/ucl run --host barbury-l --gpu auto --min-free-vram-gb 20 --local-dir ./bundle --script run.sh
 scripts/ucl run --host barbury-l --remote-root /tmp/ucl-machine-tools/fpt/launchers --local-dir ./bundle --script run.sh
 scripts/ucl tail last
 scripts/ucl fetch last
@@ -49,6 +49,8 @@ work.
   setup scripts, `/tmp` space, and optional GPU availability.
 - `ucl fanout --hosts TARGET... -- COMMAND...` is kept as the explicit fanout
   spelling, but `ucl exec HOST HOST -- COMMAND...` is the preferred form.
+- `--gpu auto` on `exec`, `run`, `fanout`, and `env` requires 20 GB free VRAM
+  by default; tune it with `--min-free-vram-gb`.
 
 ## Launcher Root
 

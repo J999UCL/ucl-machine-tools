@@ -308,19 +308,36 @@ def test_ucl_run_full_fake_path_writes_registry(
         joined = " ".join(argv)
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
+        if argv == remote_python_argv(timeout_seconds=8):
+            return ok(stdout=inventory_stdout())
         if argv == remote_python_argv() and "UCL_TMUX_JSON_BEGIN" in kwargs.get("input", ""):
             return ok(stdout=tmux_stdout(["work"]))
         if "tar -xf -" in joined:
             return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
         if "cat >" in joined:
             assert "exec > >(tee -a" in kwargs["input"]
+            assert "export CUDA_VISIBLE_DEVICES=0" in kwargs["input"]
             return ok()
         if "tmux new-window" in joined:
             return ok()
         raise AssertionError(f"unexpected argv: {argv}")
 
     rc = main_cli.main(
-        ["run", "--host", "barbury-l", "--local-dir", str(bundle), "--script", "run.sh", "--arg", "x"],
+        [
+            "run",
+            "--host",
+            "barbury-l",
+            "--gpu",
+            "auto",
+            "--min-free-vram-gb",
+            "22",
+            "--local-dir",
+            str(bundle),
+            "--script",
+            "run.sh",
+            "--arg",
+            "x",
+        ],
         runner=runner,
         popener=FakePopen,
     )
@@ -475,7 +492,20 @@ def test_ucl_exec_sync_supports_options_cwd_json_timeout_and_gpu_auto(
         raise AssertionError(f"unexpected argv: {argv}")
 
     rc = main_cli.main(
-        ["exec", "barbury-l", "--gpu", "auto", "--cwd", "/tmp", "--timeout", "1", "--json", "pwd"],
+        [
+            "exec",
+            "barbury-l",
+            "--gpu",
+            "auto",
+            "--min-free-vram-gb",
+            "22",
+            "--cwd",
+            "/tmp",
+            "--timeout",
+            "1",
+            "--json",
+            "pwd",
+        ],
         runner=runner,
     )
 
@@ -485,6 +515,20 @@ def test_ucl_exec_sync_supports_options_cwd_json_timeout_and_gpu_auto(
     assert payload["stderr"] == ""
     assert payload["returncode"] == 0
     assert payload["timed_out"] is False
+
+
+def test_ucl_exec_gpu_auto_respects_min_free_vram_threshold(capsys: pytest.CaptureFixture[str]) -> None:
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv(timeout_seconds=8):
+            return ok(stdout=inventory_stdout())
+        raise AssertionError(f"unexpected argv after failed GPU selection: {argv}")
+
+    rc = main_cli.main(["exec", "barbury-l", "--gpu", "auto", "--min-free-vram-gb", "24", "--json", "pwd"], runner=runner)
+
+    assert rc == 2
+    assert "no free GPU found on barbury-l" in capsys.readouterr().err
 
 
 def test_ucl_exec_sync_separates_command_and_connect_timeouts(capsys: pytest.CaptureFixture[str]) -> None:
@@ -841,6 +885,10 @@ def test_ucl_exec_rejects_bad_command_shapes(capsys: pytest.CaptureFixture[str],
     assert "require --detach" in capsys.readouterr().err
     assert main_cli.main(["exec", "barbury-l", "--unknown", "hostname"]) == 2
     assert "unknown ucl exec option" in capsys.readouterr().err
+    assert main_cli.main(["exec", "barbury-l", "--min-free-vram-gb", "-1", "hostname"]) == 2
+    assert "--min-free-vram-gb must be >= 0" in capsys.readouterr().err
+    assert main_cli.main(["exec", "barbury-l", "--min-free-vram-gb", "lots", "hostname"]) == 2
+    assert "--min-free-vram-gb must be a number" in capsys.readouterr().err
 
 
 def test_ucl_exec_detach_preserves_tmux_path(

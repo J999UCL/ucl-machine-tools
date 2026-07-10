@@ -41,6 +41,7 @@ CLEAN_SENTINEL_END = "UCL_CLEAN_JSON_END"
 EXEC_SENTINEL_BEGIN = "UCL_EXEC_JSON_BEGIN"
 EXEC_SENTINEL_END = "UCL_EXEC_JSON_END"
 ERROR_SNIPPET_CHARS = 800
+DEFAULT_AUTO_GPU_MIN_FREE_VRAM_GB = 20.0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -63,13 +64,15 @@ Common use:
       Run the same short remote check on multiple hosts.
   ucl exec barbury-l --cwd /tmp --timeout 60 --connect-timeout 30 pwd
       Run from a remote directory with bounded command and SSH timeouts.
+  ucl exec 3090ti --gpu auto --min-free-vram-gb 20 -- nvidia-smi
+      Select only GPUs with enough free VRAM.
   ucl exec barbury-l --stdin < check.sh
       Run a multi-line bash snippet from stdin and print output now.
   ucl exec barbury-l --shell csh --stdin < check_torch.csh
       Run UCL/TSG csh setup snippets, such as Python/CUDA setup.
   ucl exec barbury-l --detach -- hostname
       Launch a small command in tmux and record it like a run.
-  ucl run --host barbury-l --gpu auto --local-dir ./bundle --script run.sh
+  ucl run --host barbury-l --gpu auto --min-free-vram-gb 20 --local-dir ./bundle --script run.sh
       Upload a local bundle and launch its script in tmux.
   ucl tail last
       Print the latest recorded run log without login noise.
@@ -160,6 +163,7 @@ Use 'ucl COMMAND --help' for command-specific flags.
     env.add_argument("--catalog", type=Path)
     env.add_argument("--remote-root", required=True)
     env.add_argument("--gpu", help="GPU id or auto")
+    env.add_argument("--min-free-vram-gb", type=float, default=DEFAULT_AUTO_GPU_MIN_FREE_VRAM_GB)
     env.add_argument("--create", action="store_true")
     env.add_argument("--json", action="store_true")
 
@@ -172,6 +176,7 @@ Use 'ucl COMMAND --help' for command-specific flags.
     fanout.add_argument("--stdin", action="store_true")
     fanout.add_argument("--shell", choices=("bash", "csh"), default="bash")
     fanout.add_argument("--gpu", help="GPU id or auto")
+    fanout.add_argument("--min-free-vram-gb", type=float, default=DEFAULT_AUTO_GPU_MIN_FREE_VRAM_GB)
     fanout.add_argument("fanout_command", nargs=argparse.REMAINDER, metavar="COMMAND")
 
     return parser
@@ -196,6 +201,7 @@ def _add_launch_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--catalog", type=Path)
     parser.add_argument("--env", action="append", default=[], help="remote env KEY=VALUE; repeat for multiple vars")
     parser.add_argument("--gpu", help="GPU id or auto")
+    parser.add_argument("--min-free-vram-gb", type=float, default=DEFAULT_AUTO_GPU_MIN_FREE_VRAM_GB, help="minimum free VRAM for --gpu auto")
     parser.add_argument("--shell", choices=("bash", "csh"), default="bash", help="shell used for the generated payload")
     parser.add_argument("--session", help="tmux session to use or create")
     parser.add_argument("--new-session", action="store_true", help="force creating a new tmux session")
@@ -224,6 +230,7 @@ Examples:
     parser.add_argument("--catalog", type=Path)
     parser.add_argument("--env", action="append", default=[], help="remote env KEY=VALUE; repeat for multiple vars")
     parser.add_argument("--gpu", help="GPU id or auto")
+    parser.add_argument("--min-free-vram-gb", type=float, default=DEFAULT_AUTO_GPU_MIN_FREE_VRAM_GB, help="minimum free VRAM for --gpu auto")
     parser.add_argument("--shell", choices=("bash", "csh"), default="bash", help="shell used only with --stdin")
     parser.add_argument("--stdin", action="store_true", help="read a script from stdin")
     parser.add_argument("--timeout", type=float, default=60.0, help="remote command timeout in seconds; 0 disables")
@@ -281,6 +288,7 @@ def _parse_exec_argv(tokens: list[str]) -> argparse.Namespace:
         "catalog": None,
         "env": [],
         "gpu": None,
+        "min_free_vram_gb": DEFAULT_AUTO_GPU_MIN_FREE_VRAM_GB,
         "shell": "bash",
         "stdin": False,
         "timeout": 60.0,
@@ -308,6 +316,7 @@ def _parse_exec_argv(tokens: list[str]) -> argparse.Namespace:
         "--catalog": "catalog",
         "--env": "env",
         "--gpu": "gpu",
+        "--min-free-vram-gb": "min_free_vram_gb",
         "--shell": "shell",
         "--timeout": "timeout",
         "--connect-timeout": "connect_timeout",
@@ -351,6 +360,11 @@ def _parse_exec_argv(tokens: list[str]) -> argparse.Namespace:
                     values[key] = int(raw_value)
                 except ValueError:
                     parser.error(f"{token} must be an integer")
+            elif key == "min_free_vram_gb":
+                try:
+                    values[key] = float(raw_value)
+                except ValueError:
+                    parser.error(f"{token} must be a number")
             elif key == "shell":
                 if raw_value not in {"bash", "csh"}:
                     parser.error("--shell must be one of: bash, csh")
@@ -374,6 +388,8 @@ def _parse_exec_argv(tokens: list[str]) -> argparse.Namespace:
         parser.error("--timeout must be >= 0")
     if values["connect_timeout"] < 0:
         parser.error("--connect-timeout must be >= 0")
+    if values["min_free_vram_gb"] < 0:
+        parser.error("--min-free-vram-gb must be >= 0")
     if values["stdin"] and command:
         parser.error("--stdin cannot be used with COMMAND arguments")
     if not values["stdin"] and not command:
@@ -460,12 +476,14 @@ def _gpu_env(
     host: HostSpec,
     *,
     runner,
-    min_free_vram_gb: float = 4.0,
 ) -> tuple[tuple[str, str], ...]:
     if not getattr(args, "gpu", None):
         return ()
     if args.gpu != "auto":
         return (("CUDA_VISIBLE_DEVICES", str(args.gpu)),)
+    min_free_vram_gb = float(getattr(args, "min_free_vram_gb", DEFAULT_AUTO_GPU_MIN_FREE_VRAM_GB))
+    if min_free_vram_gb < 0:
+        raise ValueError("--min-free-vram-gb must be >= 0")
     rows = inventory.collect([host], runner=runner, jobs=1, min_free_vram_gb=min_free_vram_gb)
     gpu_id = _best_free_gpu(rows[0], min_free_vram_gb=min_free_vram_gb)
     return (("CUDA_VISIBLE_DEVICES", gpu_id),)
@@ -1410,8 +1428,10 @@ def run_env(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     ensure_knuckles_master(runner=runner)
     gpu = args.gpu
     if gpu == "auto":
-        rows = inventory.collect([host], runner=runner, jobs=1)
-        gpu = _best_free_gpu(rows[0], min_free_vram_gb=4.0)
+        if float(args.min_free_vram_gb) < 0:
+            raise ValueError("--min-free-vram-gb must be >= 0")
+        rows = inventory.collect([host], runner=runner, jobs=1, min_free_vram_gb=float(args.min_free_vram_gb))
+        gpu = _best_free_gpu(rows[0], min_free_vram_gb=float(args.min_free_vram_gb))
     payload = envcheck.run_env_check(host, remote_root=args.remote_root, create=args.create, gpu=gpu, runner=runner)
     payload.update({"host": host.name, "ssh_host": host.ssh_host})
     if args.json:
@@ -1438,6 +1458,7 @@ def _fanout_one(host: HostSpec, args: argparse.Namespace, command: tuple[str, ..
         cwd=getattr(args, "cwd", None),
         json=False,
         gpu=args.gpu,
+        min_free_vram_gb=getattr(args, "min_free_vram_gb", DEFAULT_AUTO_GPU_MIN_FREE_VRAM_GB),
         env=getattr(args, "env", []),
     )
     try:
