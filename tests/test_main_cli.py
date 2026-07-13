@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 from ucl_machine_tools import copy as copy_tools
-from ucl_machine_tools import envcheck, launch, main_cli
+from ucl_machine_tools import envcheck, job_control, launch, main_cli
 from ucl_machine_tools.registry import RunRecord, read_record, write_record
 
 
@@ -31,6 +31,81 @@ def tmux_stdout(sessions: list[str]) -> str:
             launch.TMUX_SENTINEL_END,
         ]
     )
+
+
+def job_identity(
+    *,
+    exists: bool = True,
+    session: str = "demo",
+    window: str = "run",
+    boot_id: str = "boot-123",
+    tmux_socket_path: str = "/tmp/tmux-1/default",
+    tmux_server_pid: int = 4321,
+    pane_id: str = "%7",
+    window_id: str = "@3",
+    pane_pid: int = 1234,
+    start_ticks: int | None = 5678,
+    session_id: int | None = 1234,
+    pane_dead: bool = False,
+    terminal_at_capture: bool | None = None,
+) -> dict[str, Any]:
+    identity = {
+        "exists": exists,
+        "session": session,
+        "window": window,
+        "boot_id": boot_id,
+        "tmux_socket_path": tmux_socket_path,
+        "tmux_server_pid": tmux_server_pid,
+        "pane_id": pane_id,
+        "window_id": window_id,
+        "pane_pid": pane_pid,
+        "pane_start_ticks": start_ticks,
+        "pane_session_id": session_id,
+        "pane_dead": pane_dead,
+        "pane_dead_status": None,
+    }
+    if terminal_at_capture is not None:
+        identity["terminal_at_capture"] = terminal_at_capture
+    return identity
+
+
+def identity_stdout(identity: dict[str, Any], *, ok_result: bool = True, error: str = "") -> str:
+    return "\n".join(
+        [
+            "login noise",
+            job_control.IDENTITY_SENTINEL_BEGIN,
+            json.dumps({"schema_version": 1, "ok": ok_result, "identity": identity, "error": error}),
+            job_control.IDENTITY_SENTINEL_END,
+        ]
+    )
+
+
+def launch_stdout(identity: dict[str, Any], *, ok_result: bool = True, error: str = "") -> str:
+    return "\n".join(
+        [
+            "login noise",
+            job_control.LAUNCH_SENTINEL_BEGIN,
+            json.dumps({"schema_version": 1, "ok": ok_result, "identity": identity, "error": error}),
+            job_control.LAUNCH_SENTINEL_END,
+        ]
+    )
+
+
+def stop_stdout(*, status: str = "stopped", ok_result: bool = True, **extra: Any) -> str:
+    payload = {
+        "schema_version": 1,
+        "ok": ok_result,
+        "status": status,
+        "target": "demo:run",
+        "signal": "TERM",
+        "expected_identity": job_identity(),
+        "current_identity": {"exists": False},
+        "signal_errors": [],
+        "survivors": [],
+        "cleanup": "target_already_gone",
+        **extra,
+    }
+    return "\n".join([job_control.STOP_SENTINEL_BEGIN, json.dumps(payload), job_control.STOP_SENTINEL_END])
 
 
 def remote_python_argv(host: str = "barbury-l", *, timeout_seconds: int | None = None) -> list[str]:
@@ -310,7 +385,7 @@ def test_ucl_run_full_fake_path_writes_registry(
         joined = " ".join(argv)
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == remote_python_argv(timeout_seconds=8):
+        if argv == remote_python_argv(timeout_seconds=8) and "UCL_INVENTORY_JSON_BEGIN" in kwargs.get("input", ""):
             return ok(stdout=inventory_stdout())
         if argv == remote_python_argv() and "UCL_TMUX_JSON_BEGIN" in kwargs.get("input", ""):
             return ok(stdout=tmux_stdout(["work"]))
@@ -321,8 +396,8 @@ def test_ucl_run_full_fake_path_writes_registry(
             assert "export CUDA_VISIBLE_DEVICES=0" in kwargs["input"]
             assert "export SECRET_TOKEN=abc" in kwargs["input"]
             return ok()
-        if "tmux new-window" in joined:
-            return ok()
+        if argv == remote_python_argv(timeout_seconds=8) and job_control.LAUNCH_SENTINEL_BEGIN in kwargs.get("input", ""):
+            return ok(stdout=launch_stdout(job_identity(session="work", window="run")))
         raise AssertionError(f"unexpected argv: {argv}")
 
     rc = main_cli.main(
@@ -356,9 +431,11 @@ def test_ucl_run_full_fake_path_writes_registry(
     assert "session:    work" in out
     latest = tmp_path / "cache" / "runs" / "latest.json"
     assert latest.exists()
-    payload = json.loads(latest.read_text(encoding="utf-8"))
-    assert payload["kind"] == "run"
-    provenance = payload["provenance"]
+    assert json.loads(latest.read_text(encoding="utf-8"))["run_id"] == "work"
+    record = read_record("last")
+    assert record.kind == "run"
+    assert record.identity == job_identity(session="work", window="run")
+    provenance = record.provenance
     assert provenance["project"] == "fpt"
     assert provenance["selected_gpu"] == "0"
     assert provenance["bundle_path"] == str(bundle.resolve())
@@ -381,6 +458,60 @@ def test_ucl_run_requires_explicit_session(
 
     assert rc == 2
     assert "ucl run requires --session NAME or --new-session" in capsys.readouterr().err
+
+
+def test_ucl_run_writes_provisional_record_before_identity_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
+    bundle = make_bundle(tmp_path)
+    launch_attempted = False
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        nonlocal launch_attempted
+        joined = " ".join(argv)
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv() and "UCL_TMUX_JSON_BEGIN" in kwargs.get("input", ""):
+            return ok(stdout=tmux_stdout(["work"]))
+        if "tar -xf -" in joined:
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        if "cat >" in joined:
+            return ok()
+        if argv == remote_python_argv(timeout_seconds=8) and job_control.LAUNCH_SENTINEL_BEGIN in kwargs.get("input", ""):
+            launch_attempted = True
+            return ok(stdout="launch completed without protocol output")
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert (
+        main_cli.main(
+            [
+                "run",
+                "--host",
+                "barbury-l",
+                "--project",
+                "fpt",
+                "--session",
+                "work",
+                "--local-dir",
+                str(bundle),
+                "--script",
+                "run.sh",
+            ],
+            runner=runner,
+            popener=FakePopen,
+        )
+        == 2
+    )
+
+    assert launch_attempted is True
+    record = read_record("last")
+    assert record.kind == "run"
+    assert record.session == "work"
+    assert record.identity == {"pending_launch": True}
+    assert record.provenance["project"] == "fpt"
+    assert record.provenance["script_sha256"] == hashlib.sha256((bundle / "run.sh").read_bytes()).hexdigest()
 
 
 def test_run_registry_backfills_missing_provenance(
@@ -958,6 +1089,7 @@ def test_ucl_exec_detach_preserves_tmux_path(
 ) -> None:
     monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
     calls: list[list[str]] = []
+    launch_sources: list[str] = []
 
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         calls.append(argv)
@@ -972,8 +1104,9 @@ def test_ucl_exec_detach_preserves_tmux_path(
         if "cat >" in joined:
             assert "hostname" in kwargs["input"]
             return ok()
-        if "tmux new-window" in joined:
-            return ok()
+        if argv == remote_python_argv(timeout_seconds=8) and job_control.LAUNCH_SENTINEL_BEGIN in kwargs.get("input", ""):
+            launch_sources.append(kwargs["input"])
+            return ok(stdout=launch_stdout(job_identity(session="work", window="exec_hostname")))
         raise AssertionError(f"unexpected argv: {argv}")
 
     assert (
@@ -997,9 +1130,10 @@ def test_ucl_exec_detach_preserves_tmux_path(
     )
 
     assert "session:    work" in capsys.readouterr().out
-    assert any("tmux new-window" in " ".join(call) for call in calls)
-    payload = json.loads((tmp_path / "cache" / "runs" / "latest.json").read_text(encoding="utf-8"))
-    provenance = payload["provenance"]
+    assert launch_sources and '"tmux", "new-window"' in launch_sources[0]
+    record = read_record("last")
+    assert record.identity == job_identity(session="work", window="exec_hostname")
+    provenance = record.provenance
     assert provenance["project"] == "smoke"
     assert provenance["selected_gpu"] == "1"
     assert provenance["bundle_path"] == ""
@@ -1007,6 +1141,82 @@ def test_ucl_exec_detach_preserves_tmux_path(
     assert "local_git_sha" in provenance
     assert provenance["env"]["SECRET_TOKEN"] == "<redacted>"
     assert "abc" not in json.dumps(provenance)
+
+
+def test_ucl_exec_detach_writes_provisional_record_before_identity_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        joined = " ".join(argv)
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv() and "UCL_TMUX_JSON_BEGIN" in kwargs.get("input", ""):
+            return ok(stdout=tmux_stdout(["work"]))
+        if "mkdir -p" in joined and "tar -xf" not in joined:
+            return ok()
+        if "cat >" in joined:
+            return ok()
+        if argv == remote_python_argv(timeout_seconds=8) and job_control.LAUNCH_SENTINEL_BEGIN in kwargs.get("input", ""):
+            return ok(stdout="not a launch sentinel")
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert (
+        main_cli.main(
+            [
+                "exec",
+                "barbury-l",
+                "--detach",
+                "--project",
+                "smoke",
+                "--",
+                "hostname",
+            ],
+            runner=runner,
+        )
+        == 2
+    )
+
+    record = read_record("last")
+    assert record.kind == "exec"
+    assert record.session == "work"
+    assert record.identity == {"pending_launch": True}
+    assert record.provenance["project"] == "smoke"
+
+
+def test_ucl_exec_detach_finalizes_a_fast_terminal_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
+    terminal_identity = job_identity(
+        exists=False,
+        pane_dead=True,
+        start_ticks=None,
+        session_id=1234,
+        terminal_at_capture=True,
+    )
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        joined = " ".join(argv)
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv() and "UCL_TMUX_JSON_BEGIN" in kwargs.get("input", ""):
+            return ok(stdout=tmux_stdout(["work"]))
+        if "mkdir -p" in joined and "tar -xf" not in joined:
+            return ok()
+        if "cat >" in joined:
+            return ok()
+        if argv == remote_python_argv(timeout_seconds=8) and job_control.LAUNCH_SENTINEL_BEGIN in kwargs.get("input", ""):
+            return ok(stdout=launch_stdout(terminal_identity))
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["exec", "barbury-l", "--detach", "--", "hostname"], runner=runner) == 0
+    record = read_record("last")
+    assert record.identity == terminal_identity
+    assert record.identity.get("pending_launch") is None
 
 
 def test_ucl_exec_detach_requires_explicit_session_when_no_existing_tmux(
@@ -1486,6 +1696,7 @@ def test_ucl_jobs_info_and_stop_use_registry_and_tmux(
             log_path="/tmp/ucl-machine-tools/launchers/demo/run.log",
             command=("bash", "run.sh"),
             provenance={"project": "fpt", "selected_gpu": "0"},
+            identity=job_identity(),
         )
     )
 
@@ -1493,10 +1704,10 @@ def test_ucl_jobs_info_and_stop_use_registry_and_tmux(
         assert kwargs.get("shell", False) is False
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == remote_python_argv(timeout_seconds=8) and "UCL_TMUX_JSON_BEGIN" in kwargs.get("input", ""):
-            return ok(stdout=tmux_stdout(["demo"]))
-        if argv == remote_python_argv() and "kill-window" in kwargs.get("input", ""):
-            return ok(stdout='{"returncode": 0, "stdout": "", "stderr": ""}\n')
+        if argv == remote_python_argv(timeout_seconds=8) and job_control.IDENTITY_SENTINEL_BEGIN in kwargs.get("input", ""):
+            return ok(stdout=identity_stdout(job_identity()))
+        if argv == remote_python_argv(timeout_seconds=8) and job_control.STOP_SENTINEL_BEGIN in kwargs.get("input", ""):
+            return ok(stdout=stop_stdout())
         raise AssertionError(f"unexpected argv: {argv}")
 
     assert main_cli.main(["jobs", "--json"], runner=runner) == 0
@@ -1513,7 +1724,8 @@ def test_ucl_jobs_info_and_stop_use_registry_and_tmux(
 
     assert main_cli.main(["stop", "demo", "--json"], runner=runner) == 0
     stop_payload = json.loads(capsys.readouterr().out)
-    assert stop_payload["returncode"] == 0
+    assert stop_payload["status"] == "stopped"
+    assert stop_payload["ok"] is True
     assert stop_payload["session"] == "demo"
 
 
@@ -1534,6 +1746,7 @@ def test_ucl_stop_requires_explicit_ref_or_yes_for_last(
             remote_dir="/tmp/ucl-machine-tools/launchers/demo",
             log_path="/tmp/ucl-machine-tools/launchers/demo/run.log",
             command=("bash", "run.sh"),
+            identity=job_identity(),
         )
     )
 
@@ -1548,9 +1761,9 @@ def test_ucl_stop_requires_explicit_ref_or_yes_for_last(
         calls.append(argv)
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == remote_python_argv() and "kill-window" in kwargs.get("input", ""):
+        if argv == remote_python_argv(timeout_seconds=8) and job_control.STOP_SENTINEL_BEGIN in kwargs.get("input", ""):
             stop_payload_seen = True
-            return ok(stdout='{"returncode": 0, "stdout": "", "stderr": ""}\n')
+            return ok(stdout=stop_stdout())
         raise AssertionError(f"unexpected argv: {argv}")
 
     assert main_cli.main(["stop", "last"], runner=runner) == 2
@@ -1561,6 +1774,317 @@ def test_ucl_stop_requires_explicit_ref_or_yes_for_last(
     payload = json.loads(capsys.readouterr().out)
     assert payload["run_id"] == "demo"
     assert stop_payload_seen is True
+
+
+@pytest.mark.parametrize(
+    ("recorded_identity", "current_identity", "expected_status"),
+    [
+        ({}, job_identity(), "legacy_unverified"),
+        (job_identity(), job_identity(pane_pid=9999), "identity_mismatch"),
+        (job_identity(), {"exists": False, "session": "demo", "window": "run"}, "exited_or_missing"),
+    ],
+)
+def test_ucl_info_uses_exact_window_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    recorded_identity: dict[str, Any],
+    current_identity: dict[str, Any],
+    expected_status: str,
+) -> None:
+    monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
+    write_record(
+        RunRecord(
+            run_id="demo",
+            kind="run",
+            host="barbury-l",
+            ssh_host="barbury-l",
+            session="demo",
+            window="run",
+            remote_dir="/tmp/ucl-machine-tools/launchers/demo",
+            log_path="/tmp/ucl-machine-tools/launchers/demo/run.log",
+            command=("bash", "run.sh"),
+            identity=recorded_identity,
+        )
+    )
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv(timeout_seconds=8) and job_control.IDENTITY_SENTINEL_BEGIN in kwargs.get("input", ""):
+            return ok(stdout=identity_stdout(current_identity))
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["info", "demo", "--json"], runner=runner) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == expected_status
+    assert payload["identity"] == recorded_identity
+    assert payload["current_identity"] == current_identity
+
+
+@pytest.mark.parametrize(
+    ("status", "ok_result", "extra", "expected_rc"),
+    [
+        ("already_stopped", True, {}, 0),
+        ("identity_mismatch", False, {}, 2),
+        ("legacy_unverified", False, {}, 2),
+        (
+            "still_running",
+            False,
+            {
+                "survivors": [{"pid": 1234, "pgrp": 1234, "start_ticks": 5678}],
+                "signal_errors": [{"pgrp": 1234, "error": "PermissionError"}],
+            },
+            2,
+        ),
+    ],
+)
+def test_ucl_stop_reports_structured_handled_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    status: str,
+    ok_result: bool,
+    extra: dict[str, Any],
+    expected_rc: int,
+) -> None:
+    monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
+    write_record(
+        RunRecord(
+            run_id="demo",
+            kind="run",
+            host="barbury-l",
+            ssh_host="barbury-l",
+            session="demo",
+            window="run",
+            remote_dir="/tmp/ucl-machine-tools/launchers/demo",
+            log_path="/tmp/ucl-machine-tools/launchers/demo/run.log",
+            command=("bash", "run.sh"),
+            identity=job_identity() if status != "legacy_unverified" else {},
+        )
+    )
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv(timeout_seconds=8) and job_control.STOP_SENTINEL_BEGIN in kwargs.get("input", ""):
+            assert "kill-session" not in kwargs["input"]
+            return ok(stdout=stop_stdout(status=status, ok_result=ok_result, **extra))
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["stop", "demo", "--json"], runner=runner) == expected_rc
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == status
+    assert payload["ok"] is ok_result
+    assert payload["survivors"] == extra.get("survivors", [])
+    assert payload["signal_errors"] == extra.get("signal_errors", [])
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_status", "expected_error"),
+    [
+        ("timeout", "unknown_after_timeout", "timed out"),
+        ("ssh_nonzero", "wrapper_error", "connection refused"),
+        ("missing_sentinel", "wrapper_error", "sentinel"),
+        ("malformed_sentinel", "wrapper_error", "valid JSON"),
+    ],
+)
+def test_ucl_stop_json_always_returns_one_object_for_wrapper_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure_kind: str,
+    expected_status: str,
+    expected_error: str,
+) -> None:
+    monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
+    write_record(
+        RunRecord(
+            run_id="demo",
+            kind="run",
+            host="barbury-l",
+            ssh_host="barbury-l",
+            session="demo",
+            window="run",
+            remote_dir="/tmp/ucl-machine-tools/launchers/demo",
+            log_path="/tmp/ucl-machine-tools/launchers/demo/run.log",
+            command=("bash", "run.sh"),
+            identity=job_identity(),
+        )
+    )
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv(timeout_seconds=8) and job_control.STOP_SENTINEL_BEGIN in kwargs.get("input", ""):
+            if failure_kind == "timeout":
+                raise main_cli.subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            if failure_kind == "ssh_nonzero":
+                return SimpleNamespace(returncode=255, stdout="", stderr="ssh: Connection refused\n")
+            if failure_kind == "missing_sentinel":
+                return ok(stdout="VBoxManage: login noise\nremote wrapper vanished\n")
+            return ok(
+                stdout="\n".join(
+                    [
+                        job_control.STOP_SENTINEL_BEGIN,
+                        "{not-json",
+                        job_control.STOP_SENTINEL_END,
+                    ]
+                )
+            )
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["stop", "demo", "--json"], runner=runner) == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert captured.err == ""
+    assert payload["ok"] is False
+    assert payload["status"] == expected_status
+    assert payload["wrapper_error"] is True
+    assert expected_error.lower() in payload["error"].lower()
+    assert payload["run_id"] == "demo"
+
+
+def test_ucl_stop_json_preserves_structured_helper_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
+    write_record(
+        RunRecord(
+            run_id="demo",
+            kind="run",
+            host="barbury-l",
+            ssh_host="barbury-l",
+            session="demo",
+            window="run",
+            remote_dir="/tmp/ucl-machine-tools/launchers/demo",
+            log_path="/tmp/ucl-machine-tools/launchers/demo/run.log",
+            command=("bash", "run.sh"),
+            identity=job_identity(),
+        )
+    )
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv(timeout_seconds=8):
+            return ok(
+                stdout=stop_stdout(
+                    status="helper_error",
+                    ok_result=False,
+                    error="RuntimeError: process inspection failed",
+                    cleanup_error="tmux query failed",
+                )
+            )
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["stop", "demo", "--json"], runner=runner) == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert captured.err == ""
+    assert payload["status"] == "helper_error"
+    assert payload["error"] == "RuntimeError: process inspection failed"
+    assert payload["cleanup_error"] == "tmux query failed"
+
+
+def test_ucl_stop_json_handles_missing_registry_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
+
+    assert main_cli.main(["stop", "missing", "--json"]) == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert captured.err == ""
+    assert payload["ok"] is False
+    assert payload["status"] == "wrapper_error"
+    assert payload["run_id"] == "missing"
+    assert "not found" in payload["error"]
+
+
+@pytest.mark.parametrize(
+    ("probe_kind", "expected_status"),
+    [("ssh", "unreachable"), ("protocol", "probe_error")],
+)
+def test_ucl_info_distinguishes_unreachable_hosts_from_probe_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    probe_kind: str,
+    expected_status: str,
+) -> None:
+    monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
+    write_record(
+        RunRecord(
+            run_id="demo",
+            kind="run",
+            host="barbury-l",
+            ssh_host="barbury-l",
+            session="demo",
+            window="run",
+            remote_dir="/tmp/ucl-machine-tools/launchers/demo",
+            log_path="/tmp/ucl-machine-tools/launchers/demo/run.log",
+            command=("bash", "run.sh"),
+            identity=job_identity(),
+        )
+    )
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv(timeout_seconds=8):
+            if probe_kind == "ssh":
+                return SimpleNamespace(returncode=255, stdout="", stderr="connection refused")
+            return ok(stdout="not a sentinel")
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["info", "demo", "--json"], runner=runner) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == expected_status
+
+
+def test_ucl_stop_human_output_reports_cleanup_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
+    write_record(
+        RunRecord(
+            run_id="demo",
+            kind="run",
+            host="barbury-l",
+            ssh_host="barbury-l",
+            session="demo",
+            window="run",
+            remote_dir="/tmp/ucl-machine-tools/launchers/demo",
+            log_path="/tmp/ucl-machine-tools/launchers/demo/run.log",
+            command=("bash", "run.sh"),
+            identity=job_identity(),
+        )
+    )
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv(timeout_seconds=8):
+            return ok(
+                stdout=stop_stdout(
+                    status="cleanup_failed",
+                    ok_result=False,
+                    cleanup_error="can't remove pane",
+                )
+            )
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["stop", "demo"], runner=runner) == 2
+    captured = capsys.readouterr()
+    assert "status: cleanup_failed" in captured.out
+    assert "cleanup_error: can't remove pane" in captured.err
 
 
 def test_ucl_copy_dry_run_and_size_verify(

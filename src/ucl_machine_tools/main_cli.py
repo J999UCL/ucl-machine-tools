@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import base64
 import concurrent.futures
+from dataclasses import replace
 import hashlib
 import json
+import math
 import subprocess
 import sys
 import shlex
@@ -17,6 +19,7 @@ from ucl_machine_tools.hosts import HostSpec, load_catalog, parse_selector
 from ucl_machine_tools import copy as copy_tools
 from ucl_machine_tools import envcheck
 from ucl_machine_tools import inventory
+from ucl_machine_tools import job_control
 from ucl_machine_tools.launch import (
     build_exec_plan,
     build_run_plan,
@@ -30,7 +33,7 @@ from ucl_machine_tools.launch import (
     upload_bundle,
     write_launcher_files,
 )
-from ucl_machine_tools.registry import RunRecord, list_records, read_record, write_record
+from ucl_machine_tools.registry import RunRecord, list_records, read_record, utc_now, write_record
 from ucl_machine_tools.ssh import build_remote_python_argv, ensure_knuckles_master
 
 TAIL_SENTINEL_BEGIN = "UCL_TAIL_TEXT_BEGIN"
@@ -43,6 +46,14 @@ EXEC_SENTINEL_BEGIN = "UCL_EXEC_JSON_BEGIN"
 EXEC_SENTINEL_END = "UCL_EXEC_JSON_END"
 ERROR_SNIPPET_CHARS = 800
 DEFAULT_AUTO_GPU_MIN_FREE_VRAM_GB = 20.0
+
+
+class JobIdentityUnreachable(RuntimeError):
+    """The host could not be reached while probing a recorded job."""
+
+
+class JobIdentityProbeError(RuntimeError):
+    """The host responded, but its job identity could not be verified."""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -144,6 +155,12 @@ Use 'ucl COMMAND --help' for command-specific flags.
     stop = subparsers.add_parser("stop", help="Stop one recorded tmux job.")
     stop.add_argument("run_ref", help="run id to stop; use 'last --yes' only when intentional")
     stop.add_argument("--signal", choices=("TERM", "KILL"), default="TERM")
+    stop.add_argument(
+        "--grace-seconds",
+        type=float,
+        default=5.0,
+        help="seconds to wait for recorded processes to exit after signaling (default: 5)",
+    )
     stop.add_argument("--yes", action="store_true", help="allow stopping the latest recorded run via 'last'")
     stop.add_argument("--json", action="store_true")
     stop.add_argument("--timeout-seconds", type=int, default=8)
@@ -1132,9 +1149,16 @@ def run_run(args: argparse.Namespace, *, runner=subprocess.run, popener=subproce
     )
     upload_bundle(plan, runner=runner, popener=popener)
     launcher = write_launcher_files(plan, runner=runner)
-    launch_tmux(plan, decision, launcher, runner=runner)
     provenance = _provenance_for_plan(plan, args=args, env=env, stdin_body=None)
-    write_record(_record_from_plan(plan, decision, provenance=provenance))
+    provisional = _record_from_plan(
+        plan,
+        decision,
+        provenance=provenance,
+        identity={"pending_launch": True},
+    )
+    write_record(provisional)
+    identity = launch_tmux(plan, decision, launcher, runner=runner)
+    write_record(replace(provisional, identity=identity))
     print(format_summary(plan, decision))
     return 0
 
@@ -1193,14 +1217,66 @@ def run_exec(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     )
     create_remote_dir(plan, runner=runner)
     launcher = write_launcher_files(plan, runner=runner)
-    launch_tmux(plan, decision, launcher, runner=runner)
     provenance = _provenance_for_plan(plan, args=args, env=env, stdin_body=stdin_body)
-    write_record(_record_from_plan(plan, decision, provenance=provenance))
+    provisional = _record_from_plan(
+        plan,
+        decision,
+        provenance=provenance,
+        identity={"pending_launch": True},
+    )
+    write_record(provisional)
+    identity = launch_tmux(plan, decision, launcher, runner=runner)
+    write_record(replace(provisional, identity=identity))
     print(format_summary(plan, decision))
     return 0
 
 
-def _record_from_plan(plan, decision, *, provenance: dict[str, Any] | None = None) -> RunRecord:
+def _query_job_identity(
+    host: HostSpec,
+    session: str,
+    window: str,
+    *,
+    expected_identity: dict[str, Any] | None = None,
+    runner=subprocess.run,
+    timeout_seconds: int = 8,
+) -> dict[str, Any]:
+    try:
+        proc = runner(
+            _ssh_python_argv(host.ssh_host, connect_timeout=timeout_seconds),
+            input=job_control.build_identity_source(session, window, expected_identity),
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds + 3,
+            shell=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise JobIdentityUnreachable(f"timed out reading job identity on {host.name} after {exc.timeout}s") from exc
+    returncode = int(getattr(proc, "returncode", 1))
+    if returncode != 0:
+        detail = _strip_remote_noise((getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip())
+        error = detail or f"failed to read job identity on {host.name}"
+        if returncode == 255:
+            raise JobIdentityUnreachable(error)
+        raise JobIdentityProbeError(error)
+    try:
+        payload = job_control.parse_identity_stdout(getattr(proc, "stdout", "") or "")
+    except ValueError as exc:
+        raise JobIdentityProbeError(str(exc)) from exc
+    if not payload.get("ok"):
+        raise JobIdentityProbeError(payload.get("error") or f"job identity probe failed on {host.name}")
+    identity = payload.get("identity")
+    if not isinstance(identity, dict):
+        raise JobIdentityProbeError(f"job identity probe returned invalid identity on {host.name}")
+    return identity
+
+
+def _record_from_plan(
+    plan,
+    decision,
+    *,
+    provenance: dict[str, Any] | None = None,
+    identity: dict[str, Any] | None = None,
+) -> RunRecord:
     return RunRecord(
         run_id=plan.run_id,
         kind=plan.kind,
@@ -1211,7 +1287,9 @@ def _record_from_plan(plan, decision, *, provenance: dict[str, Any] | None = Non
         remote_dir=plan.remote_dir,
         log_path=plan.log_path,
         command=plan.command,
+        created_at=utc_now(),
         provenance=provenance or {},
+        identity=identity or {},
     )
 
 
@@ -1394,12 +1472,23 @@ def run_clean(args: argparse.Namespace, *, runner=subprocess.run) -> int:
 def _record_status(record: RunRecord, *, runner=subprocess.run, timeout_seconds: int = 8) -> dict[str, Any]:
     host = HostSpec(name=record.host, ssh_host=record.ssh_host)
     try:
-        sessions = list_remote_sessions(host, runner=runner, timeout_seconds=timeout_seconds)
-    except Exception as exc:  # noqa: BLE001 - status should report per-job failures.
-        return {"status": "unreachable", "error": str(exc), "sessions": []}
-    if record.session in sessions:
-        return {"status": "running", "error": "", "sessions": list(sessions)}
-    return {"status": "exited_or_missing", "error": "", "sessions": list(sessions)}
+        current_identity = _query_job_identity(
+            host,
+            record.session,
+            record.window,
+            expected_identity=record.identity,
+            runner=runner,
+            timeout_seconds=timeout_seconds,
+        )
+    except JobIdentityUnreachable as exc:
+        return {"status": "unreachable", "error": str(exc), "current_identity": {}}
+    except Exception as exc:  # noqa: BLE001 - status should report per-job probe failures.
+        return {"status": "probe_error", "error": str(exc), "current_identity": {}}
+    return {
+        "status": job_control.classify_identity(record.identity, current_identity),
+        "error": "",
+        "current_identity": current_identity,
+    }
 
 
 def _record_payload(record: RunRecord, *, runner=subprocess.run, timeout_seconds: int = 8) -> dict[str, Any]:
@@ -1417,6 +1506,7 @@ def _record_payload(record: RunRecord, *, runner=subprocess.run, timeout_seconds
         "command": list(record.command),
         "created_at": record.created_at,
         "updated_at": record.updated_at,
+        "identity": record.identity,
         "project": provenance.get("project", ""),
         "selected_gpu": provenance.get("selected_gpu", ""),
         "provenance": provenance,
@@ -1480,6 +1570,8 @@ def run_info(args: argparse.Namespace, *, runner=subprocess.run) -> int:
             "command",
             "created_at",
             "updated_at",
+            "identity",
+            "current_identity",
             "provenance",
             "error",
         ):
@@ -1492,63 +1584,127 @@ def run_info(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     return 0
 
 
-def _stop_source(session: str, window: str, signal: str) -> str:
-    return f"""
-import json
-import os
-import signal as signal_mod
-import subprocess
-SESSION={json.dumps(session)}
-WINDOW={json.dumps(window)}
-SIGNAL={json.dumps(signal)}
-target = SESSION + ":" + WINDOW
-sig = signal_mod.SIGKILL if SIGNAL == "KILL" else signal_mod.SIGTERM
-pane = subprocess.run(["tmux", "display-message", "-p", "-t", target, "#{{pane_pid}}"], capture_output=True, text=True)
-signal_error = ""
-if pane.returncode == 0 and pane.stdout.strip().isdigit():
-    pid = int(pane.stdout.strip())
-    try:
-        os.killpg(os.getpgid(pid), sig)
-    except Exception as exc:
-        signal_error = f"{{type(exc).__name__}}: {{exc}}"
-proc = subprocess.run(["tmux", "kill-window", "-t", target], capture_output=True, text=True)
-if proc.returncode != 0 and "can't find window" in proc.stderr:
-    proc = subprocess.run(["tmux", "kill-session", "-t", SESSION], capture_output=True, text=True)
-print(json.dumps({{"returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "signal_error": signal_error}}, sort_keys=True))
-raise SystemExit(proc.returncode)
-"""
+def _stop_source(
+    session: str,
+    window: str,
+    signal: str,
+    *,
+    expected_identity: dict[str, Any] | None = None,
+    grace_seconds: float = 5.0,
+) -> str:
+    return job_control.build_stop_source(
+        session,
+        window,
+        expected_identity or {},
+        signal,
+        grace_seconds,
+    )
 
 
 def run_stop(args: argparse.Namespace, *, runner=subprocess.run) -> int:
-    if args.run_ref == "last" and not args.yes:
-        raise RuntimeError("refusing to stop 'last' without --yes; pass an explicit run id or use 'ucl stop last --yes'")
-    record = read_record(args.run_ref)
-    ensure_knuckles_master(runner=runner)
-    proc = runner(
-        _ssh_python_argv(record.ssh_host),
-        input=_stop_source(record.session, record.window, args.signal),
-        capture_output=True,
-        text=True,
-        shell=False,
-    )
+    record: RunRecord | None = None
+    result: dict[str, Any]
+    try:
+        if args.run_ref == "last" and not args.yes:
+            raise RuntimeError(
+                "refusing to stop 'last' without --yes; pass an explicit run id or use 'ucl stop last --yes'"
+            )
+        if not math.isfinite(args.grace_seconds) or args.grace_seconds < 0:
+            raise ValueError("--grace-seconds must be finite and non-negative")
+        record = read_record(args.run_ref)
+        ensure_knuckles_master(runner=runner)
+        proc = runner(
+            _ssh_python_argv(record.ssh_host, connect_timeout=args.timeout_seconds),
+            input=_stop_source(
+                record.session,
+                record.window,
+                args.signal,
+                expected_identity=record.identity,
+                grace_seconds=args.grace_seconds,
+            ),
+            capture_output=True,
+            text=True,
+            timeout=args.timeout_seconds + args.grace_seconds + 5,
+            shell=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        result = {
+            "ok": False,
+            "status": "unknown_after_timeout",
+            "signal": args.signal,
+            "timed_out": True,
+            "wrapper_error": True,
+            "error": f"timed out stopping {record.run_id if record else args.run_ref} after {exc.timeout}s",
+        }
+    except Exception as exc:  # noqa: BLE001 - --json must remain machine-readable on setup failures.
+        result = {
+            "ok": False,
+            "status": "wrapper_error",
+            "signal": args.signal,
+            "timed_out": False,
+            "wrapper_error": True,
+            "error": str(exc),
+        }
+    else:
+        returncode = int(getattr(proc, "returncode", 1))
+        if returncode != 0:
+            detail = _strip_remote_noise(
+                (getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip()
+            )
+            result = {
+                "ok": False,
+                "status": "wrapper_error",
+                "signal": args.signal,
+                "timed_out": False,
+                "wrapper_error": True,
+                "remote_returncode": returncode,
+                "error": detail or f"remote stop wrapper failed for {record.run_id if record else args.run_ref}",
+            }
+        else:
+            try:
+                result = job_control.parse_stop_stdout(getattr(proc, "stdout", "") or "")
+            except Exception as exc:  # noqa: BLE001 - protocol errors are structured CLI results.
+                detail = _wrapper_stream_detail(
+                    getattr(proc, "stdout", "") or "",
+                    getattr(proc, "stderr", "") or "",
+                )
+                error = str(exc)
+                if detail:
+                    error = f"{error}: {detail}"
+                result = {
+                    "ok": False,
+                    "status": "wrapper_error",
+                    "signal": args.signal,
+                    "timed_out": False,
+                    "wrapper_error": True,
+                    "error": error,
+                }
+            else:
+                result.setdefault("timed_out", False)
+                result.setdefault("wrapper_error", False)
     payload: dict[str, Any] = {
-        "run_id": record.run_id,
-        "host": record.host,
-        "session": record.session,
-        "window": record.window,
-        "returncode": int(getattr(proc, "returncode", 1)),
-        "stdout": getattr(proc, "stdout", "") or "",
-        "stderr": getattr(proc, "stderr", "") or "",
+        "run_id": record.run_id if record else args.run_ref,
+        "host": record.host if record else "",
+        "session": record.session if record else "",
+        "window": record.window if record else "",
+        **result,
     }
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
-        print(f"run_id: {record.run_id}")
-        print(f"target: {record.session}:{record.window}")
-        print("status: stopped" if payload["returncode"] == 0 else "status: stop_failed")
-        if payload["stderr"]:
-            print(payload["stderr"], file=sys.stderr, end="")
-    return 0 if payload["returncode"] == 0 else 2
+        print(f"run_id: {record.run_id if record else args.run_ref}")
+        if record:
+            print(f"target: {record.session}:{record.window}")
+        print(f"status: {result.get('status', 'unknown')}")
+        if result.get("signal_errors"):
+            print(f"signal_errors: {json.dumps(result['signal_errors'], sort_keys=True)}")
+        if result.get("survivors"):
+            print(f"survivors: {json.dumps(result['survivors'], sort_keys=True)}")
+        if result.get("cleanup_error"):
+            print(f"cleanup_error: {result['cleanup_error']}", file=sys.stderr)
+        if result.get("error"):
+            print(f"error: {result['error']}", file=sys.stderr)
+    return 0 if result.get("ok") else 2
 
 
 def _copy_endpoint_manifest(endpoint: copy_tools.Endpoint, *, verify: str, runner=subprocess.run) -> dict[str, Any]:

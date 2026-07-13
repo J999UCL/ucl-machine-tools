@@ -43,6 +43,9 @@ work.
   script in tmux. It requires `--session NAME` or `--new-session`.
 - `ucl jobs`, `ucl info`, `ucl stop`, `ucl tail`, `ucl fetch`, and `ucl clean`
   operate on recorded run metadata.
+- New detached jobs record the tmux socket, pane, process, and Linux session
+  identity. `ucl stop` refuses legacy or mismatched identities, signals only
+  that recorded session through pidfds, and never deletes tmux panes/sessions.
 - `ucl tail RUN_ID --live` prints the latest lines and streams new output until
   interrupted with `Ctrl-C`; `--follow` remains an alias.
 - Recorded `ucl run` and detached `ucl exec` jobs include provenance: project

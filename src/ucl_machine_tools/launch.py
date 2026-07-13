@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable
 
+from ucl_machine_tools import job_control
 from ucl_machine_tools.hosts import HostSpec
 from ucl_machine_tools.ssh import build_remote_python_argv, describe_ssh_failure
 
@@ -410,18 +411,14 @@ def decide_tmux(
 
 
 def build_tmux_launch_argv(host: HostSpec, plan: RemoteJobPlan, decision: TmuxDecision, launcher_name: str) -> list[str]:
-    launcher_path = shlex.quote(posixpath.join(plan.remote_dir, launcher_name))
-    launcher = f"csh -f {launcher_path}" if launcher_name.endswith(".csh") else f"bash {launcher_path}"
-    launcher_q = '"' + launcher.replace('"', '\\"') + '"'
-    session_q = shlex.quote(decision.session)
-    window_q = shlex.quote(decision.window)
-    if decision.mode == "new-session":
-        command = f"tmux new-session -d -s {session_q} {launcher_q}"
-    elif decision.mode == "new-window":
-        command = f"tmux new-window -d -t {session_q} -n {window_q} {launcher_q}"
-    else:
-        raise ValueError(f"unknown tmux mode: {decision.mode}")
-    return remote_bash_argv(host, command)
+    del plan, decision, launcher_name
+    return build_remote_python_argv(host.ssh_host, timeout_seconds=8)
+
+
+def build_tmux_launch_source(plan: RemoteJobPlan, decision: TmuxDecision, launcher_name: str) -> str:
+    launcher_path = posixpath.join(plan.remote_dir, launcher_name)
+    launcher_argv = ["csh", "-f", launcher_path] if launcher_name.endswith(".csh") else ["bash", launcher_path]
+    return job_control.build_launch_source(decision.mode, decision.session, decision.window, launcher_argv)
 
 
 def upload_bundle(plan: RemoteJobPlan, *, runner: Runner = subprocess.run, popener: Popener = subprocess.Popen) -> None:
@@ -504,10 +501,30 @@ def list_remote_sessions(
         raise RuntimeError(f"failed to parse tmux sessions on {host.name}: {detail}") from exc
 
 
-def launch_tmux(plan: RemoteJobPlan, decision: TmuxDecision, launcher_name: str, *, runner: Runner = subprocess.run) -> None:
-    proc = runner(build_tmux_launch_argv(plan.host, plan, decision, launcher_name), capture_output=True, text=True, shell=False)
+def launch_tmux(
+    plan: RemoteJobPlan,
+    decision: TmuxDecision,
+    launcher_name: str,
+    *,
+    runner: Runner = subprocess.run,
+) -> dict[str, object]:
+    proc = runner(
+        build_tmux_launch_argv(plan.host, plan, decision, launcher_name),
+        input=build_tmux_launch_source(plan, decision, launcher_name),
+        capture_output=True,
+        text=True,
+        timeout=11,
+        shell=False,
+    )
     if int(getattr(proc, "returncode", 1)) != 0:
         raise RuntimeError((getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "failed to launch tmux").strip())
+    payload = job_control.parse_launch_stdout(getattr(proc, "stdout", "") or "")
+    if not payload.get("ok"):
+        raise RuntimeError(payload.get("error") or "failed to launch tmux")
+    identity = payload.get("identity")
+    if not isinstance(identity, dict):
+        raise RuntimeError("tmux launch returned invalid identity")
+    return identity
 
 
 def format_summary(plan: RemoteJobPlan, decision: TmuxDecision) -> str:
