@@ -1049,6 +1049,35 @@ def test_ucl_doctor_reports_host_state(capsys: pytest.CaptureFixture[str]) -> No
     assert "tmux_sessions: work" in out
 
 
+def test_ucl_doctor_reports_unreachable_host_without_tmux_discovery(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        calls.append((argv, kwargs))
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv(timeout_seconds=8) and "UCL_INVENTORY_JSON_BEGIN" in kwargs.get("input", ""):
+            return SimpleNamespace(
+                returncode=255,
+                stdout="",
+                stderr="ssh: connect to host barbury-l: No route to host",
+            )
+        raise AssertionError(f"unexpected call after unreachable inventory probe: {argv}")
+
+    assert main_cli.main(["doctor", "barbury-l"], runner=runner) == 2
+
+    out = capsys.readouterr().out
+    assert "host:          barbury-l" in out
+    assert "status:        unreachable" in out
+    assert "tmux_sessions: unavailable" in out
+    assert "error:         target host is unreachable from the jump host" in out
+    assert "no-sentinel" not in out
+    assert len(calls) == 2
+    assert not any("UCL_TMUX_JSON_BEGIN" in kwargs.get("input", "") for _, kwargs in calls)
+
+
 def test_profile_flags_are_rejected(capsys: pytest.CaptureFixture[str]) -> None:
     assert main_cli.main(["exec", "barbury-l", "--profile", "uv", "--dry-run", "--", "hostname"]) == 2
     assert "--profile" in capsys.readouterr().err

@@ -249,6 +249,36 @@ def test_missing_sentinel_does_not_expose_login_noise_unless_debug() -> None:
     assert noisy["stderr_tail"] == "VBoxManage noisy stderr"
 
 
+def test_collect_one_distinguishes_unreachable_ssh_from_missing_sentinel() -> None:
+    remote_hosts, remote_inventory, _ = import_toolkit()
+    host = make_catalog(remote_hosts)["barbury-l"]
+
+    unreachable = remote_inventory.collect_one(
+        host,
+        runner=lambda argv, **kwargs: SimpleNamespace(
+            returncode=255,
+            stdout="",
+            stderr="ssh: connect to host barbury-l: No route to host",
+        ),
+    )
+    missing_sentinel = remote_inventory.collect_one(
+        host,
+        runner=lambda argv, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="Last login: noisy",
+            stderr="",
+        ),
+    )
+
+    assert unreachable["status"] == "unreachable"
+    assert unreachable["ssh_returncode"] == 255
+    assert unreachable["errors"] == ["target host is unreachable from the jump host"]
+    assert "sentinel" not in unreachable["errors"][0]
+    assert missing_sentinel["status"] == "no-sentinel"
+    assert missing_sentinel["ssh_returncode"] == 0
+    assert missing_sentinel["errors"] == ["inventory sentinel not found"]
+
+
 def test_classification_distinguishes_ready_busy_no_gpu_and_unreachable() -> None:
     _, remote_inventory, _ = import_toolkit()
     busy_process = {"pid": 4242, "user": "other", "used_memory_mb": 7000, "command": "python train.py"}
