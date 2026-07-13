@@ -1128,10 +1128,21 @@ def test_ucl_tail_filters_login_noise(
     assert capsys.readouterr().out == "actual log line\n"
 
 
-def test_ucl_tail_follow_filters_login_noise(
+@pytest.mark.parametrize("flag", ["--live", "--follow"])
+def test_ucl_tail_parser_exposes_live_mode(flag: str) -> None:
+    args = main_cli.build_parser().parse_args(["tail", "demo", flag])
+
+    assert args.command == "tail"
+    assert args.run_ref == "demo"
+    assert args.live is True
+
+
+@pytest.mark.parametrize("live_flag", ["--live", "--follow"])
+def test_ucl_tail_live_streams_and_filters_only_startup_noise(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    live_flag: str,
 ) -> None:
     monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
     write_record(
@@ -1175,6 +1186,7 @@ def test_ucl_tail_follow_filters_login_noise(
                     "VBoxManage: error: startup noise\n",
                     main_cli.TAIL_SENTINEL_BEGIN + "\n",
                     "actual follow line\n",
+                    "actual log mentions VirtualBox\n",
                 ]
             )
             self.stderr = FakePipe(text="VBoxManage: error: stderr noise\n")
@@ -1190,12 +1202,161 @@ def test_ucl_tail_follow_filters_login_noise(
             return ok()
         raise AssertionError(f"unexpected argv: {argv}")
 
-    assert main_cli.main(["tail", "demo", "--follow"], runner=runner, popener=FakeFollowPopen) == 0
+    assert main_cli.main(["tail", "demo", live_flag], runner=runner, popener=FakeFollowPopen) == 0
 
     captured = capsys.readouterr()
-    assert captured.out == "actual follow line\n"
-    assert "VBoxManage" not in captured.out
+    assert captured.out == "actual follow line\nactual log mentions VirtualBox\n"
     assert "VBoxManage" not in captured.err
+
+
+def test_ucl_tail_help_documents_live_streaming(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main_cli.main(["tail", "--help"]) == 0
+
+    help_text = capsys.readouterr().out
+    assert "--live, --follow" in help_text
+    assert "until interrupted with Ctrl-C" in help_text
+
+
+def test_ucl_tail_live_streams_incrementally_without_filtering_log_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
+    write_record(
+        RunRecord(
+            run_id="demo",
+            kind="exec",
+            host="barbury-l",
+            ssh_host="barbury-l",
+            session="demo",
+            window="exec_demo",
+            remote_dir="/tmp/ucl-machine-tools/launchers/demo",
+            log_path="/tmp/ucl-machine-tools/launchers/demo/run.log",
+            command=("hostname",),
+        )
+    )
+    output_before_next_line: list[str] = []
+
+    class FakePipe:
+        def __init__(self, lines: list[str] | None = None, text: str = "") -> None:
+            self.lines = lines or []
+            self.text = text
+            self.writes: list[str] = []
+
+        def write(self, value: str) -> None:
+            self.writes.append(value)
+
+        def close(self) -> None:
+            pass
+
+        def readline(self) -> str:
+            if self.lines and self.lines[0].startswith("training log mentions"):
+                output_before_next_line.append(capsys.readouterr().out)
+            return self.lines.pop(0) if self.lines else ""
+
+        def read(self) -> str:
+            return self.text
+
+    class FakeLivePopen:
+        def __init__(self, argv: list[str], **kwargs: Any) -> None:
+            assert argv == remote_python_argv()
+            self.stdin = FakePipe()
+            self.stdout = FakePipe(
+                [
+                    "Last login: wrapper noise\n",
+                    "VBoxManage: error: startup noise\n",
+                    main_cli.TAIL_SENTINEL_BEGIN + "\n",
+                    "first live log line\n",
+                    "training log mentions VBoxManage as data\n",
+                ]
+            )
+            self.stderr = FakePipe(text="VirtualBox wrapper warning\n")
+
+        def wait(self) -> int:
+            return 0
+
+        def terminate(self) -> None:
+            pass
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["tail", "demo", "--live"], runner=runner, popener=FakeLivePopen) == 0
+
+    captured = capsys.readouterr()
+    assert output_before_next_line == ["first live log line\n"]
+    assert captured.out == "training log mentions VBoxManage as data\n"
+    assert captured.err == ""
+
+
+def test_ucl_tail_live_propagates_nonzero_ssh_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
+    write_record(
+        RunRecord(
+            run_id="demo",
+            kind="exec",
+            host="barbury-l",
+            ssh_host="barbury-l",
+            session="demo",
+            window="exec_demo",
+            remote_dir="/tmp/ucl-machine-tools/launchers/demo",
+            log_path="/tmp/ucl-machine-tools/launchers/demo/run.log",
+            command=("hostname",),
+        )
+    )
+
+    class FakePipe:
+        def __init__(self, lines: list[str] | None = None, text: str = "") -> None:
+            self.lines = lines or []
+            self.text = text
+
+        def write(self, value: str) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+        def readline(self) -> str:
+            return self.lines.pop(0) if self.lines else ""
+
+        def read(self) -> str:
+            return self.text
+
+    class FakeFailedLivePopen:
+        def __init__(self, argv: list[str], **kwargs: Any) -> None:
+            assert argv == remote_python_argv()
+            self.stdin = FakePipe()
+            self.stdout = FakePipe(["Last login: wrapper noise\n"])
+            self.stderr = FakePipe(
+                text=(
+                    "VBoxManage: error: wrapper noise\n"
+                    "ssh: connect to host barbury-l: No route to host\n"
+                )
+            )
+
+        def wait(self) -> int:
+            return 255
+
+        def terminate(self) -> None:
+            pass
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["tail", "demo", "--live"], runner=runner, popener=FakeFailedLivePopen) == 255
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "ssh: connect to host barbury-l: No route to host\n"
 
 
 def test_ucl_fetch_filters_login_noise(

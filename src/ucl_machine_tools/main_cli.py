@@ -70,7 +70,7 @@ Common workflows:
     ucl run --host barbury-l --new-session --gpu auto --min-free-vram-gb 20 --local-dir ./bundle --script run.sh
     ucl jobs
     ucl info last
-    ucl tail last
+    ucl tail last --live
     ucl fetch last
     ucl stop RUN_ID
     ucl clean barbury-l
@@ -107,10 +107,16 @@ Use 'ucl COMMAND --help' for command-specific flags.
     exec_parser = subparsers.add_parser("exec", help="Run a small remote command or snippet.")
     _configure_exec_parser(exec_parser)
 
-    tail = subparsers.add_parser("tail", help="Print or follow a recorded run log.")
+    tail = subparsers.add_parser("tail", help="Print or live-stream a recorded run log.")
     tail.add_argument("run_ref", nargs="?", default="last")
-    tail.add_argument("--lines", type=int, default=80)
-    tail.add_argument("--follow", action="store_true")
+    tail.add_argument("--lines", type=int, default=80, help="initial log lines to show (default: 80)")
+    tail.add_argument(
+        "--live",
+        "--follow",
+        dest="live",
+        action="store_true",
+        help="stream new log lines until interrupted with Ctrl-C",
+    )
 
     fetch = subparsers.add_parser("fetch", help="Fetch small artifacts for a recorded run.")
     fetch.add_argument("run_ref", nargs="?", default="last")
@@ -1266,7 +1272,7 @@ def _ssh_python_argv(host: str, *, connect_timeout: int | None = None) -> list[s
 def run_tail(args: argparse.Namespace, *, runner=subprocess.run, popener=subprocess.Popen) -> int:
     record = read_record(args.run_ref)
     ensure_knuckles_master(runner=runner)
-    if args.follow:
+    if args.live:
         proc = popener(
             _ssh_python_argv(record.ssh_host),
             stdin=subprocess.PIPE,

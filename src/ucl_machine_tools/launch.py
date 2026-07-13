@@ -525,6 +525,6 @@ def format_summary(plan: RemoteJobPlan, decision: TmuxDecision) -> str:
             f"  tmux attach -t {decision.session}",
             "",
             "tail:",
-            f"  ucl tail {plan.run_id}",
+            f"  ucl tail {plan.run_id} --live",
         ]
     )

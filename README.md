@@ -15,7 +15,7 @@ scripts/ucl exec barbury-l --shell csh --stdin < setup_python.csh
 scripts/ucl exec barbury-l --detach --new-session -- hostname
 scripts/ucl run --host barbury-l --new-session --gpu auto --min-free-vram-gb 20 --local-dir ./bundle --script run.sh
 scripts/ucl run --host barbury-l --session my_run --remote-root /tmp/ucl-machine-tools/fpt/launchers --local-dir ./bundle --script run.sh
-scripts/ucl tail last
+scripts/ucl tail last --live
 scripts/ucl fetch last
 scripts/ucl jobs
 scripts/ucl copy ./data barbury-l:/tmp/ucl-machine-tools/data --verify size
@@ -43,6 +43,8 @@ work.
   script in tmux. It requires `--session NAME` or `--new-session`.
 - `ucl jobs`, `ucl info`, `ucl stop`, `ucl tail`, `ucl fetch`, and `ucl clean`
   operate on recorded run metadata.
+- `ucl tail RUN_ID --live` prints the latest lines and streams new output until
+  interrupted with `Ctrl-C`; `--follow` remains an alias.
 - Recorded `ucl run` and detached `ucl exec` jobs include provenance: project
   tag, local git SHA when available, script hash, bundle path, selected GPU,
   remote root, and env keys with values redacted. Add `--project NAME` when
