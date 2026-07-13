@@ -685,10 +685,15 @@ def run_doctor(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     host = _resolve_one_host(args.host, catalog_path=args.catalog)
     ensure_knuckles_master(runner=runner)
     row = inventory.collect([host], runner=runner, jobs=1, timeout_seconds=args.timeout_seconds)[0]
-    sessions = list_remote_sessions(host, runner=runner, timeout_seconds=args.timeout_seconds)
     print(f"host:          {host.name}")
     print(f"status:        {row.get('status')}")
     print(f"tmp_scratch:  {'yes' if (row.get('scratch') or {}).get('exists') else 'no'}")
+    if not row.get("ok"):
+        errors = row.get("errors") or ["remote probe failed"]
+        print("tmux_sessions: unavailable")
+        print(f"error:         {errors[0]}")
+        return 2
+    sessions = list_remote_sessions(host, runner=runner, timeout_seconds=args.timeout_seconds)
     print(f"tmux_sessions: {', '.join(sessions) if sessions else 'none'}")
     return 0
 

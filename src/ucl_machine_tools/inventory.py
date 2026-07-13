@@ -9,7 +9,7 @@ from collections import Counter
 from typing import Any, Callable, Iterable
 
 from ucl_machine_tools.hosts import HostSpec
-from ucl_machine_tools.ssh import build_remote_python_argv
+from ucl_machine_tools.ssh import build_remote_python_argv, describe_ssh_failure
 
 
 INVENTORY_SENTINEL = "UCL_INVENTORY_JSON"
@@ -337,8 +337,13 @@ def collect_one(
     try:
         payload = parse_sentinel_stdout(stdout)
     except ValueError as exc:
-        status = "no-sentinel" if "sentinel not found" in str(exc) else "parse-error"
-        row = _error_row(host, status, str(exc))
+        if returncode != 0:
+            status = "unreachable" if returncode == 255 else "ssh-failed"
+            message = describe_ssh_failure(returncode, stdout=stdout, stderr=stderr)
+        else:
+            status = "no-sentinel" if "sentinel not found" in str(exc) else "parse-error"
+            message = str(exc)
+        row = _error_row(host, status, message)
         row["ssh_returncode"] = returncode
         if debug and stderr:
             row["stderr_tail"] = stderr[-500:]

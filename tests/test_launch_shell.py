@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -138,6 +139,15 @@ def test_tmux_sentinel_parser_ignores_noise_and_exec_auto_requires_single_sessio
             window="exec_hostname",
             require_explicit_when_not_single=True,
         )
+
+
+def test_tmux_session_probe_has_a_local_timeout() -> None:
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        assert kwargs["timeout"] == 11
+        raise subprocess.TimeoutExpired(argv, timeout=kwargs["timeout"])
+
+    with pytest.raises(RuntimeError, match="timed out listing tmux sessions on barbury-l after 11s"):
+        launch.list_remote_sessions(host(), runner=runner, timeout_seconds=8)
 
 
 def test_upload_and_launcher_writes_use_argv_only(tmp_path: Path) -> None:

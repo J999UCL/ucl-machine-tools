@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from ucl_machine_tools.hosts import HostSpec
-from ucl_machine_tools.ssh import build_remote_python_argv
+from ucl_machine_tools.ssh import build_remote_python_argv, describe_ssh_failure
 
 
 Runner = Callable[..., subprocess.CompletedProcess]
@@ -476,18 +476,25 @@ def list_remote_sessions(
     runner: Runner = subprocess.run,
     timeout_seconds: int | None = None,
 ) -> tuple[str, ...]:
-    proc = runner(
-        build_tmux_list_argv(host, timeout_seconds=timeout_seconds),
-        input=build_tmux_list_source(),
-        capture_output=True,
-        text=True,
-        shell=False,
-    )
+    try:
+        proc = runner(
+            build_tmux_list_argv(host, timeout_seconds=timeout_seconds),
+            input=build_tmux_list_source(),
+            capture_output=True,
+            text=True,
+            timeout=(timeout_seconds + 3) if timeout_seconds is not None else None,
+            shell=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"timed out listing tmux sessions on {host.name} after {exc.timeout}s") from exc
     if int(getattr(proc, "returncode", 1)) != 0:
-        stderr = (getattr(proc, "stderr", "") or "").strip()
-        stdout = (getattr(proc, "stdout", "") or "").strip()
-        detail = stderr or stdout or f"exit {getattr(proc, 'returncode', 'unknown')}"
-        raise RuntimeError(f"failed to list tmux sessions on {host.name}: {detail}")
+        returncode = int(getattr(proc, "returncode", 1))
+        detail = describe_ssh_failure(
+            returncode,
+            stdout=getattr(proc, "stdout", "") or "",
+            stderr=getattr(proc, "stderr", "") or "",
+        )
+        raise RuntimeError(f"failed to list tmux sessions on {host.name}: {detail} (exit {returncode})")
     try:
         return parse_tmux_sessions(getattr(proc, "stdout", "") or "")
     except ValueError as exc:
