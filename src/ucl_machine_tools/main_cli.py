@@ -46,6 +46,7 @@ EXEC_SENTINEL_BEGIN = "UCL_EXEC_JSON_BEGIN"
 EXEC_SENTINEL_END = "UCL_EXEC_JSON_END"
 ERROR_SNIPPET_CHARS = 800
 DEFAULT_AUTO_GPU_MIN_FREE_VRAM_GB = 20.0
+TAIL_STOP_TIMEOUT_SECONDS = 5.0
 
 
 class JobIdentityUnreachable(RuntimeError):
@@ -1374,13 +1375,33 @@ raise SystemExit(subprocess.call(["tail", "-n", str(LINES), "-f", PATH]))
 """
 
 
-def _forward_text_stream(stream: Any, destination: Any) -> None:
-    while True:
-        chunk = stream.read(8192)
-        if chunk == "":
-            return
-        destination.write(chunk)
-        destination.flush()
+def _forward_text_stream(stream: Any, destination: Any, *, on_read_error: Any) -> None:
+    destination_error: BaseException | None = None
+    try:
+        while True:
+            chunk = stream.read(8192)
+            if chunk == "":
+                break
+            if destination_error is None:
+                try:
+                    destination.write(chunk)
+                    destination.flush()
+                except BaseException as exc:
+                    destination_error = exc
+    except BaseException:
+        on_read_error()
+        raise
+    if destination_error is not None:
+        raise destination_error
+
+
+def _terminate_and_wait(proc: Any) -> None:
+    proc.terminate()
+    try:
+        proc.wait(timeout=TAIL_STOP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
 
 
 def _ssh_python_argv(host: str, *, connect_timeout: int | None = None) -> list[str]:
@@ -1400,13 +1421,19 @@ def run_tail(args: argparse.Namespace, *, runner=subprocess.run, popener=subproc
             text=True,
         )
         if proc.stdin is None or proc.stdout is None or proc.stderr is None:
+            _terminate_and_wait(proc)
             raise RuntimeError("failed to open remote tail pipes")
-        proc.stdin.write(_tail_follow_source(record.log_path, int(args.lines)))
-        proc.stdin.close()
         started = False
         with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="ucl-tail-stderr") as executor:
-            stderr_forward = executor.submit(_forward_text_stream, proc.stderr, sys.stderr)
+            stderr_forward = executor.submit(
+                _forward_text_stream,
+                proc.stderr,
+                sys.stderr,
+                on_read_error=proc.terminate,
+            )
             try:
+                proc.stdin.write(_tail_follow_source(record.log_path, int(args.lines)))
+                proc.stdin.close()
                 while True:
                     line = proc.stdout.readline()
                     if line == "":
@@ -1417,14 +1444,18 @@ def run_tail(args: argparse.Namespace, *, runner=subprocess.run, popener=subproc
                         continue
                     print(line, end="", flush=True)
             except KeyboardInterrupt:
-                proc.terminate()
-                proc.wait()
-                stderr_forward.result()
+                _terminate_and_wait(proc)
+                try:
+                    stderr_forward.result()
+                except Exception:
+                    pass
                 return 130
             except BaseException:
-                proc.terminate()
-                proc.wait()
-                stderr_forward.result()
+                _terminate_and_wait(proc)
+                try:
+                    stderr_forward.result()
+                except Exception:
+                    pass
                 raise
             returncode = int(proc.wait())
             stderr_forward.result()

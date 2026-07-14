@@ -8,6 +8,7 @@ import json
 import re
 import shlex
 import shutil
+import subprocess
 import tarfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -1427,6 +1428,46 @@ def test_ucl_tail_help_documents_live_streaming(capsys: pytest.CaptureFixture[st
     assert "until interrupted with Ctrl-C" in help_text
 
 
+def test_live_tail_stderr_forwarder_keeps_draining_after_output_failure() -> None:
+    class Stream:
+        def __init__(self) -> None:
+            self.chunks = ["first", "second", ""]
+            self.reads = 0
+
+        def read(self, size: int) -> str:
+            self.reads += 1
+            return self.chunks.pop(0)
+
+    class BrokenDestination:
+        def write(self, chunk: str) -> None:
+            raise BrokenPipeError("local stderr closed")
+
+        def flush(self) -> None:
+            pass
+
+    stream = Stream()
+    read_errors: list[bool] = []
+
+    with pytest.raises(BrokenPipeError, match="local stderr closed"):
+        main_cli._forward_text_stream(stream, BrokenDestination(), on_read_error=lambda: read_errors.append(True))
+
+    assert stream.reads == 3
+    assert read_errors == []
+
+
+def test_live_tail_stderr_read_failure_triggers_remote_termination() -> None:
+    class BrokenStream:
+        def read(self, size: int) -> str:
+            raise OSError("remote stderr read failed")
+
+    terminated: list[bool] = []
+
+    with pytest.raises(OSError, match="remote stderr read failed"):
+        main_cli._forward_text_stream(BrokenStream(), io.StringIO(), on_read_error=lambda: terminated.append(True))
+
+    assert terminated == [True]
+
+
 def test_ucl_tail_live_streams_incrementally_without_filtering_log_content(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1575,6 +1616,100 @@ def test_ucl_tail_live_drains_stderr_concurrently(
     captured = capsys.readouterr()
     assert captured.out == "live output\n"
     assert captured.err == "remote stderr\n"
+
+
+def test_ucl_tail_live_keyboard_interrupt_terminates_and_waits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
+    write_record(
+        RunRecord(
+            run_id="demo",
+            kind="exec",
+            host="barbury-l",
+            ssh_host="barbury-l",
+            session="demo",
+            window="exec_demo",
+            remote_dir="/tmp/ucl-machine-tools/launchers/demo",
+            log_path="/tmp/ucl-machine-tools/launchers/demo/run.log",
+            command=("hostname",),
+        )
+    )
+
+    class InputPipe:
+        def write(self, value: str) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    class StdoutPipe:
+        def readline(self) -> str:
+            raise KeyboardInterrupt
+
+    class StderrPipe:
+        def read(self, size: int = -1) -> str:
+            return ""
+
+    class FakeLivePopen:
+        instance: "FakeLivePopen"
+
+        def __init__(self, argv: list[str], **kwargs: Any) -> None:
+            self.stdin = InputPipe()
+            self.stdout = StdoutPipe()
+            self.stderr = StderrPipe()
+            self.terminated = False
+            self.killed = False
+            self.wait_timeouts: list[float | None] = []
+            FakeLivePopen.instance = self
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_timeouts.append(timeout)
+            return 143
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["tail", "demo", "--live"], runner=runner, popener=FakeLivePopen) == 130
+    assert FakeLivePopen.instance.terminated is True
+    assert FakeLivePopen.instance.killed is False
+    assert FakeLivePopen.instance.wait_timeouts == [main_cli.TAIL_STOP_TIMEOUT_SECONDS]
+
+
+def test_live_tail_stop_escalates_to_kill_after_timeout() -> None:
+    class Process:
+        def __init__(self) -> None:
+            self.terminated = False
+            self.killed = False
+            self.wait_timeouts: list[float | None] = []
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_timeouts.append(timeout)
+            if timeout is not None:
+                raise subprocess.TimeoutExpired("ucl tail", timeout)
+            return 137
+
+    proc = Process()
+    main_cli._terminate_and_wait(proc)
+
+    assert proc.terminated is True
+    assert proc.killed is True
+    assert proc.wait_timeouts == [main_cli.TAIL_STOP_TIMEOUT_SECONDS, None]
 
 
 def test_ucl_tail_live_propagates_nonzero_ssh_exit(
