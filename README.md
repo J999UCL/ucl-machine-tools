@@ -19,7 +19,7 @@ scripts/ucl tail last --live
 scripts/ucl fetch last
 scripts/ucl jobs
 scripts/ucl copy ./data barbury-l:/tmp/ucl-machine-tools/data --verify size
-scripts/ucl copy barbury-l:/tmp/a barnacle-l:/tmp/a -- --partial --info=progress2 --exclude '*.pt'
+scripts/ucl copy barbury-l:/tmp/checkpoints barnacle-l:/tmp/checkpoints --verify sha256 --reuse-from barnacle-l:/tmp/checkpoints.previous --retries 3
 scripts/ucl env barbury-l --remote-root /tmp/ucl-machine-tools/fpt --json
 ```
 
@@ -52,11 +52,19 @@ work.
   tag, local git SHA when available, script hash, bundle path, selected GPU,
   remote root, and env keys with values redacted. Add `--project NAME` when
   you want `ucl jobs` to disambiguate work across projects.
-- `ucl copy SRC DST [-- RSYNC_ARGS...]` is a thin `rsync` wrapper. Endpoints
-  can be local paths or `HOST:/absolute/path`; host aliases/selectors must
-  resolve to exactly one UCL host. For lab-machine-to-lab-machine copies, rsync
-  runs from the source host so data stays inside UCL. Add `--verify size` or
-  `--verify sha256` when you want explicit transfer checks.
+- `ucl copy SRC DST [-- RSYNC_ARGS...]` copies between local paths or
+  `HOST:/absolute/path` endpoints; host aliases/selectors must resolve to exactly
+  one UCL host. For lab-machine-to-lab-machine copies, rsync runs from the source
+  host so data stays inside UCL. With `--verify sha256`, `ucl copy` pre-compares
+  source and destination, skips exact files, transfers missing or mismatched
+  files, verifies the result, and retries as needed. `--retries N` controls the
+  retry count. `--reuse-from HOST:/absolute/path` enables same-filesystem
+  hard-link reuse from an existing copy when content, mode, and mtime match.
+  Verified directory copies treat `SRC` and `DST` as tree roots, so the contents
+  of `SRC` map directly into `DST`; `DST` must not contain source-absent files.
+  `--partial` keeps resumable data under `DST/.ucl-rsync-partial`. Raw rsync
+  arguments remain available for unverified copies only. Use `--verify size`
+  when byte-level identity is not required.
 - `ucl env HOST --remote-root DIR` checks reachability, scratch/root state, TSG
   setup scripts, `/tmp` space, and optional GPU availability.
 - `--gpu auto` on `exec`, `run`, and `env` requires 20 GB free VRAM by default;

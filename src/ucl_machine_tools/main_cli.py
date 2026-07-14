@@ -89,6 +89,8 @@ Common workflows:
   Copy data:
     ucl copy /tmp/a barbury-l:/tmp/a --verify size
     ucl copy barbury-l:/tmp/a barnacle-l:/tmp/a -- --partial --info=progress2 --exclude '*.pt'
+    ucl copy cream:/tmp/downloads brent-l:/tmp/downloads --verify sha256 --partial --retries 2
+    ucl copy cream:/tmp/downloads brent-l:/tmp/clean --verify sha256 --reuse-from brent-l:/tmp/existing
 
   Check a remote scratch root:
     ucl env barbury-l --remote-root /tmp/ucl-machine-tools/fpt --json
@@ -165,11 +167,13 @@ Use 'ucl COMMAND --help' for command-specific flags.
     stop.add_argument("--json", action="store_true")
     stop.add_argument("--timeout-seconds", type=int, default=8)
 
-    copy = subparsers.add_parser("copy", help="Copy local/remote paths with rsync.")
+    copy = subparsers.add_parser("copy", help="Copy or reconcile local/remote paths with rsync.")
     copy.add_argument("src")
     copy.add_argument("dst")
     copy.add_argument("--catalog", type=Path)
     copy.add_argument("--verify", choices=("size", "sha256", "none"), default="none")
+    copy.add_argument("--reuse-from", help="same-destination-host tree containing files eligible for hard-link reuse")
+    copy.add_argument("--retries", type=int, default=1, help="verification retries after the first transfer (default: 1)")
     copy.add_argument("--partial", action="store_true")
     copy.add_argument("--progress", action="store_true")
     copy.add_argument("--dry-run", action="store_true")
@@ -437,16 +441,34 @@ def _parse_exec_argv(tokens: list[str]) -> argparse.Namespace:
 def _build_copy_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ucl copy",
-        description="Copy local/remote paths with rsync.",
-        epilog="Use '--' before raw rsync args, e.g. ucl copy SRC DST -- --exclude '*.pt'.",
+        description="Copy paths with rsync, or reconcile them with pre/post verification.",
+        epilog=(
+            "Use '--verify sha256' to hash both sides, skip exact files, transfer only missing/mismatched files, "
+            "and retry verification failures. Raw rsync args after '--' are available only without --verify."
+        ),
     )
     parser.add_argument("src")
     parser.add_argument("dst")
     parser.add_argument("--catalog", type=Path)
-    parser.add_argument("--verify", choices=("size", "sha256", "none"), default="none")
-    parser.add_argument("--partial", action="store_true", help="add rsync --partial")
+    parser.add_argument(
+        "--verify",
+        choices=("size", "sha256", "none"),
+        default="none",
+        help="pre-compare, selectively transfer, and verify by size or SHA-256",
+    )
+    parser.add_argument(
+        "--reuse-from",
+        help="same-destination-host directory whose exact files should be hard-linked into DST",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=1,
+        help="verification retries after the first selective transfer (default: 1)",
+    )
+    parser.add_argument("--partial", action="store_true", help="preserve partial data for resumable transfers")
     parser.add_argument("--progress", action="store_true", help="add rsync --info=progress2")
-    parser.add_argument("--dry-run", action="store_true", help="print/perform rsync dry-run")
+    parser.add_argument("--dry-run", action="store_true", help="inspect the transfer plan without modifying files")
     parser.add_argument("--json", action="store_true")
     return parser
 
@@ -461,6 +483,8 @@ def _parse_copy_argv(tokens: list[str]) -> argparse.Namespace:
         "dst": None,
         "catalog": None,
         "verify": "none",
+        "reuse_from": None,
+        "retries": 1,
         "partial": False,
         "progress": False,
         "dry_run": False,
@@ -478,6 +502,8 @@ def _parse_copy_argv(tokens: list[str]) -> argparse.Namespace:
     value_flags = {
         "--catalog": "catalog",
         "--verify": "verify",
+        "--reuse-from": "reuse_from",
+        "--retries": "retries",
     }
     idx = 0
     while idx < len(tokens):
@@ -501,6 +527,15 @@ def _parse_copy_argv(tokens: list[str]) -> argparse.Namespace:
             elif key == "verify":
                 if raw_value not in {"size", "sha256", "none"}:
                     parser.error("--verify must be one of: size, sha256, none")
+                values[key] = raw_value
+            elif key == "retries":
+                try:
+                    values[key] = int(raw_value)
+                except ValueError:
+                    parser.error("--retries must be a non-negative integer")
+                if values[key] < 0:
+                    parser.error("--retries must be a non-negative integer")
+            else:
                 values[key] = raw_value
             idx += 2
             continue
@@ -1711,37 +1746,72 @@ def _copy_endpoint_manifest(endpoint: copy_tools.Endpoint, *, verify: str, runne
     return copy_tools.read_manifest(endpoint, sha256=(verify == "sha256"), runner=runner)
 
 
-def run_copy(args: argparse.Namespace, *, runner=subprocess.run) -> int:
-    src = copy_tools.resolve_endpoint(copy_tools.parse_endpoint(args.src), args.catalog)
-    dst = copy_tools.resolve_endpoint(copy_tools.parse_endpoint(args.dst), args.catalog)
-    needs_ssh = bool(src.host or dst.host)
-    if needs_ssh and not args.dry_run:
-        ensure_knuckles_master(runner=runner)
-    before = None
-    if args.verify != "none" and not args.dry_run:
-        before = _copy_endpoint_manifest(src, verify=args.verify, runner=runner)
+def _copy_transfer_argv(
+    src: copy_tools.Endpoint,
+    dst: copy_tools.Endpoint,
+    args: argparse.Namespace,
+    *,
+    selective: bool,
+    source_is_directory: bool,
+    dry_run: bool,
+) -> tuple[str, list[str]]:
     if src.host and dst.host:
         mode = "remote-to-remote"
-        argv = copy_tools.build_remote_to_remote_argv(
-            src,
-            dst,
-            partial=args.partial,
-            progress=args.progress,
-            dry_run=args.dry_run,
-            rsync_args=tuple(args.rsync_args),
-        )
+        builder = copy_tools.build_selective_remote_to_remote_argv if selective else copy_tools.build_remote_to_remote_argv
     else:
         mode = "rsync"
-        argv = copy_tools.build_rsync_argv(
-            src,
-            dst,
-            partial=args.partial,
-            progress=args.progress,
-            dry_run=args.dry_run,
-            rsync_args=tuple(args.rsync_args),
+        builder = copy_tools.build_selective_rsync_argv if selective else copy_tools.build_rsync_argv
+    kwargs: dict[str, Any] = {
+        "partial": args.partial,
+        "progress": args.progress,
+        "dry_run": dry_run,
+        "rsync_args": tuple(args.rsync_args),
+    }
+    if selective:
+        kwargs["source_is_directory"] = source_is_directory
+    return mode, builder(src, dst, **kwargs)
+
+
+def _render_copy_payload(payload: dict[str, Any], *, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    if payload.get("stdout"):
+        print(payload["stdout"], end="")
+    if payload.get("stderr"):
+        print(payload["stderr"], file=sys.stderr, end="")
+    plan = payload.get("plan")
+    if plan:
+        print(
+            "reconcile: "
+            f"exact={len(plan['destination_exact'])} "
+            f"reused={len(plan['reused'])} "
+            f"transfer={len(plan['transfer_paths'])} "
+            f"bytes={plan['bytes_to_transfer']}"
         )
+    verify = payload.get("verify", {})
+    if verify.get("mode") != "none":
+        print(f"verify: {verify.get('message', 'unknown')}")
+
+
+def _run_plain_copy(
+    args: argparse.Namespace,
+    *,
+    src: copy_tools.Endpoint,
+    dst: copy_tools.Endpoint,
+    runner=subprocess.run,
+) -> int:
+    mode, argv = _copy_transfer_argv(
+        src,
+        dst,
+        args,
+        selective=False,
+        source_is_directory=False,
+        dry_run=args.dry_run,
+    )
     if args.dry_run:
         payload = {
+            "ok": True,
             "src": args.src,
             "dst": args.dst,
             "resolved_src": src.rsync_spec(),
@@ -1749,7 +1819,12 @@ def run_copy(args: argparse.Namespace, *, runner=subprocess.run) -> int:
             "mode": mode,
             "argv": argv,
             "dry_run": True,
-            "verify": args.verify,
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "plan": None,
+            "attempts": [],
+            "verify": {"mode": "none", "ok": None, "message": "skipped"},
         }
         if args.json:
             print(json.dumps(payload, indent=2, sort_keys=True))
@@ -1758,12 +1833,6 @@ def run_copy(args: argparse.Namespace, *, runner=subprocess.run) -> int:
         return 0
     proc = runner(argv, capture_output=True, text=True, shell=False)
     ok = int(getattr(proc, "returncode", 1)) == 0
-    verify_payload: dict[str, Any] = {"mode": args.verify, "ok": None, "message": "skipped"}
-    if ok and args.verify != "none" and before is not None:
-        after = _copy_endpoint_manifest(dst, verify=args.verify, runner=runner)
-        verify_ok, message = copy_tools.compare_manifests(before, after, sha256=(args.verify == "sha256"))
-        verify_payload = {"mode": args.verify, "ok": verify_ok, "message": message}
-        ok = ok and verify_ok
     payload = {
         "ok": ok,
         "src": args.src,
@@ -1775,20 +1844,278 @@ def run_copy(args: argparse.Namespace, *, runner=subprocess.run) -> int:
         "returncode": int(getattr(proc, "returncode", 1)),
         "stdout": _strip_remote_noise(getattr(proc, "stdout", "") or ""),
         "stderr": _strip_remote_noise(getattr(proc, "stderr", "") or ""),
-        "verify": verify_payload,
+        "dry_run": False,
+        "plan": None,
+        "attempts": [],
+        "verify": {"mode": "none", "ok": None, "message": "skipped"},
     }
-    if args.json:
-        print(json.dumps(payload, indent=2, sort_keys=True))
-    else:
-        if payload["stdout"]:
-            print(payload["stdout"], end="")
-        if payload["stderr"]:
-            print(payload["stderr"], file=sys.stderr, end="")
-        print(f"mode: {mode}")
-        print(f"argv: {shlex.join(argv)}")
-        print(f"returncode: {payload['returncode']}")
-        print(f"verify: {verify_payload['message']}")
+    _render_copy_payload(payload, json_output=args.json)
     return 0 if ok else 2
+
+
+def _read_reconcile_manifests(
+    endpoints: dict[str, copy_tools.Endpoint],
+    *,
+    verify: str,
+    runner=subprocess.run,
+) -> dict[str, dict[str, Any]]:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
+        futures = {
+            name: executor.submit(_copy_endpoint_manifest, endpoint, verify=verify, runner=runner)
+            for name, endpoint in endpoints.items()
+        }
+        return {name: future.result() for name, future in futures.items()}
+
+
+def _verify_message(
+    source: dict[str, Any],
+    destination: dict[str, Any],
+    diff: copy_tools.ManifestDiff,
+    *,
+    sha256: bool,
+) -> str:
+    if diff.ok:
+        return "ok"
+    _, message = copy_tools.compare_manifests(source, destination, sha256=sha256)
+    if message == "ok":
+        return "sha256 manifest differs" if sha256 else "size/path manifest differs"
+    return message
+
+
+def _run_reconciled_copy(
+    args: argparse.Namespace,
+    *,
+    src: copy_tools.Endpoint,
+    dst: copy_tools.Endpoint,
+    reuse: copy_tools.Endpoint | None,
+    runner=subprocess.run,
+) -> int:
+    if args.retries < 0:
+        raise ValueError("--retries must be a non-negative integer")
+    if args.rsync_args:
+        raise ValueError("raw rsync arguments are not supported with --verify; remove --verify or the raw arguments")
+    if reuse is not None:
+        if args.verify != "sha256":
+            raise ValueError("--reuse-from requires --verify sha256")
+        copy_tools.validate_reuse_endpoints(dst, reuse)
+
+    if not args.json:
+        labels = "source and destination" if reuse is None else "source, destination, and reuse tree"
+        print(f"preflight: hashing {labels} with {args.verify}")
+    endpoints = {"source": src, "destination": dst}
+    if reuse is not None:
+        endpoints["reuse"] = reuse
+    manifests = _read_reconcile_manifests(endpoints, verify=args.verify, runner=runner)
+    source_manifest = manifests["source"]
+    destination_manifest = manifests["destination"]
+    for label, manifest in manifests.items():
+        unsupported = copy_tools.unsupported_entries(manifest)
+        if unsupported:
+            detail = ", ".join(f"{item['path']} ({item['kind']})" for item in unsupported[:5])
+            raise ValueError(f"verified copy does not support {label} symlinks or special files: {detail}")
+    if not source_manifest.get("exists"):
+        raise ValueError(f"copy source does not exist: {args.src}")
+    source_kind = source_manifest.get("root_kind", "directory")
+    if source_kind not in {"file", "directory"}:
+        raise ValueError(f"unsupported copy source type: {source_kind}")
+    source_is_directory = source_kind == "directory"
+    copy_tools.validate_reconcile_paths(src, dst, source_is_directory=source_is_directory)
+    empty_directories = list(source_manifest.get("empty_directories", []))
+    if empty_directories:
+        preview = ", ".join(empty_directories[:5])
+        raise ValueError(
+            "verified copy does not support empty source directories because they cannot be content-verified "
+            f"(examples: {preview})"
+        )
+    if source_is_directory and destination_manifest.get("root_kind") == "file":
+        raise ValueError("verified directory copy destination cannot be an existing file")
+
+    initial_diff = copy_tools.endpoint_diff(
+        source_manifest,
+        destination_manifest,
+        source_endpoint=src,
+        sha256=(args.verify == "sha256"),
+    )
+    initial_diff = copy_tools.ignore_destination_internal_partials(
+        initial_diff,
+        enabled=bool(args.partial and source_is_directory),
+    )
+    if source_is_directory and initial_diff.extra:
+        preview = ", ".join(initial_diff.extra[:5])
+        raise ValueError(
+            "verified directory destination contains files absent from the source; "
+            f"use a clean destination (examples: {preview})"
+        )
+    reusable: tuple[str, ...] = ()
+    if reuse is not None:
+        if not source_is_directory or manifests["reuse"].get("root_kind", "directory") != "directory":
+            raise ValueError("--reuse-from currently requires directory source, reuse, and destination roots")
+        reuse_diff = copy_tools.diff_manifests(source_manifest, manifests["reuse"], sha256=True)
+        reusable = copy_tools.hardlinkable_paths(
+            source_manifest,
+            manifests["reuse"],
+            tuple(sorted(set(initial_diff.transfer_paths).intersection(reuse_diff.exact))),
+        )
+    transfer_paths = tuple(sorted(set(initial_diff.transfer_paths) - set(reusable)))
+    plan = {
+        "comparison": args.verify,
+        "source_files": int(source_manifest.get("file_count", 0)),
+        "destination_exact": list(initial_diff.exact),
+        "destination_missing": list(initial_diff.missing),
+        "destination_mismatched": list(initial_diff.mismatched),
+        "destination_extra": list(initial_diff.extra),
+        "reuse_candidates": list(reusable),
+        "reused": [],
+        "transfer_paths": list(transfer_paths),
+        "bytes_to_transfer": copy_tools.manifest_bytes(source_manifest, transfer_paths),
+    }
+
+    mode, planned_argv = _copy_transfer_argv(
+        src,
+        dst,
+        args,
+        selective=True,
+        source_is_directory=source_is_directory,
+        dry_run=True,
+    )
+    if args.dry_run:
+        payload = {
+            "ok": True,
+            "src": args.src,
+            "dst": args.dst,
+            "resolved_src": src.rsync_spec(),
+            "resolved_dst": dst.rsync_spec(),
+            "reuse_from": args.reuse_from,
+            "mode": mode,
+            "argv": planned_argv if transfer_paths else [],
+            "dry_run": True,
+            "plan": plan,
+            "verify": {"mode": args.verify, "ok": None, "message": "planned only"},
+            "attempts": [],
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+        }
+        _render_copy_payload(payload, json_output=args.json)
+        return 0
+
+    if reusable and reuse is not None:
+        plan["reused"] = copy_tools.hardlink_reusable(reuse, dst, reusable, runner=runner)
+
+    attempts: list[dict[str, Any]] = []
+    pending = transfer_paths
+    final_manifest = destination_manifest
+    final_diff = initial_diff
+    if reusable:
+        final_manifest = _copy_endpoint_manifest(dst, verify=args.verify, runner=runner)
+        final_diff = copy_tools.endpoint_diff(
+            source_manifest,
+            final_manifest,
+            source_endpoint=src,
+            sha256=(args.verify == "sha256"),
+        )
+        final_diff = copy_tools.ignore_destination_internal_partials(
+            final_diff,
+            enabled=bool(args.partial and source_is_directory),
+        )
+        pending = final_diff.transfer_paths
+
+    for attempt_number in range(1, args.retries + 2):
+        if not pending:
+            break
+        mode, argv = _copy_transfer_argv(
+            src,
+            dst,
+            args,
+            selective=True,
+            source_is_directory=source_is_directory,
+            dry_run=False,
+        )
+        input_data = copy_tools.files_from_input(pending) if source_is_directory else None
+        proc = runner(argv, input=input_data, capture_output=True, text=True, shell=False)
+        final_manifest = _copy_endpoint_manifest(dst, verify=args.verify, runner=runner)
+        final_diff = copy_tools.endpoint_diff(
+            source_manifest,
+            final_manifest,
+            source_endpoint=src,
+            sha256=(args.verify == "sha256"),
+        )
+        final_diff = copy_tools.ignore_destination_internal_partials(
+            final_diff,
+            enabled=bool(args.partial and source_is_directory),
+        )
+        attempts.append(
+            {
+                "attempt": attempt_number,
+                "paths": list(pending),
+                "argv": argv,
+                "returncode": int(getattr(proc, "returncode", 1)),
+                "stdout": _strip_remote_noise(getattr(proc, "stdout", "") or ""),
+                "stderr": _strip_remote_noise(getattr(proc, "stderr", "") or ""),
+                "remaining": list(final_diff.transfer_paths),
+            }
+        )
+        pending = final_diff.transfer_paths
+        if not pending:
+            break
+
+    final_source_snapshot = _copy_endpoint_manifest(src, verify=args.verify, runner=runner)
+    source_stable = copy_tools.source_snapshot_stable(
+        source_manifest,
+        final_source_snapshot,
+        sha256=(args.verify == "sha256"),
+    )
+    verify_ok = final_diff.ok and source_stable
+    transfer_ok = not attempts or attempts[-1]["returncode"] == 0
+    ok = verify_ok and transfer_ok
+    message = _verify_message(
+        source_manifest,
+        final_manifest,
+        final_diff,
+        sha256=(args.verify == "sha256"),
+    )
+    if not source_stable:
+        message = "source changed during copy; result is not trusted"
+    payload = {
+        "ok": ok,
+        "src": args.src,
+        "dst": args.dst,
+        "resolved_src": src.rsync_spec(),
+        "resolved_dst": dst.rsync_spec(),
+        "reuse_from": args.reuse_from,
+        "mode": mode,
+        "argv": attempts[-1]["argv"] if attempts else [],
+        "returncode": attempts[-1]["returncode"] if attempts else 0,
+        "stdout": "".join(str(attempt["stdout"]) for attempt in attempts),
+        "stderr": "".join(str(attempt["stderr"]) for attempt in attempts),
+        "plan": plan,
+        "attempts": attempts,
+        "verify": {
+            "mode": args.verify,
+            "ok": verify_ok,
+            "message": message,
+            "source_stable": source_stable,
+            **final_diff.as_dict(),
+        },
+    }
+    _render_copy_payload(payload, json_output=args.json)
+    return 0 if ok else 2
+
+
+def run_copy(args: argparse.Namespace, *, runner=subprocess.run) -> int:
+    src = copy_tools.resolve_endpoint(copy_tools.parse_endpoint(args.src), args.catalog)
+    dst = copy_tools.resolve_endpoint(copy_tools.parse_endpoint(args.dst), args.catalog)
+    reuse = None
+    if args.reuse_from:
+        reuse = copy_tools.resolve_endpoint(copy_tools.parse_endpoint(args.reuse_from), args.catalog)
+    needs_ssh = bool(src.host or dst.host or (reuse and reuse.host))
+    if needs_ssh and (not args.dry_run or args.verify != "none"):
+        ensure_knuckles_master(runner=runner)
+    if args.verify == "none":
+        if reuse is not None:
+            raise ValueError("--reuse-from requires --verify sha256")
+        return _run_plain_copy(args, src=src, dst=dst, runner=runner)
+    return _run_reconciled_copy(args, src=src, dst=dst, reuse=reuse, runner=runner)
 
 
 def run_env(args: argparse.Namespace, *, runner=subprocess.run) -> int:
@@ -1922,7 +2249,28 @@ def main(argv: list[str] | None = None, *, runner=subprocess.run, popener=subpro
         try:
             return run_copy(args, runner=runner)
         except Exception as exc:  # noqa: BLE001 - CLI should render concise failures.
-            print(f"ERROR: {exc}", file=sys.stderr)
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "src": args.src,
+                            "dst": args.dst,
+                            "dry_run": bool(args.dry_run),
+                            "returncode": 2,
+                            "stdout": "",
+                            "stderr": "",
+                            "error": str(exc),
+                            "plan": None,
+                            "attempts": [],
+                            "verify": {"mode": args.verify, "ok": False, "message": "not completed"},
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+            else:
+                print(f"ERROR: {exc}", file=sys.stderr)
             return 2
     try:
         args = parser.parse_args(raw_argv)

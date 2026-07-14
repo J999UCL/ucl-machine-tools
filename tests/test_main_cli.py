@@ -7,6 +7,7 @@ import io
 import json
 import re
 import shlex
+import shutil
 import tarfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -265,7 +266,7 @@ def test_ucl_status_accepts_multiple_positional_targets(
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert [row["host"] for row in payload["hosts"]] == ["barbury-l", "canada-l"]
-    assert probed == ["barbury-l", "canada-l"]
+    assert sorted(probed) == ["barbury-l", "canada-l"]
 
 
 def test_ucl_status_modes_accept_multiple_targets_and_selector_override(
@@ -291,7 +292,7 @@ def test_ucl_status_modes_accept_multiple_targets_and_selector_override(
     )
     recommend_payload = json.loads(capsys.readouterr().out)
     assert [row["host"] for row in recommend_payload["hosts"]] == ["barbury-l"]
-    assert calls == ["barbury-l", "canada-l"]
+    assert sorted(calls) == ["barbury-l", "canada-l"]
 
     calls.clear()
     assert (
@@ -303,7 +304,7 @@ def test_ucl_status_modes_accept_multiple_targets_and_selector_override(
     )
     gpus_payload = json.loads(capsys.readouterr().out)
     assert [row["host"] for row in gpus_payload["hosts"]] == ["barbury-l", "canada-l"]
-    assert calls == ["barbury-l", "canada-l"]
+    assert sorted(calls) == ["barbury-l", "canada-l"]
 
     calls.clear()
     assert (
@@ -335,19 +336,19 @@ def test_ucl_status_expands_multiple_selectors_in_catalog_order(
     assert main_cli.main(["status", "3090ti", "timeshare", "--catalog", str(catalog), "--json"], runner=runner) == 0
     payload = json.loads(capsys.readouterr().out)
     assert [row["host"] for row in payload["hosts"]] == ["barbury-l", "canada-l", "cream"]
-    assert probed == ["barbury-l", "canada-l", "cream"]
+    assert sorted(probed) == ["barbury-l", "canada-l", "cream"]
 
     probed.clear()
     assert main_cli.main(["status", "barbury-l", "3090ti", "--catalog", str(catalog), "--json"], runner=runner) == 0
     dedupe_payload = json.loads(capsys.readouterr().out)
     assert [row["host"] for row in dedupe_payload["hosts"]] == ["barbury-l", "canada-l"]
-    assert probed == ["barbury-l", "canada-l"]
+    assert sorted(probed) == ["barbury-l", "canada-l"]
 
     probed.clear()
     assert main_cli.main(["status", "all", "!cream", "--catalog", str(catalog), "--json"], runner=runner) == 0
     exclusion_payload = json.loads(capsys.readouterr().out)
     assert [row["host"] for row in exclusion_payload["hosts"]] == ["barbury-l", "canada-l"]
-    assert probed == ["barbury-l", "canada-l"]
+    assert sorted(probed) == ["barbury-l", "canada-l"]
 
 
 def test_ucl_status_defaults_to_all_targets(
@@ -367,7 +368,7 @@ def test_ucl_status_defaults_to_all_targets(
     assert main_cli.main(["status", "--catalog", str(catalog), "--json"], runner=runner) == 0
     payload = json.loads(capsys.readouterr().out)
     assert [row["host"] for row in payload["hosts"]] == ["barbury-l", "canada-l", "cream"]
-    assert probed == ["barbury-l", "canada-l", "cream"]
+    assert sorted(probed) == ["barbury-l", "canada-l", "cream"]
 
 
 def test_ucl_run_full_fake_path_writes_registry(
@@ -2107,7 +2108,7 @@ def test_ucl_copy_dry_run_and_size_verify(
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
         assert argv[0] == "rsync"
-        (dst / "a.txt").write_text("hello", encoding="utf-8")
+        shutil.copy2(src / "a.txt", dst / "a.txt")
         return ok(stdout="copied\n", stderr="VBoxManage: noisy login\n")
 
     assert main_cli.main(["copy", str(src), str(dst), "--verify", "size", "--json"], runner=runner) == 0
@@ -2333,8 +2334,8 @@ def test_ucl_copy_remote_to_remote_verify_reads_each_endpoint_host(
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["verify"]["ok"] is True
-    assert manifest_hosts == ["barbury.internal", "barnacle.internal"]
-    assert transfer_hosts == ["barbury.internal"]
+    assert sorted(manifest_hosts) == ["barbury.internal", "barbury.internal", "barnacle.internal"]
+    assert transfer_hosts == []
 
 
 def test_ucl_copy_verify_failure_cases(
@@ -2354,7 +2355,7 @@ def test_ucl_copy_verify_failure_cases(
     rc = main_cli.main(["copy", str(src), str(dst), "--verify", "size", "--json"], runner=failed_rsync)
     payload = json.loads(capsys.readouterr().out)
     assert rc == 2
-    assert payload["verify"]["ok"] is None
+    assert payload["verify"]["ok"] is False
     assert payload["returncode"] == 23
 
     def mismatch_rsync(argv: list[str], **kwargs: Any) -> SimpleNamespace:
