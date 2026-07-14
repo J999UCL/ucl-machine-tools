@@ -877,8 +877,8 @@ def _compact_text(text: str, *, limit: int = ERROR_SNIPPET_CHARS) -> str:
 
 def _wrapper_stream_detail(stdout: str, stderr: str) -> str:
     parts = []
-    clean_stderr = _compact_text(_strip_remote_noise(stderr))
-    clean_stdout = _compact_text(_strip_remote_noise(stdout))
+    clean_stderr = _compact_text(stderr)
+    clean_stdout = _compact_text(stdout)
     if clean_stderr:
         parts.append(f"stderr: {clean_stderr}")
     if clean_stdout:
@@ -1050,8 +1050,8 @@ def run_exec_sync(
                     args=args,
                     error=message,
                     returncode=int(getattr(proc, "returncode", 1)),
-                    stdout=_strip_remote_noise(getattr(proc, "stdout", "") or ""),
-                    stderr=_strip_remote_noise(getattr(proc, "stderr", "") or ""),
+                    stdout=getattr(proc, "stdout", "") or "",
+                    stderr=getattr(proc, "stderr", "") or "",
                 )
             )
             return 2
@@ -1070,8 +1070,8 @@ def run_exec_sync(
                     command=command,
                     args=args,
                     error=str(exc),
-                    stdout=_strip_remote_noise(getattr(proc, "stdout", "") or ""),
-                    stderr=_strip_remote_noise(getattr(proc, "stderr", "") or ""),
+                    stdout=getattr(proc, "stdout", "") or "",
+                    stderr=getattr(proc, "stderr", "") or "",
                 )
             )
             return 2
@@ -1290,7 +1290,7 @@ def _query_job_identity(
         raise JobIdentityUnreachable(f"timed out reading job identity on {host.name} after {exc.timeout}s") from exc
     returncode = int(getattr(proc, "returncode", 1))
     if returncode != 0:
-        detail = _strip_remote_noise((getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip())
+        detail = (getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip()
         error = detail or f"failed to read job identity on {host.name}"
         if returncode == 255:
             raise JobIdentityUnreachable(error)
@@ -1374,11 +1374,6 @@ raise SystemExit(subprocess.call(["tail", "-n", str(LINES), "-f", PATH]))
 """
 
 
-def _strip_remote_noise(text: str) -> str:
-    noisy_markers = ("VBoxManage", "VirtualBox")
-    return "".join(line for line in text.splitlines(keepends=True) if not any(marker in line for marker in noisy_markers))
-
-
 def _ssh_python_argv(host: str, *, connect_timeout: int | None = None) -> list[str]:
     timeout = None if connect_timeout in (None, 0) else int(connect_timeout)
     return build_remote_python_argv(host, timeout_seconds=timeout)
@@ -1416,7 +1411,7 @@ def run_tail(args: argparse.Namespace, *, runner=subprocess.run, popener=subproc
         returncode = int(proc.wait())
         stderr = ""
         if proc.stderr is not None:
-            stderr = _strip_remote_noise(proc.stderr.read())
+            stderr = proc.stderr.read()
         if returncode != 0 and stderr:
             print(stderr, file=sys.stderr, end="")
         return returncode
@@ -1447,7 +1442,7 @@ def run_fetch(args: argparse.Namespace, *, runner=subprocess.run, popener=subpro
         shell=False,
     )
     if int(getattr(proc, "returncode", 1)) != 0:
-        detail = _strip_remote_noise((getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip())
+        detail = (getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip()
         raise RuntimeError(detail or "remote fetch failed")
     tar_data = base64.b64decode(_extract_between(getattr(proc, "stdout", "") or "", FETCH_SENTINEL_BEGIN, FETCH_SENTINEL_END, label="fetch"))
     local = runner(["tar", "-xf", "-", "-C", str(output_dir)], input=tar_data, capture_output=True, shell=False)
@@ -1498,7 +1493,7 @@ def run_clean(args: argparse.Namespace, *, runner=subprocess.run) -> int:
         shell=False,
     )
     if int(getattr(proc, "returncode", 1)) != 0:
-        detail = _strip_remote_noise((getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip())
+        detail = (getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip()
         raise RuntimeError(detail or "remote clean failed")
     payload = json.loads(_extract_between(getattr(proc, "stdout", "") or "", CLEAN_SENTINEL_BEGIN, CLEAN_SENTINEL_END, label="clean"))
     for path in payload.get("paths", []):
@@ -1685,9 +1680,7 @@ def run_stop(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     else:
         returncode = int(getattr(proc, "returncode", 1))
         if returncode != 0:
-            detail = _strip_remote_noise(
-                (getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip()
-            )
+            detail = (getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip()
             result = {
                 "ok": False,
                 "status": "wrapper_error",
@@ -2243,8 +2236,8 @@ def _multi_exec_one(host: HostSpec, args: argparse.Namespace, command: tuple[str
                 "host": host.name,
                 "ok": False,
                 "returncode": int(getattr(proc, "returncode", 1)),
-                "stdout": _strip_remote_noise(getattr(proc, "stdout", "") or ""),
-                "stderr": _strip_remote_noise(getattr(proc, "stderr", "") or ""),
+                "stdout": getattr(proc, "stdout", "") or "",
+                "stderr": getattr(proc, "stderr", "") or "",
                 "error": _exec_wrapper_failure_message(host=host, returncode=int(getattr(proc, "returncode", 1)), stdout=getattr(proc, "stdout", "") or "", stderr=getattr(proc, "stderr", "") or ""),
             }
         result = _parse_sync_exec_result(host=host, stdout=getattr(proc, "stdout", "") or "", stderr=getattr(proc, "stderr", "") or "")

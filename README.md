@@ -24,7 +24,11 @@ scripts/ucl env barbury-l --remote-root /tmp/ucl-machine-tools/fpt --json
 ```
 
 The tool always checks/starts the `knuckles` SSH master connection before remote
-work.
+work. Every remote command uses a nonce-framed transport that discards login-hook
+output before the command starts. In particular, broken VirtualBox startup
+diagnostics cannot corrupt probes, checksums, rsync, tmux control, or command
+results. Once the frame is established, command stdout and stderr are forwarded
+unchanged, including command output that happens to mention VirtualBox.
 
 ## Commands
 
@@ -55,10 +59,9 @@ work.
 - `ucl copy SRC DST [-- RSYNC_ARGS...]` copies between local paths or
   `HOST:/absolute/path` endpoints; host aliases/selectors must resolve to exactly
   one UCL host. For lab-machine-to-lab-machine copies, rsync runs from the source
-  host so data stays inside UCL. Every SSH hop uses a nonce-framed transport:
-  bounded stdout/stderr produced by shell startup is discarded before the remote
-  rsync process starts, after which all bytes are forwarded unchanged. A missing,
-  late, or oversized handshake fails closed and never retries through raw SSH.
+  host so data stays inside UCL. Its SSH hops use the same global nonce-framed
+  transport: a missing, late, or oversized handshake fails closed and never
+  retries through raw SSH.
   Remote copies require `python3` and `rsync` in each participating host's
   non-interactive `PATH`.
   With `--verify sha256`, `ucl copy` pre-compares

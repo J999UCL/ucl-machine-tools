@@ -15,7 +15,7 @@ from typing import Callable, Iterable
 
 from ucl_machine_tools import job_control
 from ucl_machine_tools.hosts import HostSpec
-from ucl_machine_tools.ssh import build_remote_python_argv, describe_ssh_failure
+from ucl_machine_tools.ssh import build_remote_argv, build_remote_python_argv, describe_ssh_failure
 
 
 Runner = Callable[..., subprocess.CompletedProcess]
@@ -58,9 +58,7 @@ class TmuxDecision:
 
 
 def remote_bash_argv(host: HostSpec, command: str) -> list[str]:
-    if "'" in command:
-        raise ValueError("remote bash command must not contain single quotes; use stdin for complex scripts")
-    return ["ssh", host.ssh_host, "bash", "-lc", f"'{command}'"]
+    return build_remote_argv(host.ssh_host, ("bash", "-lc", command))
 
 
 def validate_name(value: str, label: str) -> None:

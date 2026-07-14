@@ -12,6 +12,7 @@ import pytest
 
 from ucl_machine_tools import copy as copy_tools
 from ucl_machine_tools import main_cli
+from ucl_machine_tools import ssh as ssh_tools
 
 
 def ok(stdout: str = "", stderr: str = "") -> SimpleNamespace:
@@ -405,11 +406,11 @@ def test_ucl_copy_reconcile_remote_to_remote_manifests_and_transfer_stay_on_endp
         assert kwargs.get("shell", False) is False
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barbury.internal", "python3", "-"]:
+        if argv == ssh_tools.build_remote_python_argv("barbury.internal"):
             assert "ROOT=\"/tmp/src\"" in kwargs["input"]
             assert "SHA256=True" in kwargs["input"]
             return ok(stdout=manifest_stdout(source))
-        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "barnacle.internal", "python3", "-"]:
+        if argv == ssh_tools.build_remote_python_argv("barnacle.internal"):
             assert "ROOT=\"/tmp/dst\"" in kwargs["input"]
             assert "SHA256=True" in kwargs["input"]
             payload = destination_before if destination_reads == 0 else destination_after

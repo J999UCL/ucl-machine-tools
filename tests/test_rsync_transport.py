@@ -51,6 +51,13 @@ def test_prefix_frame_enforces_exact_prefix_limit_and_fails_closed() -> None:
         overflow.feed(b"12345")
     assert overflow.ready is False
 
+    marker_overflow = rsync_transport.PrefixFrame(b"MARK", max_prefix_bytes=4)
+    with pytest.raises(rsync_transport.FrameError, match="exceeded"):
+        marker_overflow.feed(b"12345MARKapplication data")
+    assert marker_overflow.captured_prefix == b"12345"
+    assert b"MARK" not in marker_overflow.captured_prefix
+    assert b"application data" not in marker_overflow.captured_prefix
+
 
 def test_remote_command_does_not_embed_complete_markers_and_preserves_hostile_argv() -> None:
     nonce = "0123456789abcdef0123456789abcdef"
@@ -141,9 +148,18 @@ def test_transport_argv_filters_both_startup_streams_and_preserves_command_bytes
 
 
 def test_command_output_that_looks_like_login_noise_is_preserved_after_handshake() -> None:
+    command_output = "\n".join(
+        [
+            "VBoxManage: Failed to create the VirtualBox object",
+            "Document is empty",
+            "/home/user/.config/VirtualBox/VirtualBox.xml, line 1",
+            "NS_ERROR_FAILURE",
+            "",
+        ]
+    )
     argv = rsync_transport.build_transport_argv(
         "fake-host",
-        [sys.executable, "-c", "import sys;sys.stderr.write('VBoxManage is real command output\\n')"],
+        [sys.executable, "-c", f"import sys;sys.stderr.write({command_output!r})"],
         ssh_executable=str(FAKE_SSH),
     )
     proc = subprocess.run(
@@ -154,7 +170,7 @@ def test_command_output_that_looks_like_login_noise_is_preserved_after_handshake
     )
 
     assert proc.returncode == 0
-    assert proc.stderr == b"VBoxManage is real command output\n"
+    assert proc.stderr == command_output.encode()
 
 
 def test_missing_ssh_executable_returns_a_concise_transport_error() -> None:
@@ -188,6 +204,38 @@ def test_transport_fails_cleanly_when_handshake_never_arrives() -> None:
     assert proc.stdout == b""
     assert b"handshake" in proc.stderr.lower()
     assert b"useful startup error" in proc.stderr
+
+
+def test_transport_failure_hides_virtualbox_startup_block_but_keeps_real_diagnostic() -> None:
+    argv = rsync_transport.build_transport_argv(
+        "fake-host",
+        ["true"],
+        ssh_executable=str(FAKE_SSH),
+        handshake_timeout_seconds=0.2,
+    )
+    virtualbox = b"\n".join(
+        [
+            b"VBoxManage: Failed to create the VirtualBox object",
+            b"Document is empty",
+            b"/home/user/.config/VirtualBox/VirtualBox.xml, line 1",
+            b"NS_ERROR_FAILURE",
+            b"ssh: actual transport failure",
+            b"",
+        ]
+    )
+    proc = subprocess.run(
+        argv,
+        capture_output=True,
+        env=_transport_env(stderr_prefix=virtualbox, mode="exit"),
+        check=False,
+    )
+
+    assert proc.returncode != 0
+    assert b"VBoxManage" not in proc.stderr
+    assert b"VirtualBox.xml" not in proc.stderr
+    assert b"Document is empty" not in proc.stderr
+    assert b"NS_ERROR_FAILURE" not in proc.stderr
+    assert b"ssh: actual transport failure" in proc.stderr
 
 
 def test_transport_reports_late_stderr_after_stdout_closes_before_handshake() -> None:

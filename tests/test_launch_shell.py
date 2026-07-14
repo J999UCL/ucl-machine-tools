@@ -92,19 +92,9 @@ def test_remote_root_can_be_configured_in_plans(tmp_path: Path, monkeypatch: pyt
 
 
 def test_tmux_sentinel_parser_ignores_noise_and_exec_auto_requires_single_session() -> None:
-    assert launch.build_tmux_list_argv(host(), timeout_seconds=8) == [
-        "ssh",
-        "-T",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "LogLevel=ERROR",
-        "-o",
-        "ConnectTimeout=8",
-        "barbury-l",
-        "python3",
-        "-",
-    ]
+    argv = launch.build_tmux_list_argv(host(), timeout_seconds=8)
+    assert argv[0] == "python3"
+    assert argv[-3:] == ["barbury-l", "python3", "-"]
 
     stdout = "\n".join(
         [
@@ -183,6 +173,7 @@ def test_upload_and_launcher_writes_use_argv_only(tmp_path: Path) -> None:
     launch.write_launcher_files(plan, runner=runner)
 
     assert popen_calls[0][:2] == ["tar", "-cf"]
-    assert all(call[0] == "ssh" for call in runner_calls)
+    assert all(call[0] == "python3" for call in runner_calls)
+    assert all("--logical-argv" in call for call in runner_calls)
     assert "scp" not in " ".join(" ".join(call) for call in runner_calls)
-    assert "rsync" not in " ".join(" ".join(call) for call in runner_calls)
+    assert all("rsync" not in call for call in runner_calls)

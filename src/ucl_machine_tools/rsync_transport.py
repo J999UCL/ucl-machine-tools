@@ -1,4 +1,4 @@
-"""Noise-safe SSH transport for rsync's binary protocol."""
+"""Noise-safe SSH transport for remote commands and rsync's binary protocol."""
 
 from __future__ import annotations
 
@@ -39,6 +39,21 @@ class FrameError(RuntimeError):
     """Raised when a remote transport handshake cannot be framed safely."""
 
 
+_VIRTUALBOX_STARTUP_BLOCK_RE = re.compile(
+    rb"^VBoxManage: Failed to create the VirtualBox object\r?\n"
+    rb"Document is empty\r?\n"
+    rb"[^\r\n]*/\.config/VirtualBox/VirtualBox\.xml, line 1\r?\n"
+    rb"NS_ERROR_FAILURE(?:\r?\n|$)",
+    re.MULTILINE,
+)
+
+
+def strip_virtualbox_startup_noise(data: bytes) -> bytes:
+    """Remove only complete known VirtualBox login-hook blocks."""
+
+    return _VIRTUALBOX_STARTUP_BLOCK_RE.sub(b"", data)
+
+
 class PrefixFrame:
     """Discard a bounded byte prefix through a marker, then pass bytes unchanged."""
 
@@ -51,11 +66,12 @@ class PrefixFrame:
         self.max_prefix_bytes = max_prefix_bytes
         self.ready = False
         self.prefix = b""
+        self._prefix_captured = False
         self._buffer = bytearray()
 
     @property
     def captured_prefix(self) -> bytes:
-        return self.prefix if self.ready else bytes(self._buffer)
+        return self.prefix if self._prefix_captured else bytes(self._buffer)
 
     def feed(self, data: bytes) -> bytes:
         if self.ready:
@@ -63,13 +79,14 @@ class PrefixFrame:
         self._buffer.extend(data)
         index = self._buffer.find(self.marker)
         if index >= 0:
+            self.prefix = bytes(self._buffer[:index])
+            self._prefix_captured = True
+            payload = bytes(self._buffer[index + len(self.marker) :])
+            self._buffer.clear()
             if index > self.max_prefix_bytes:
                 raise FrameError(
                     f"startup output exceeded {self.max_prefix_bytes} bytes before the transport handshake"
                 )
-            self.prefix = bytes(self._buffer[:index])
-            payload = bytes(self._buffer[index + len(self.marker) :])
-            self._buffer.clear()
             self.ready = True
             return payload
 
@@ -236,11 +253,11 @@ def _write_all(stream: BinaryIO, data: bytes) -> None:
 
 
 def _preview(data: bytes, limit: int = 512) -> str:
-    clipped = data[:limit]
-    text = clipped.decode("utf-8", errors="backslashreplace")
-    if len(data) > limit:
-        text += f"... ({len(data) - limit} more bytes)"
-    return text
+    text = strip_virtualbox_startup_noise(data).decode("utf-8", errors="backslashreplace")
+    clipped = text[:limit]
+    if len(text) > limit:
+        clipped += f"... ({len(text) - limit} more characters)"
+    return clipped
 
 
 def _stop_child(process: subprocess.Popen[bytes]) -> None:
@@ -440,11 +457,13 @@ def _proxy(
             signal.signal(signum, previous)
 
     if failure is not None:
-        details = [f"ucl rsync transport failed: {failure}"]
+        details = [f"ucl remote transport failed: {failure}"]
         for name in ("stdout", "stderr"):
             prefix = frames[name].captured_prefix
             if prefix:
-                details.append(f"remote {name} before handshake: {_preview(prefix)}")
+                preview = _preview(prefix)
+                if preview.strip():
+                    details.append(f"remote {name} before handshake: {preview}")
         try:
             _write_all(sys.stderr.buffer, ("\n".join(details) + "\n").encode("utf-8"))
         except BrokenPipeError:
@@ -505,7 +524,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             max_prefix_bytes=options.max_prefix_bytes,
         )
     except FrameError as exc:
-        print(f"ucl rsync transport: {exc}", file=sys.stderr)
+        print(f"ucl remote transport: {exc}", file=sys.stderr)
         return 255
 
 

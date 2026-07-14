@@ -183,7 +183,8 @@ def test_ssh_argv_construction_is_list_argv_with_no_local_shell_tokens() -> None
 
     assert isinstance(argv, list)
     assert all(isinstance(part, str) for part in argv)
-    assert argv[0] == "ssh"
+    assert argv[0] == "python3"
+    assert "--logical-argv" in argv
     assert "barbury-l" in argv
     assert argv[-2:] == ["python3", "-"]
     assert "shell=True" not in argv

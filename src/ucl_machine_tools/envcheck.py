@@ -109,6 +109,5 @@ def run_env_check(
     )
     if int(getattr(proc, "returncode", 1)) != 0:
         detail = (getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip()
-        detail = "\n".join(line for line in detail.splitlines() if "VBoxManage" not in line and "VirtualBox" not in line).strip()
         raise RuntimeError(detail or f"remote env check failed on {host.name}")
     return parse_env_output(getattr(proc, "stdout", "") or "")

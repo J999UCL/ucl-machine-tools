@@ -17,6 +17,7 @@ import pytest
 
 from ucl_machine_tools import copy as copy_tools
 from ucl_machine_tools import envcheck, job_control, launch, main_cli
+from ucl_machine_tools import ssh as ssh_tools
 from ucl_machine_tools.registry import RunRecord, read_record, write_record
 
 
@@ -110,10 +111,7 @@ def stop_stdout(*, status: str = "stopped", ok_result: bool = True, **extra: Any
 
 
 def remote_python_argv(host: str = "barbury-l", *, timeout_seconds: int | None = None) -> list[str]:
-    argv = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR"]
-    if timeout_seconds is not None:
-        argv += ["-o", f"ConnectTimeout={timeout_seconds}"]
-    return [*argv, host, "python3", "-"]
+    return ssh_tools.build_remote_python_argv(host, timeout_seconds=timeout_seconds)
 
 
 def inventory_stdout(host: str = "barbury-l", *, busy: bool = False) -> str:
@@ -576,8 +574,8 @@ def test_ucl_exec_sync_accepts_multiple_hosts_with_delimiter(
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
         if argv[-2:] == ["python3", "-"]:
-            assert "-o" in argv
-            assert "ConnectTimeout=30" in argv
+            assert "--handshake-timeout" in argv
+            assert argv[argv.index("--handshake-timeout") + 1] == "30.0"
             host = argv[-3]
             params = embedded_exec_params(kwargs["input"])
             assert params["argv"] == ["hostname"]
@@ -671,7 +669,7 @@ def test_ucl_exec_sync_supports_options_cwd_json_timeout_and_gpu_auto(
         calls.append(argv)
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        if argv == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=8", "barbury-l", "python3", "-"]:
+        if argv == remote_python_argv(timeout_seconds=8):
             return ok(stdout=inventory_stdout())
         if argv == remote_python_argv(timeout_seconds=30):
             source = kwargs["input"]
@@ -917,7 +915,7 @@ def test_ucl_exec_sync_json_includes_wrapper_error(capsys: pytest.CaptureFixture
     assert payload["stderr"] == "unknown wrapper error\n"
 
 
-def test_ucl_exec_json_is_clean_for_ssh_failure(capsys: pytest.CaptureFixture[str]) -> None:
+def test_ucl_exec_json_preserves_post_frame_failure_output(capsys: pytest.CaptureFixture[str]) -> None:
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
@@ -934,7 +932,7 @@ def test_ucl_exec_json_is_clean_for_ssh_failure(capsys: pytest.CaptureFixture[st
     assert payload["wrapper_error"] is True
     assert payload["returncode"] == 255
     assert "SSH failed before remote exec wrapper started" in payload["error"]
-    assert "VBoxManage" not in payload["stdout"]
+    assert payload["stdout"] == "VBoxManage noise\n"
 
 
 def test_ucl_exec_json_reports_command_failure_without_human_text(capsys: pytest.CaptureFixture[str]) -> None:
@@ -955,7 +953,7 @@ def test_ucl_exec_json_reports_command_failure_without_human_text(capsys: pytest
     assert payload["stderr"] == "bad\n"
 
 
-def test_ucl_exec_sync_filters_wrapper_startup_noise_from_errors(capsys: pytest.CaptureFixture[str]) -> None:
+def test_ucl_exec_sync_preserves_post_frame_wrapper_errors(capsys: pytest.CaptureFixture[str]) -> None:
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
@@ -966,8 +964,8 @@ def test_ucl_exec_sync_filters_wrapper_startup_noise_from_errors(capsys: pytest.
     assert main_cli.main(["exec", "barbury-l", "hostname"], runner=runner) == 2
 
     err = capsys.readouterr().err
-    assert "VBoxManage" not in err
-    assert "no stderr/stdout" in err
+    assert "VBoxManage: noisy startup failure" in err
+    assert "no stderr/stdout" not in err
 
 
 def test_ucl_exec_sync_stdin_uses_selected_shell(capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1545,12 +1543,7 @@ def test_ucl_tail_live_propagates_nonzero_ssh_exit(
             assert argv == remote_python_argv()
             self.stdin = FakePipe()
             self.stdout = FakePipe(["Last login: wrapper noise\n"])
-            self.stderr = FakePipe(
-                text=(
-                    "VBoxManage: error: wrapper noise\n"
-                    "ssh: connect to host barbury-l: No route to host\n"
-                )
-            )
+            self.stderr = FakePipe(text="ssh: connect to host barbury-l: No route to host\n")
 
         def wait(self) -> int:
             return 255

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import os
 import shlex
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -10,9 +14,11 @@ import pytest
 
 from ucl_machine_tools import copy as copy_tools
 from ucl_machine_tools import main_cli
+from ucl_machine_tools import rsync_transport
 
 
 _FRAMING_HINTS = ("frame", "marker", "sentinel", "magic", "ucl_rsync")
+FAKE_SSH = Path(__file__).parent / "helpers" / "fake_ssh.py"
 
 
 def _unexpected_runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
@@ -326,3 +332,36 @@ def test_copy_dry_run_json_exposes_framed_transport_for_audit(
     assert payload["dry_run"] is True
     assert payload["mode"] == "rsync"
     _assert_framed_rsync(payload["argv"])
+
+
+def test_remote_manifest_survives_multiline_virtualbox_startup_noise(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "ssh").symlink_to(FAKE_SSH)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    remote_file = tmp_path / "payload.bin"
+    remote_file.write_bytes(b"manifest payload")
+    virtualbox = b"\n".join(
+        [
+            b"VBoxManage: Failed to create the VirtualBox object",
+            b"Document is empty",
+            b"/home/user/.config/VirtualBox/VirtualBox.xml, line 1",
+            b"NS_ERROR_FAILURE",
+            b"",
+        ]
+    )
+    monkeypatch.setenv("FAKE_SSH_STDERR_PREFIX_B64", base64.b64encode(virtualbox).decode("ascii"))
+    monkeypatch.setenv("FAKE_SSH_MODE", "run")
+
+    manifest = copy_tools.endpoint_manifest(
+        copy_tools.Endpoint("remote", "fake-host", str(remote_file)),
+        sha256=True,
+        runner=subprocess.run,
+    )
+
+    assert manifest["exists"] is True
+    assert manifest["file_count"] == 1
+    assert manifest["files"][0]["sha256"] == hashlib.sha256(b"manifest payload").hexdigest()

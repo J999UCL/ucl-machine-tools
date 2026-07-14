@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import subprocess
-from typing import Callable
+from typing import Callable, Sequence
+
+from ucl_machine_tools import rsync_transport
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -40,13 +42,30 @@ def build_master_start_argv(master_host: str = "knuckles") -> list[str]:
     return ["ssh", "-MNf", master_host]
 
 
-def build_remote_python_argv(host: str, *, timeout_seconds: int | None = None) -> list[str]:
+def build_remote_argv(
+    host: str,
+    command: Sequence[str],
+    *,
+    timeout_seconds: int | None = None,
+    ssh_executable: str = "ssh",
+) -> list[str]:
     if timeout_seconds is not None and timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
-    argv = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR"]
-    if timeout_seconds is not None:
-        argv += ["-o", f"ConnectTimeout={int(timeout_seconds)}"]
-    return [*argv, host, "python3", "-"]
+    handshake_timeout = (
+        rsync_transport.DEFAULT_HANDSHAKE_TIMEOUT_SECONDS
+        if timeout_seconds is None
+        else float(timeout_seconds)
+    )
+    return rsync_transport.build_transport_argv(
+        host,
+        command,
+        ssh_executable=ssh_executable,
+        handshake_timeout_seconds=handshake_timeout,
+    )
+
+
+def build_remote_python_argv(host: str, *, timeout_seconds: int | None = None) -> list[str]:
+    return build_remote_argv(host, ("python3", "-"), timeout_seconds=timeout_seconds)
 
 
 def ensure_knuckles_master(
@@ -72,6 +91,6 @@ def ensure_knuckles_master(
     if int(getattr(start, "returncode", 1)) != 0:
         stderr = (getattr(start, "stderr", "") or "").strip()
         stdout = (getattr(start, "stdout", "") or "").strip()
-        detail = stderr or stdout or f"exit {getattr(start, 'returncode', 'unknown')}"
+        detail = (stderr or stdout).strip() or f"exit {getattr(start, 'returncode', 'unknown')}"
         raise RuntimeError(f"failed to start SSH master connection for {master_host}: {detail}")
     return "started"
