@@ -6,14 +6,14 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import stat
 import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
+from ucl_machine_tools import rsync_transport
 from ucl_machine_tools.hosts import HostSpec, load_catalog, parse_selector
 from ucl_machine_tools.ssh import build_remote_python_argv
 
@@ -23,8 +23,7 @@ MANIFEST_BEGIN = "UCL_COPY_MANIFEST_BEGIN"
 MANIFEST_END = "UCL_COPY_MANIFEST_END"
 LINK_BEGIN = "UCL_COPY_LINK_BEGIN"
 LINK_END = "UCL_COPY_LINK_END"
-RSYNC_SSH = "ssh -o BatchMode=yes -o LogLevel=ERROR"
-SSH_BASE = ("ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR")
+RSYNC_SSH = rsync_transport.build_transport_command()
 SAFE_SELECTOR_RE = re.compile(r"^[A-Za-z0-9_.!,:-]+$")
 PARTIAL_DIR_NAME = ".ucl-rsync-partial"
 
@@ -41,6 +40,8 @@ class Endpoint:
 
     def rsync_spec(self) -> str:
         if self.host is None:
+            if self.path.startswith("-"):
+                return f"./{self.path}"
             return self.path
         return f"{self.host}:{self.path}"
 
@@ -114,6 +115,7 @@ def build_rsync_argv(
     dry_run: bool = False,
     rsync_args: tuple[str, ...] = (),
 ) -> list[str]:
+    validate_rsync_args(rsync_args)
     argv = ["rsync", "-a", "--human-readable", "-e", RSYNC_SSH]
     if partial:
         argv.append("--partial")
@@ -121,7 +123,12 @@ def build_rsync_argv(
         argv.append("--info=progress2")
     if dry_run:
         argv.append("--dry-run")
-    argv += [*rsync_args, src.rsync_spec(), dst.rsync_spec()]
+    if src.is_remote or dst.is_remote:
+        # This is the rsync 3.2.5-compatible spelling of secluded arguments.
+        # The explicit option overrides RSYNC_OLD_ARGS/RSYNC_PROTECT_ARGS.
+        argv.append("--protect-args")
+    argv.extend(rsync_args)
+    argv += ["--", src.rsync_spec(), dst.rsync_spec()]
     return argv
 
 
@@ -144,8 +151,41 @@ def build_remote_to_remote_argv(
         dry_run=dry_run,
         rsync_args=rsync_args,
     )
-    command = " ".join(shlex.quote(part) for part in rsync)
-    return [*SSH_BASE, src.host, "bash", "-lc", shlex.quote(command)]
+    return rsync_transport.build_transport_argv(src.host, rsync)
+
+
+def validate_rsync_args(rsync_args: Sequence[str]) -> None:
+    """Reject options that could replace or contaminate the framed transport."""
+
+    for token in rsync_args:
+        short_options = token[1:] if token.startswith("-") and not token.startswith("--") else ""
+        is_short_rsh = _short_option_before_value(short_options, "e")
+        is_short_remote_option = _short_option_before_value(short_options, "M")
+        is_long_rsh = token == "--rsh" or token.startswith("--rsh=")
+        is_remote_path = token == "--rsync-path" or token.startswith("--rsync-path=")
+        is_long_remote_option = token == "--remote-option" or token.startswith("--remote-option=")
+        disables_safe_args = token in {"--old-args", "--no-s", "--no-secluded-args", "--no-protect-args"}
+        if (
+            token == "--"
+            or is_short_rsh
+            or is_short_remote_option
+            or is_long_rsh
+            or is_remote_path
+            or is_long_remote_option
+            or disables_safe_args
+        ):
+            raise ValueError(f"raw rsync argument {token!r} cannot override ucl's framed transport")
+
+
+def _short_option_before_value(options: str, target: str) -> bool:
+    """Find a short option before an attached-value option consumes the suffix."""
+
+    for option in options:
+        if option == target:
+            return True
+        if option in {"B", "T", "f"}:
+            return False
+    return False
 
 
 def manifest_source(path: str, *, sha256: bool) -> str:

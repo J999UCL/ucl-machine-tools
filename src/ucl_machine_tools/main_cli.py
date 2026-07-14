@@ -444,7 +444,9 @@ def _build_copy_parser() -> argparse.ArgumentParser:
         description="Copy paths with rsync, or reconcile them with pre/post verification.",
         epilog=(
             "Use '--verify sha256' to hash both sides, skip exact files, transfer only missing/mismatched files, "
-            "and retry verification failures. Raw rsync args after '--' are available only without --verify."
+            "and retry verification failures. Remote copies use a framed SSH transport that removes only startup "
+            "output before rsync begins. Raw rsync args after '--' are available only without --verify, but cannot "
+            "replace the protected transport or inject remote-side rsync options."
         ),
     )
     parser.add_argument("src")
@@ -1780,6 +1782,8 @@ def _render_copy_payload(payload: dict[str, Any], *, json_output: bool) -> None:
         print(payload["stdout"], end="")
     if payload.get("stderr"):
         print(payload["stderr"], file=sys.stderr, end="")
+    if payload.get("error"):
+        print(f"error: {payload['error']}", file=sys.stderr)
     plan = payload.get("plan")
     if plan:
         print(
@@ -1842,8 +1846,10 @@ def _run_plain_copy(
         "mode": mode,
         "argv": argv,
         "returncode": int(getattr(proc, "returncode", 1)),
-        "stdout": _strip_remote_noise(getattr(proc, "stdout", "") or ""),
-        "stderr": _strip_remote_noise(getattr(proc, "stderr", "") or ""),
+        # The framed rsync transport has already removed only pre-handshake
+        # startup output. Everything after that boundary is rsync output.
+        "stdout": getattr(proc, "stdout", "") or "",
+        "stderr": getattr(proc, "stderr", "") or "",
         "dry_run": False,
         "plan": None,
         "attempts": [],
@@ -1880,6 +1886,41 @@ def _verify_message(
     if message == "ok":
         return "sha256 manifest differs" if sha256 else "size/path manifest differs"
     return message
+
+
+def _render_reconciled_copy_error(
+    args: argparse.Namespace,
+    *,
+    src: copy_tools.Endpoint,
+    dst: copy_tools.Endpoint,
+    mode: str,
+    plan: dict[str, Any],
+    attempts: list[dict[str, Any]],
+    error: Exception,
+) -> int:
+    payload = {
+        "ok": False,
+        "src": args.src,
+        "dst": args.dst,
+        "resolved_src": src.rsync_spec(),
+        "resolved_dst": dst.rsync_spec(),
+        "reuse_from": args.reuse_from,
+        "mode": mode,
+        "argv": attempts[-1]["argv"] if attempts else [],
+        "returncode": 2,
+        "stdout": "".join(str(attempt["stdout"]) for attempt in attempts),
+        "stderr": "".join(str(attempt["stderr"]) for attempt in attempts),
+        "error": str(error),
+        "plan": plan,
+        "attempts": attempts,
+        "verify": {
+            "mode": args.verify,
+            "ok": False,
+            "message": "post-transfer verification failed",
+        },
+    }
+    _render_copy_payload(payload, json_output=args.json)
+    return 2
 
 
 def _run_reconciled_copy(
@@ -2033,7 +2074,29 @@ def _run_reconciled_copy(
         )
         input_data = copy_tools.files_from_input(pending) if source_is_directory else None
         proc = runner(argv, input=input_data, capture_output=True, text=True, shell=False)
-        final_manifest = _copy_endpoint_manifest(dst, verify=args.verify, runner=runner)
+        attempt = {
+            "attempt": attempt_number,
+            "paths": list(pending),
+            "argv": argv,
+            "returncode": int(getattr(proc, "returncode", 1)),
+            "stdout": getattr(proc, "stdout", "") or "",
+            "stderr": getattr(proc, "stderr", "") or "",
+            "remaining": list(pending),
+        }
+        attempts.append(attempt)
+        try:
+            final_manifest = _copy_endpoint_manifest(dst, verify=args.verify, runner=runner)
+        except Exception as exc:  # Preserve the completed transfer's diagnostics.
+            attempt["verification_error"] = str(exc)
+            return _render_reconciled_copy_error(
+                args,
+                src=src,
+                dst=dst,
+                mode=mode,
+                plan=plan,
+                attempts=attempts,
+                error=exc,
+            )
         final_diff = copy_tools.endpoint_diff(
             source_manifest,
             final_manifest,
@@ -2044,22 +2107,23 @@ def _run_reconciled_copy(
             final_diff,
             enabled=bool(args.partial and source_is_directory),
         )
-        attempts.append(
-            {
-                "attempt": attempt_number,
-                "paths": list(pending),
-                "argv": argv,
-                "returncode": int(getattr(proc, "returncode", 1)),
-                "stdout": _strip_remote_noise(getattr(proc, "stdout", "") or ""),
-                "stderr": _strip_remote_noise(getattr(proc, "stderr", "") or ""),
-                "remaining": list(final_diff.transfer_paths),
-            }
-        )
+        attempt["remaining"] = list(final_diff.transfer_paths)
         pending = final_diff.transfer_paths
         if not pending:
             break
 
-    final_source_snapshot = _copy_endpoint_manifest(src, verify=args.verify, runner=runner)
+    try:
+        final_source_snapshot = _copy_endpoint_manifest(src, verify=args.verify, runner=runner)
+    except Exception as exc:
+        return _render_reconciled_copy_error(
+            args,
+            src=src,
+            dst=dst,
+            mode=mode,
+            plan=plan,
+            attempts=attempts,
+            error=exc,
+        )
     source_stable = copy_tools.source_snapshot_stable(
         source_manifest,
         final_source_snapshot,

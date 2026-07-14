@@ -2109,13 +2109,35 @@ def test_ucl_copy_dry_run_and_size_verify(
             return ok()
         assert argv[0] == "rsync"
         shutil.copy2(src / "a.txt", dst / "a.txt")
-        return ok(stdout="copied\n", stderr="VBoxManage: noisy login\n")
+        return ok(stdout="copied\n", stderr="VBoxManage: legitimate rsync diagnostic\n")
 
     assert main_cli.main(["copy", str(src), str(dst), "--verify", "size", "--json"], runner=runner) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is True
     assert payload["verify"]["ok"] is True
-    assert "VBoxManage" not in payload["stderr"]
+    assert payload["stderr"] == "VBoxManage: legitimate rsync diagnostic\n"
+
+
+def test_ucl_plain_copy_preserves_noise_like_post_handshake_output(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    src = tmp_path / "src.txt"
+    dst = tmp_path / "dst.txt"
+    src.write_text("payload", encoding="utf-8")
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        assert kwargs.get("shell", False) is False
+        assert argv[0] == "rsync"
+        return ok(
+            stdout="VirtualBox is ordinary rsync stdout\n",
+            stderr="VBoxManage is ordinary rsync stderr\n",
+        )
+
+    assert main_cli.main(["copy", str(src), str(dst), "--json"], runner=runner) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stdout"] == "VirtualBox is ordinary rsync stdout\n"
+    assert payload["stderr"] == "VBoxManage is ordinary rsync stderr\n"
 
 
 def test_ucl_copy_passes_raw_rsync_args_after_delimiter(
@@ -2152,11 +2174,12 @@ def test_ucl_copy_passes_raw_rsync_args_after_delimiter(
         copy_tools.RSYNC_SSH,
         "--info=progress2",
         "--dry-run",
-        "--exclude",
-        "*.pt",
-        "--dry-run",
-        str(src),
-        str(dst),
+            "--exclude",
+            "*.pt",
+            "--dry-run",
+            "--",
+            str(src),
+            str(dst),
     ]
 
 
@@ -2244,13 +2267,13 @@ def test_ucl_copy_remote_to_remote_runs_rsync_from_source_host(
         assert kwargs.get("shell", False) is False
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
-        assert argv[:6] == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR"]
-        assert argv[6] == "barbury.internal"
-        assert argv[7:9] == ["bash", "-lc"]
-        inner = shlex.split(shlex.split(argv[9])[0])
+        assert argv[0] == "python3"
+        assert "barbury.internal" in argv
+        inner = argv[argv.index("rsync") :]
         assert inner[:5] == ["rsync", "-a", "--human-readable", "-e", copy_tools.RSYNC_SSH]
-        assert inner[5:7] == ["--partial", "--exclude"]
-        assert inner[7] == "*.pt"
+        assert inner[5:8] == ["--partial", "--protect-args", "--exclude"]
+        assert inner[8] == "*.pt"
+        assert inner[-3] == "--"
         assert inner[-2:] == ["/tmp/src ' path", "barnacle.internal:/tmp/dst ' path"]
         return ok(stdout="copied\n")
 

@@ -54,7 +54,7 @@ def _rsync_transport(argv: list[str]) -> str:
 
 def _assert_framed_rsync(argv: list[str], *, self_contained: bool = False) -> None:
     transport = _rsync_transport(argv)
-    assert transport != copy_tools.RSYNC_SSH
+    assert transport != "ssh -o BatchMode=yes -o LogLevel=ERROR"
     _assert_framed_python_invocation(shlex.split(transport), self_contained=self_contained)
 
 
@@ -235,12 +235,23 @@ def test_remote_to_remote_inner_rsync_transport_is_framed_and_self_contained(sel
     [
         ("-e", "ssh"),
         ("-essh",),
+        ("-ave", "ssh"),
+        ("-avessh",),
         ("--rsh", "ssh"),
         ("--rsh=ssh",),
         ("--rsh=",),
         ("--rsync-path", "sudo rsync"),
         ("--rsync-path=sudo rsync",),
         ("--rsync-path=",),
+        ("--old-args",),
+        ("--no-s",),
+        ("--no-secluded-args",),
+        ("--no-protect-args",),
+        ("-M", "--old-args"),
+        ("-aM--old-args",),
+        ("--remote-option", "--old-args"),
+        ("--remote-option=--old-args",),
+        ("--",),
     ],
 )
 def test_copy_rejects_raw_rsync_transport_overrides(
@@ -267,7 +278,39 @@ def test_copy_keeps_benign_raw_rsync_arguments() -> None:
         rsync_args=args.rsync_args,
     )
 
-    assert argv[-len(raw_args) - 2 : -2] == raw_args
+    assert argv[-len(raw_args) - 3 : -3] == raw_args
+    assert argv[-3] == "--"
+
+
+@pytest.mark.parametrize(
+    ("src", "dst"),
+    [
+        (copy_tools.Endpoint("src", None, "/tmp/src"), copy_tools.Endpoint("dst", "remote", "/tmp/dst")),
+        (copy_tools.Endpoint("src", "remote", "/tmp/src"), copy_tools.Endpoint("dst", None, "/tmp/dst")),
+    ],
+)
+def test_remote_copy_forces_protected_arguments_after_raw_options(
+    src: copy_tools.Endpoint,
+    dst: copy_tools.Endpoint,
+) -> None:
+    argv = copy_tools.build_rsync_argv(src, dst, rsync_args=("--exclude", "*.pt"))
+
+    assert argv.count("--protect-args") == 1
+    assert argv.index("--protect-args") < argv.index("--exclude")
+
+
+@pytest.mark.parametrize("raw_arg", ["-T/tmp/cache", "-fmerge,- *.pt"])
+def test_copy_keeps_attached_short_option_values_containing_e(raw_arg: str) -> None:
+    copy_tools.validate_rsync_args((raw_arg,))
+
+
+def test_copy_separates_dash_leading_local_operands_from_options() -> None:
+    argv = copy_tools.build_rsync_argv(
+        copy_tools.parse_endpoint("./-essh"),
+        copy_tools.parse_endpoint("./-destination"),
+    )
+
+    assert argv[-3:] == ["--", "./-essh", "./-destination"]
 
 
 def test_copy_dry_run_json_exposes_framed_transport_for_audit(

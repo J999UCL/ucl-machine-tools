@@ -55,7 +55,13 @@ work.
 - `ucl copy SRC DST [-- RSYNC_ARGS...]` copies between local paths or
   `HOST:/absolute/path` endpoints; host aliases/selectors must resolve to exactly
   one UCL host. For lab-machine-to-lab-machine copies, rsync runs from the source
-  host so data stays inside UCL. With `--verify sha256`, `ucl copy` pre-compares
+  host so data stays inside UCL. Every SSH hop uses a nonce-framed transport:
+  bounded stdout/stderr produced by shell startup is discarded before the remote
+  rsync process starts, after which all bytes are forwarded unchanged. A missing,
+  late, or oversized handshake fails closed and never retries through raw SSH.
+  Remote copies require `python3` and `rsync` in each participating host's
+  non-interactive `PATH`.
+  With `--verify sha256`, `ucl copy` pre-compares
   source and destination, skips exact files, transfers missing or mismatched
   files, verifies the result, and retries as needed. `--retries N` controls the
   retry count. `--reuse-from HOST:/absolute/path` enables same-filesystem
@@ -63,8 +69,11 @@ work.
   Verified directory copies treat `SRC` and `DST` as tree roots, so the contents
   of `SRC` map directly into `DST`; `DST` must not contain source-absent files.
   `--partial` keeps resumable data under `DST/.ucl-rsync-partial`. Raw rsync
-  arguments remain available for unverified copies only. Use `--verify size`
-  when byte-level identity is not required.
+  arguments remain available for unverified copies only. Remote arguments use
+  rsync's protected-argument mode. `-e`, `--rsh`, `--rsync-path`, remote-side
+  options (`-M`/`--remote-option`), legacy argument mode, and options that
+  disable protected arguments are rejected. Use `--verify size` when byte-level
+  identity is not required.
 - `ucl env HOST --remote-root DIR` checks reachability, scratch/root state, TSG
   setup scripts, `/tmp` space, and optional GPU availability.
 - `--gpu auto` on `exec`, `run`, and `env` requires 20 GB free VRAM by default;

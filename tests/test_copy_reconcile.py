@@ -55,6 +55,8 @@ def write_tree(root: Path, files: dict[str, bytes]) -> None:
 def selected_files(argv: list[str], kwargs: dict[str, Any]) -> list[str]:
     if argv[0] == "rsync":
         rsync_argv = argv
+    elif argv[0] == "python3":
+        rsync_argv = argv[argv.index("rsync") :]
     else:
         assert argv[:6] == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR"]
         assert argv[7:9] == ["bash", "-lc"]
@@ -286,6 +288,79 @@ def test_ucl_copy_reconcile_retries_only_files_still_failing_verification(
     assert payload["verify"]["ok"] is True
 
 
+def test_ucl_copy_reconcile_preserves_transfer_output_when_post_verify_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = manifest({"payload.bin": b"payload"})
+    destination = manifest({})
+    monkeypatch.setattr(
+        main_cli,
+        "_read_reconcile_manifests",
+        lambda *args, **kwargs: {"source": source, "destination": destination},
+    )
+    monkeypatch.setattr(
+        main_cli,
+        "_copy_endpoint_manifest",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("manifest helper lost connection")),
+    )
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        del argv, kwargs
+        return ok(
+            stdout="VirtualBox is legitimate transfer stdout\n",
+            stderr="VBoxManage is legitimate transfer stderr\n",
+        )
+
+    rc = main_cli.main(
+        ["copy", "/tmp/source", "/tmp/destination", "--verify", "sha256", "--json"],
+        runner=runner,
+    )
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stdout"] == "VirtualBox is legitimate transfer stdout\n"
+    assert payload["stderr"] == "VBoxManage is legitimate transfer stderr\n"
+    assert len(payload["attempts"]) == 1
+    assert payload["attempts"][0]["verification_error"] == "manifest helper lost connection"
+    assert payload["verify"]["message"] == "post-transfer verification failed"
+    assert payload["error"] == "manifest helper lost connection"
+
+
+def test_ucl_copy_human_error_reports_transfer_output_and_verification_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = manifest({"payload.bin": b"payload"})
+    destination = manifest({})
+    monkeypatch.setattr(
+        main_cli,
+        "_read_reconcile_manifests",
+        lambda *args, **kwargs: {"source": source, "destination": destination},
+    )
+    monkeypatch.setattr(
+        main_cli,
+        "_copy_endpoint_manifest",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("manifest helper lost connection")),
+    )
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        del argv, kwargs
+        return ok(stdout="transfer stdout\n", stderr="transfer stderr\n")
+
+    rc = main_cli.main(
+        ["copy", "/tmp/source", "/tmp/destination", "--verify", "sha256"],
+        runner=runner,
+    )
+
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert "transfer stdout\n" in captured.out
+    assert "verify: post-transfer verification failed\n" in captured.out
+    assert "transfer stderr\n" in captured.err
+    assert "error: manifest helper lost connection\n" in captured.err
+
+
 def test_ucl_copy_reconcile_dry_run_reports_plan_without_mutating_or_transferring(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -340,16 +415,9 @@ def test_ucl_copy_reconcile_remote_to_remote_manifests_and_transfer_stay_on_endp
             payload = destination_before if destination_reads == 0 else destination_after
             destination_reads += 1
             return ok(stdout=manifest_stdout(payload))
-        assert argv[:7] == [
-            "ssh",
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "LogLevel=ERROR",
-            "barbury.internal",
-        ]
-        transfer_hosts.append(argv[6])
+        assert argv[0] == "python3"
+        assert "barbury.internal" in argv
+        transfer_hosts.append("barbury.internal")
         transfers.append(selected_files(argv, kwargs))
         return ok()
 
