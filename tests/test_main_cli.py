@@ -1383,8 +1383,9 @@ def test_ucl_tail_live_streams_and_filters_only_startup_noise(
         def readline(self) -> str:
             return self.lines.pop(0) if self.lines else ""
 
-        def read(self) -> str:
-            return self.text
+        def read(self, size: int = -1) -> str:
+            text, self.text = self.text, ""
+            return text
 
     class FakeFollowPopen:
         def __init__(self, argv: list[str], **kwargs: Any) -> None:
@@ -1398,7 +1399,7 @@ def test_ucl_tail_live_streams_and_filters_only_startup_noise(
                     "actual log mentions VirtualBox\n",
                 ]
             )
-            self.stderr = FakePipe(text="VBoxManage: error: stderr noise\n")
+            self.stderr = FakePipe(text="VBoxManage from the remote command\n")
 
         def wait(self) -> int:
             return 0
@@ -1415,7 +1416,7 @@ def test_ucl_tail_live_streams_and_filters_only_startup_noise(
 
     captured = capsys.readouterr()
     assert captured.out == "actual follow line\nactual log mentions VirtualBox\n"
-    assert "VBoxManage" not in captured.err
+    assert captured.err == "VBoxManage from the remote command\n"
 
 
 def test_ucl_tail_help_documents_live_streaming(capsys: pytest.CaptureFixture[str]) -> None:
@@ -1464,8 +1465,9 @@ def test_ucl_tail_live_streams_incrementally_without_filtering_log_content(
                 output_before_next_line.append(capsys.readouterr().out)
             return self.lines.pop(0) if self.lines else ""
 
-        def read(self) -> str:
-            return self.text
+        def read(self, size: int = -1) -> str:
+            text, self.text = self.text, ""
+            return text
 
     class FakeLivePopen:
         def __init__(self, argv: list[str], **kwargs: Any) -> None:
@@ -1480,7 +1482,7 @@ def test_ucl_tail_live_streams_incrementally_without_filtering_log_content(
                     "training log mentions VBoxManage as data\n",
                 ]
             )
-            self.stderr = FakePipe(text="VirtualBox wrapper warning\n")
+            self.stderr = FakePipe()
 
         def wait(self) -> int:
             return 0
@@ -1499,6 +1501,80 @@ def test_ucl_tail_live_streams_incrementally_without_filtering_log_content(
     assert output_before_next_line == ["first live log line\n"]
     assert captured.out == "training log mentions VBoxManage as data\n"
     assert captured.err == ""
+
+
+def test_ucl_tail_live_drains_stderr_concurrently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import threading
+
+    monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
+    write_record(
+        RunRecord(
+            run_id="demo",
+            kind="exec",
+            host="barbury-l",
+            ssh_host="barbury-l",
+            session="demo",
+            window="exec_demo",
+            remote_dir="/tmp/ucl-machine-tools/launchers/demo",
+            log_path="/tmp/ucl-machine-tools/launchers/demo/run.log",
+            command=("hostname",),
+        )
+    )
+    stderr_read_started = threading.Event()
+
+    class InputPipe:
+        def write(self, value: str) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    class StdoutPipe:
+        def __init__(self) -> None:
+            self.lines = [main_cli.TAIL_SENTINEL_BEGIN + "\n", "live output\n"]
+
+        def readline(self) -> str:
+            assert stderr_read_started.wait(timeout=1), "stderr was not drained concurrently"
+            return self.lines.pop(0) if self.lines else ""
+
+    class StderrPipe:
+        def __init__(self) -> None:
+            self.emitted = False
+
+        def read(self, size: int = -1) -> str:
+            stderr_read_started.set()
+            if self.emitted:
+                return ""
+            self.emitted = True
+            return "remote stderr\n"
+
+    class FakeLivePopen:
+        def __init__(self, argv: list[str], **kwargs: Any) -> None:
+            assert argv == remote_python_argv()
+            self.stdin = InputPipe()
+            self.stdout = StdoutPipe()
+            self.stderr = StderrPipe()
+
+        def wait(self) -> int:
+            return 0
+
+        def terminate(self) -> None:
+            pass
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert main_cli.main(["tail", "demo", "--live"], runner=runner, popener=FakeLivePopen) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == "live output\n"
+    assert captured.err == "remote stderr\n"
 
 
 def test_ucl_tail_live_propagates_nonzero_ssh_exit(
@@ -1535,8 +1611,9 @@ def test_ucl_tail_live_propagates_nonzero_ssh_exit(
         def readline(self) -> str:
             return self.lines.pop(0) if self.lines else ""
 
-        def read(self) -> str:
-            return self.text
+        def read(self, size: int = -1) -> str:
+            text, self.text = self.text, ""
+            return text
 
     class FakeFailedLivePopen:
         def __init__(self, argv: list[str], **kwargs: Any) -> None:

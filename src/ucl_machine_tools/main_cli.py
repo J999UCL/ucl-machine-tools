@@ -1374,6 +1374,15 @@ raise SystemExit(subprocess.call(["tail", "-n", str(LINES), "-f", PATH]))
 """
 
 
+def _forward_text_stream(stream: Any, destination: Any) -> None:
+    while True:
+        chunk = stream.read(8192)
+        if chunk == "":
+            return
+        destination.write(chunk)
+        destination.flush()
+
+
 def _ssh_python_argv(host: str, *, connect_timeout: int | None = None) -> list[str]:
     timeout = None if connect_timeout in (None, 0) else int(connect_timeout)
     return build_remote_python_argv(host, timeout_seconds=timeout)
@@ -1390,31 +1399,36 @@ def run_tail(args: argparse.Namespace, *, runner=subprocess.run, popener=subproc
             stderr=subprocess.PIPE,
             text=True,
         )
-        if proc.stdin is None or proc.stdout is None:
+        if proc.stdin is None or proc.stdout is None or proc.stderr is None:
             raise RuntimeError("failed to open remote tail pipes")
         proc.stdin.write(_tail_follow_source(record.log_path, int(args.lines)))
         proc.stdin.close()
         started = False
-        try:
-            while True:
-                line = proc.stdout.readline()
-                if line == "":
-                    break
-                if not started:
-                    if line.strip() == TAIL_SENTINEL_BEGIN:
-                        started = True
-                    continue
-                print(line, end="", flush=True)
-        except KeyboardInterrupt:
-            proc.terminate()
-            return 130
-        returncode = int(proc.wait())
-        stderr = ""
-        if proc.stderr is not None:
-            stderr = proc.stderr.read()
-        if returncode != 0 and stderr:
-            print(stderr, file=sys.stderr, end="")
-        return returncode
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="ucl-tail-stderr") as executor:
+            stderr_forward = executor.submit(_forward_text_stream, proc.stderr, sys.stderr)
+            try:
+                while True:
+                    line = proc.stdout.readline()
+                    if line == "":
+                        break
+                    if not started:
+                        if line.strip() == TAIL_SENTINEL_BEGIN:
+                            started = True
+                        continue
+                    print(line, end="", flush=True)
+            except KeyboardInterrupt:
+                proc.terminate()
+                proc.wait()
+                stderr_forward.result()
+                return 130
+            except BaseException:
+                proc.terminate()
+                proc.wait()
+                stderr_forward.result()
+                raise
+            returncode = int(proc.wait())
+            stderr_forward.result()
+            return returncode
     proc = runner(
         _ssh_python_argv(record.ssh_host),
         input=_tail_source(record.log_path, int(args.lines)),
