@@ -245,6 +245,40 @@ def test_ucl_status_routes_inventory_json(capsys: pytest.CaptureFixture[str]) ->
     assert calls[0] == ["ssh", "-O", "check", "knuckles"]
 
 
+def test_ucl_status_human_output_streams_rows_in_completion_order(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    canada = main_cli.inventory.parse_sentinel_stdout(inventory_stdout("canada-l", busy=True))
+    canada["status"] = "busy"
+    barbury = main_cli.inventory.parse_sentinel_stdout(inventory_stdout("barbury-l"))
+    barbury["status"] = "ready"
+    completed = [canada, barbury]
+
+    def fake_collect(hosts: Any, *, on_result: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        assert on_result is not None
+        for row in completed:
+            on_result(row)
+        return list(reversed(completed))
+
+    monkeypatch.setattr(main_cli.inventory, "collect", fake_collect)
+    monkeypatch.setattr(main_cli, "ensure_knuckles_master", lambda **kwargs: "existing")
+
+    assert main_cli.main(["status", "barbury-l", "canada-l"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+
+    assert lines[0].startswith("host")
+    assert lines[1].startswith("canada-l")
+    assert lines[2].startswith("barbury-l")
+
+
+def test_ucl_status_uses_fast_parallel_defaults() -> None:
+    args = main_cli.build_parser().parse_args(["status", "all"])
+
+    assert args.jobs == 32
+    assert args.timeout_seconds == 5
+
+
 def test_ucl_status_accepts_multiple_positional_targets(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

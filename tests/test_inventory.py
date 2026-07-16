@@ -222,6 +222,39 @@ def test_collect_uses_fake_runner_with_list_argv_and_no_shell() -> None:
     assert rows[0]["status"] == "ready"
 
 
+def test_collect_reports_completion_order_but_returns_catalog_order() -> None:
+    import threading
+
+    remote_hosts, remote_inventory, _ = import_toolkit()
+    catalog = make_catalog(remote_hosts)
+    hosts = [catalog["barbury-l"], catalog["barbury-m"]]
+    second_completed = threading.Event()
+    completed: list[str] = []
+
+    def fake_runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        host = argv[-3]
+        if host == "barbury-l":
+            assert second_completed.wait(timeout=1)
+        else:
+            second_completed.set()
+        return ok(
+            stdout=sentinel_stdout(
+                remote_inventory,
+                inventory_payload(host=host, gpus=[gpu()], filesystems=[tmp_fs()]),
+            )
+        )
+
+    rows = remote_inventory.collect(
+        hosts,
+        runner=fake_runner,
+        jobs=2,
+        on_result=lambda row: completed.append(str(row["host"])),
+    )
+
+    assert completed == ["barbury-m", "barbury-l"]
+    assert [row["host"] for row in rows] == ["barbury-l", "barbury-m"]
+
+
 def test_sentinel_parser_ignores_login_noise_and_rejects_missing_sentinel() -> None:
     _, remote_inventory, _ = import_toolkit()
     payload = inventory_payload(host="barbury-l", gpus=[gpu()], filesystems=[tmp_fs()])
@@ -329,6 +362,20 @@ def test_human_table_formatting_is_plain_text_and_scan_friendly() -> None:
     assert "fpt" not in table.lower()
     assert "{" not in table
     assert "\x1b" not in table
+
+
+def test_stream_table_uses_stable_columns() -> None:
+    _, remote_inventory, _ = import_toolkit()
+    row = {**inventory_payload(host="barbury-l", gpus=[gpu()], filesystems=[tmp_fs(512.0)]), "status": "ready"}
+
+    header = remote_inventory.format_stream_header()
+    rendered = remote_inventory.format_stream_row(row)
+
+    assert header.startswith("host")
+    assert "status" in header
+    assert rendered.startswith("barbury-l")
+    assert "ready" in rendered
+    assert "RTX 4060 Ti" in rendered
 
 
 def test_json_shape_is_stable_and_counts_statuses() -> None:

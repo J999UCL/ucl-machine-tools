@@ -391,6 +391,7 @@ def collect(
     debug: bool = False,
     min_tmp_free_gb: float = 50.0,
     min_free_vram_gb: float = 4.0,
+    on_result: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[dict[str, Any]]:
     host_list = list(hosts)
     if not host_list:
@@ -415,7 +416,10 @@ def collect(
             for idx, host in enumerate(host_list)
         }
         for future in concurrent.futures.as_completed(futures):
-            rows[futures[future]] = future.result()
+            row = future.result()
+            rows[futures[future]] = row
+            if on_result is not None:
+                on_result(row)
     return [row for row in rows if row is not None]
 
 
@@ -475,33 +479,51 @@ def _note(row: dict[str, Any]) -> str:
     return "-"
 
 
+TABLE_HEADERS = ["host", "status", "gpu", "best_gpu", "vram", "tmp_free", "tmp_scratch", "restart", "ssh", "note"]
+STREAM_WIDTHS = [13, 12, 5, 23, 8, 9, 11, 46, 16]
+
+
+def _table_row(row: dict[str, Any]) -> list[str]:
+    best = _best_gpu(row)
+    best_gpu = "n/a"
+    vram = "n/a"
+    if best is not None:
+        best_gpu = f"{best.get('index', '?')} {_compact_gpu_name(best.get('name'))}"
+        free_mb = best.get("memory_free_mb")
+        if free_mb is None and best.get("memory_total_mb") is not None and best.get("memory_used_mb") is not None:
+            free_mb = best["memory_total_mb"] - best["memory_used_mb"]
+        vram = _fmt_gb((float(free_mb) / 1024) if free_mb is not None else None)
+    return [
+        str(row.get("host", "n/a")),
+        str(row.get("status", "unknown")),
+        _gpu_summary(row),
+        best_gpu,
+        vram,
+        _tmp_summary(row),
+        _scratch_summary(row),
+        str((row.get("restart") or {}).get("text") or "unknown"),
+        str(row.get("ssh_host") or row.get("host") or "n/a"),
+        _note(row),
+    ]
+
+
+def format_stream_header() -> str:
+    return "  ".join(
+        header.ljust(STREAM_WIDTHS[idx]) if idx < len(STREAM_WIDTHS) else header
+        for idx, header in enumerate(TABLE_HEADERS)
+    )
+
+
+def format_stream_row(row: dict[str, Any]) -> str:
+    return "  ".join(
+        value.ljust(STREAM_WIDTHS[idx]) if idx < len(STREAM_WIDTHS) else value
+        for idx, value in enumerate(_table_row(row))
+    )
+
+
 def format_table(rows: list[dict[str, Any]]) -> str:
-    table_rows: list[list[str]] = []
-    for row in rows:
-        best = _best_gpu(row)
-        best_gpu = "n/a"
-        vram = "n/a"
-        if best is not None:
-            best_gpu = f"{best.get('index', '?')} {_compact_gpu_name(best.get('name'))}"
-            free_mb = best.get("memory_free_mb")
-            if free_mb is None and best.get("memory_total_mb") is not None and best.get("memory_used_mb") is not None:
-                free_mb = best["memory_total_mb"] - best["memory_used_mb"]
-            vram = _fmt_gb((float(free_mb) / 1024) if free_mb is not None else None)
-        table_rows.append(
-            [
-                str(row.get("host", "n/a")),
-                str(row.get("status", "unknown")),
-                _gpu_summary(row),
-                best_gpu,
-                vram,
-                _tmp_summary(row),
-                _scratch_summary(row),
-                str((row.get("restart") or {}).get("text") or "unknown"),
-                str(row.get("ssh_host") or row.get("host") or "n/a"),
-                _note(row),
-            ]
-        )
-    headers = ["host", "status", "gpu", "best_gpu", "vram", "tmp_free", "tmp_scratch", "restart", "ssh", "note"]
+    table_rows = [_table_row(row) for row in rows]
+    headers = TABLE_HEADERS
     widths = [len(header) for header in headers]
     for row in table_rows:
         for idx, value in enumerate(row):

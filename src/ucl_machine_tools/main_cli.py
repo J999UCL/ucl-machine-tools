@@ -47,6 +47,8 @@ EXEC_SENTINEL_END = "UCL_EXEC_JSON_END"
 ERROR_SNIPPET_CHARS = 800
 DEFAULT_AUTO_GPU_MIN_FREE_VRAM_GB = 20.0
 TAIL_STOP_TIMEOUT_SECONDS = 5.0
+DEFAULT_STATUS_JOBS = 32
+DEFAULT_STATUS_TIMEOUT_SECONDS = 5
 
 
 class JobIdentityUnreachable(RuntimeError):
@@ -198,8 +200,18 @@ def _add_inventory_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--root", default="/tmp/ucl-machine-tools", help="remote scratch root to check")
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     parser.add_argument("--table", action="store_true", help="emit a human table")
-    parser.add_argument("--jobs", type=int, default=4)
-    parser.add_argument("--timeout-seconds", type=int, default=8)
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=DEFAULT_STATUS_JOBS,
+        help=f"maximum concurrent probes (default: {DEFAULT_STATUS_JOBS})",
+    )
+    parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=DEFAULT_STATUS_TIMEOUT_SECONDS,
+        help=f"per-host SSH handshake timeout (default: {DEFAULT_STATUS_TIMEOUT_SECONDS})",
+    )
     parser.add_argument("--only-free", action="store_true")
     parser.add_argument("--min-free-vram-gb", type=float, default=4.0)
     parser.add_argument("--min-tmp-free-gb", type=float)
@@ -723,6 +735,15 @@ def run_status(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     catalog = load_catalog(args.catalog)
     selected = _resolve_status_targets(targets, catalog=catalog)
     ensure_knuckles_master(runner=runner)
+    stream_human = not (args.json and not args.table) and mode != "recommend"
+    if stream_human:
+        print(inventory.format_stream_header(), flush=True)
+
+    def emit_row(row: dict[str, Any]) -> None:
+        filtered = _filter_status_rows(mode, args, [row])
+        if filtered:
+            print(inventory.format_stream_row(filtered[0]), flush=True)
+
     rows = inventory.collect(
         selected,
         runner=runner,
@@ -733,11 +754,12 @@ def run_status(args: argparse.Namespace, *, runner=subprocess.run) -> int:
         debug=args.debug,
         min_tmp_free_gb=float(args.min_tmp_free_gb) if args.min_tmp_free_gb is not None else 50.0,
         min_free_vram_gb=float(args.min_free_vram_gb),
+        on_result=emit_row if stream_human else None,
     )
     rows = _filter_status_rows(mode, args, rows)
     if args.json and not args.table:
         print(json.dumps(inventory.to_jsonable(rows), indent=2, sort_keys=True))
-    else:
+    elif not stream_human:
         print(inventory.format_table(rows))
     return 0
 

@@ -33,7 +33,10 @@ unchanged, including command output that happens to mention VirtualBox.
 ## Commands
 
 - `ucl status [target]` checks GPU availability, `/tmp` free space,
-  `/tmp/ucl-machine-tools`, and restart policy.
+  `/tmp/ucl-machine-tools`, and restart policy. Human output streams one row as
+  soon as each host responds, using up to 32 concurrent probes and a five-second
+  per-host handshake timeout by default. `--json` remains buffered and catalog
+  ordered for scripts.
 - `ucl doctor HOST` checks one host, tmux visibility, and scratch state.
 - `ucl exec HOST_OR_SELECTOR [HOST_OR_SELECTOR ...] COMMAND...` runs a short
   remote command synchronously. For multiple hosts, use `--` before the command,
