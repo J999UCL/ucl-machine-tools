@@ -131,4 +131,7 @@ only existing tmux session.
 UCL CS TSG says lab PCs regularly reboot on Monday and Thursday evenings between
 7:30pm and midnight, and may be rebooted at any time. The timeshare GPU page
 lists `blaze`, `cream`, and `vanilla`, but does not list that same lab-PC reboot
-window for them.
+window for them. On Monday and Thursday, `ucl status` shows a Europe/London
+countdown for reachable lab PCs. During the active window its restart column
+labels unreachable lab PCs as restarting and warns that reachable hosts may
+shut down at any time.

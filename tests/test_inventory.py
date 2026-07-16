@@ -330,6 +330,66 @@ def test_classification_distinguishes_ready_busy_no_gpu_and_unreachable() -> Non
     assert remote_inventory.classify(inventory_payload(gpus=[gpu()], filesystems=[tmp_fs(2.0)])) == "storage-low"
 
 
+def test_lab_restart_text_counts_down_on_restart_days() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    _, remote_inventory, _ = import_toolkit()
+    now = datetime(2026, 7, 16, 15, 0, tzinfo=ZoneInfo("Europe/London"))
+
+    text = remote_inventory.restart_text("lab_pc", reachable=True, now=now)
+
+    assert text == "warning: host will shut down in 4h 30m and be unavailable until midnight"
+
+
+def test_lab_restart_text_marks_unreachable_hosts_during_window_as_restarting() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    _, remote_inventory, _ = import_toolkit()
+    now = datetime(2026, 7, 16, 20, 15, tzinfo=ZoneInfo("Europe/London"))
+
+    assert (
+        remote_inventory.restart_text("lab_pc", reachable=False, now=now)
+        == "machine restarting; unavailable until midnight"
+    )
+    assert remote_inventory.restart_text("lab_pc", reachable=True, now=now) == (
+        "warning: restart window active; host may shut down at any time and be unavailable until midnight"
+    )
+
+
+def test_restart_text_is_static_outside_lab_window_and_for_timeshare() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    _, remote_inventory, _ = import_toolkit()
+    tuesday = datetime(2026, 7, 14, 20, 15, tzinfo=ZoneInfo("Europe/London"))
+
+    assert remote_inventory.restart_text("lab_pc", reachable=True, now=tuesday) == remote_inventory.LAB_PC_RESTART_TEXT
+    assert (
+        remote_inventory.restart_text("timeshare", reachable=False, now=tuesday)
+        == remote_inventory.TIMESHARE_RESTART_TEXT
+    )
+
+
+def test_unreachable_lab_host_during_window_gets_restart_diagnosis() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    remote_hosts, remote_inventory, _ = import_toolkit()
+    host = make_catalog(remote_hosts)["barbury-l"]
+    now = datetime(2026, 7, 16, 21, 0, tzinfo=ZoneInfo("Europe/London"))
+
+    row = remote_inventory.collect_one(
+        host,
+        runner=lambda argv, **kwargs: SimpleNamespace(returncode=255, stdout="", stderr="connection refused"),
+        now=now,
+    )
+
+    assert row["status"] == "unreachable"
+    assert row["restart"]["text"] == "machine restarting; unavailable until midnight"
+
+
 def test_human_table_formatting_is_plain_text_and_scan_friendly() -> None:
     _, remote_inventory, _ = import_toolkit()
     rows = [

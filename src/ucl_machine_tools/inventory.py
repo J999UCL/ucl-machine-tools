@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import math
 import subprocess
 from collections import Counter
+from datetime import datetime, time, timedelta
 from typing import Any, Callable, Iterable
+from zoneinfo import ZoneInfo
 
 from ucl_machine_tools.hosts import HostSpec
 from ucl_machine_tools.ssh import build_remote_python_argv, describe_ssh_failure
@@ -18,12 +21,52 @@ INVENTORY_SENTINEL_END = "UCL_INVENTORY_JSON_END"
 SCHEMA_VERSION = 1
 LAB_PC_RESTART_TEXT = "Mon/Thu 19:30-midnight; may reboot anytime"
 TIMESHARE_RESTART_TEXT = "no regular lab-PC window listed by TSG"
+LONDON = ZoneInfo("Europe/London")
+LAB_RESTART_WEEKDAYS = {0, 3}
+LAB_RESTART_START = time(19, 30)
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
-def restart_text(policy: str) -> str:
+def _london_time(now: datetime | None) -> datetime:
+    if now is None:
+        return datetime.now(LONDON)
+    if now.tzinfo is None:
+        return now.replace(tzinfo=LONDON)
+    return now.astimezone(LONDON)
+
+
+def _countdown_text(delta: timedelta) -> str:
+    minutes = max(0, math.ceil(delta.total_seconds() / 60))
+    hours, minutes = divmod(minutes, 60)
+    if minutes == 0:
+        return f"{hours}h"
+    return f"{hours}h {minutes}m"
+
+
+def restart_text(
+    policy: str,
+    *,
+    reachable: bool | None = None,
+    now: datetime | None = None,
+) -> str:
     if policy == "lab_pc":
+        if reachable is None:
+            return LAB_PC_RESTART_TEXT
+        current = _london_time(now)
+        if current.weekday() not in LAB_RESTART_WEEKDAYS:
+            return LAB_PC_RESTART_TEXT
+        restart_start = datetime.combine(current.date(), LAB_RESTART_START, tzinfo=LONDON)
+        midnight = datetime.combine(current.date() + timedelta(days=1), time.min, tzinfo=LONDON)
+        if current < restart_start:
+            if reachable:
+                remaining = _countdown_text(restart_start - current)
+                return f"warning: host will shut down in {remaining} and be unavailable until midnight"
+            return LAB_PC_RESTART_TEXT
+        if current < midnight:
+            if reachable:
+                return "warning: restart window active; host may shut down at any time and be unavailable until midnight"
+            return "machine restarting; unavailable until midnight"
         return LAB_PC_RESTART_TEXT
     if policy == "timeshare":
         return TIMESHARE_RESTART_TEXT
@@ -314,6 +357,7 @@ def collect_one(
     debug: bool = False,
     min_tmp_free_gb: float = 50.0,
     min_free_vram_gb: float = 4.0,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     argv = build_ssh_argv(host, timeout_seconds=timeout_seconds)
     probe = build_remote_probe_source(host=host, root=root or host.scratch_root, sizes=sizes)
@@ -327,9 +371,9 @@ def collect_one(
             shell=False,
         )
     except subprocess.TimeoutExpired as exc:
-        return _error_row(host, "ssh-timeout", f"ssh timed out after {exc.timeout}s")
+        return _error_row(host, "ssh-timeout", f"ssh timed out after {exc.timeout}s", now=now)
     except Exception as exc:  # noqa: BLE001 - diagnostic wrapper around user SSH config.
-        return _error_row(host, "ssh-failed", repr(exc))
+        return _error_row(host, "ssh-failed", repr(exc), now=now)
 
     stdout = getattr(proc, "stdout", "") or ""
     stderr = getattr(proc, "stderr", "") or ""
@@ -343,7 +387,7 @@ def collect_one(
         else:
             status = "no-sentinel" if "sentinel not found" in str(exc) else "parse-error"
             message = str(exc)
-        row = _error_row(host, status, message)
+        row = _error_row(host, status, message, reachable=returncode != 255, now=now)
         row["ssh_returncode"] = returncode
         if debug and stderr:
             row["stderr_tail"] = stderr[-500:]
@@ -354,7 +398,10 @@ def collect_one(
     payload["ssh_host"] = host.ssh_host
     payload["expected_gpu_count"] = host.expected_gpu_count
     payload["expected_gpu_name"] = host.expected_gpu_name
-    payload["restart"] = payload.get("restart") or {"policy": host.restart_policy, "text": restart_text(host.restart_policy)}
+    payload["restart"] = {
+        "policy": host.restart_policy,
+        "text": restart_text(host.restart_policy, reachable=True, now=now),
+    }
     if returncode != 0:
         payload.setdefault("errors", []).append(f"ssh exited {returncode}")
     payload["status"] = classify(
@@ -365,7 +412,14 @@ def collect_one(
     return payload
 
 
-def _error_row(host: HostSpec, status: str, message: str) -> dict[str, Any]:
+def _error_row(
+    host: HostSpec,
+    status: str,
+    message: str,
+    *,
+    reachable: bool = False,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "host": host.name,
@@ -375,7 +429,10 @@ def _error_row(host: HostSpec, status: str, message: str) -> dict[str, Any]:
         "gpus": [],
         "filesystems": [],
         "scratch": {"root": host.scratch_root, "exists": False},
-        "restart": {"policy": host.restart_policy, "text": restart_text(host.restart_policy)},
+        "restart": {
+            "policy": host.restart_policy,
+            "text": restart_text(host.restart_policy, reachable=reachable, now=now),
+        },
         "errors": [message],
     }
 
@@ -392,12 +449,14 @@ def collect(
     min_tmp_free_gb: float = 50.0,
     min_free_vram_gb: float = 4.0,
     on_result: Callable[[dict[str, Any]], None] | None = None,
+    now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     host_list = list(hosts)
     if not host_list:
         raise ValueError("at least one host is required")
     if jobs <= 0:
         raise ValueError("jobs must be positive")
+    observed_at = _london_time(now)
 
     rows: list[dict[str, Any] | None] = [None] * len(host_list)
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(jobs, len(host_list))) as executor:
@@ -412,6 +471,7 @@ def collect(
                 debug=debug,
                 min_tmp_free_gb=min_tmp_free_gb,
                 min_free_vram_gb=min_free_vram_gb,
+                now=observed_at,
             ): idx
             for idx, host in enumerate(host_list)
         }
