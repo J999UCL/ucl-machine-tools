@@ -100,7 +100,7 @@ def csh_setenv_lines(env: Iterable[tuple[str, str]]) -> list[str]:
 
 def utc_run_id(stem: str) -> str:
     safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in stem).strip("._-") or "run"
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     return f"{safe}_{timestamp}"
 
 
@@ -385,6 +385,7 @@ def _bash_csh_launcher_source(plan: RemoteJobPlan) -> str:
 def _csh_payload_source(plan: RemoteJobPlan) -> str:
     lines = [
         "#!/bin/csh -f",
+        "unset histchars",
         f"cd {shlex.quote(plan.work_dir)}",
         *csh_setenv_lines(plan.env),
         "echo '[ucl] run'",

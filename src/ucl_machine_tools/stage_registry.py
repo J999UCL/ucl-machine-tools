@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 import fcntl
@@ -11,14 +12,14 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import tempfile
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 
 _STAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SAFE_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _UV_VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:[-+][A-Za-z0-9.-]+)?$")
-_PYTHON_REQUEST_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
+_PYTHON_REQUEST_PATTERN = re.compile(r"^(?:(?:cpython|pypy)-)?[0-9]+\.[0-9]+\.[0-9]+$")
 _STAGE_STATUSES = frozenset(
     {"unknown", "planned", "preparing", "ready", "failed", "launch_failed"}
 )
@@ -34,11 +35,11 @@ _REQUIRED_FIELDS = (
     "cache_path",
     "source_hash",
     "lock_hash",
-    "setup_environment_hash",
     "uv_version",
     "python_request",
 )
 _ADDITIVE_DEFAULTS: dict[str, Any] = {
+    "setup_environment_hash": "0" * 64,
     "python_path": "",
     "state_path": "",
     "setup_run_id": "",
@@ -73,9 +74,9 @@ class StageRecord:
     cache_path: str
     source_hash: str
     lock_hash: str
-    setup_environment_hash: str
     uv_version: str
     python_request: str
+    setup_environment_hash: str = "0" * 64
     python_path: str = ""
     state_path: str = ""
     setup_run_id: str = ""
@@ -98,6 +99,33 @@ def registry_root() -> Path:
     if base:
         return Path(base).expanduser() / "stages"
     return Path("~/.cache/ucl-machine-tools/stages").expanduser()
+
+
+@contextmanager
+def claim_stage(stage_id: str, *, root: Path | None = None) -> Iterator[None]:
+    """Serialize local reconciliation and launch decisions for one stage identity."""
+
+    _validate_stage_id(stage_id)
+    target_root = root or registry_root()
+    claims_root = target_root / "claims"
+    claims_root.mkdir(parents=True, exist_ok=True)
+    claim_path = claims_root / f"{stage_id}.lock"
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(claim_path, flags, 0o600)
+    except OSError as error:
+        raise RuntimeError(f"unable to claim stage {stage_id}: {error}") from error
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def _validate_stage_id(stage_id: str) -> None:

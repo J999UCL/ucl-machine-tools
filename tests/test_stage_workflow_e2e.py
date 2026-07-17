@@ -69,7 +69,7 @@ source = { virtual = "." }
 """,
         encoding="utf-8",
     )
-    (project / ".python-version").write_text("3.11\n", encoding="utf-8")
+    (project / ".python-version").write_text("3.11.5\n", encoding="utf-8")
     scripts = project / "scripts"
     scripts.mkdir()
     run_script = scripts / "run.sh"
@@ -233,6 +233,17 @@ class FakeUclRunner:
             }
             return completed(
                 stdout="\n".join((envcheck.ENV_BEGIN, json.dumps(payload), envcheck.ENV_END))
+            )
+        if stage_tools.PATHS_SENTINEL_BEGIN in source_text:
+            payload = {"schema_version": 1, "ok": True, "error": ""}
+            return completed(
+                stdout="\n".join(
+                    (
+                        stage_tools.PATHS_SENTINEL_BEGIN,
+                        json.dumps(payload),
+                        stage_tools.PATHS_SENTINEL_END,
+                    )
+                )
             )
         if stage_tools.SOURCE_SENTINEL_BEGIN in source_text:
             if '"ready": False' in source_text:
@@ -489,6 +500,35 @@ def test_stage_dry_run_reports_that_source_was_not_checked(
     assert workflow.runner.transfer_count() == 0
 
 
+def test_gpu_setup_mode_changes_the_stage_identity(
+    workflow: SimpleNamespace,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert invoke_stage(workflow, "--dry-run", "--json") == 0
+    cpu = json.loads(capsys.readouterr().out)
+    assert invoke_stage(workflow, "--dry-run", "--json", "--gpu", "0") == 0
+    gpu = json.loads(capsys.readouterr().out)
+
+    assert gpu["stage_id"] != cpu["stage_id"]
+    assert gpu["environment_path"] != cpu["environment_path"]
+
+
+def test_finished_setup_job_status_reconciles_remote_ready_state(
+    workflow: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert invoke_stage(workflow) == 0
+    stage_record = stage_registry.list_records()[0]
+    workflow.runner.remote_state = setup_state(stage_record)
+    setup_run = next(record for record in list_run_records() if record.kind == "stage-setup")
+    monkeypatch.setattr(main_cli, "_query_job_identity", lambda *args, **kwargs: {"exists": False})
+
+    status = main_cli._record_status(setup_run, runner=workflow.runner)
+
+    assert status["status"] == "completed"
+    assert stage_registry.read_record(stage_record.stage_id).status == "ready"
+
+
 def test_identical_stage_reuses_content_addressed_source_and_environment(
     workflow: SimpleNamespace,
 ) -> None:
@@ -522,7 +562,7 @@ def test_included_source_change_creates_a_distinct_stage_identity(workflow: Simp
 
     records = stage_registry.list_records()
     assert len(records) == 2
-    second = records[-1]
+    second = next(record for record in records if record.stage_id != first.stage_id)
     assert second.stage_id != first.stage_id
     assert second.source_hash != first.source_hash
     assert second.source_path != first.source_path
@@ -566,7 +606,8 @@ def test_run_from_ready_stage_uses_frozen_no_sync_without_upload(
     assert record.environment_path in new_calls
     assert "scripts/run.sh" in new_calls
     assert "hello world" in new_calls
-    assert "sync --frozen" not in new_calls
+    assert "sync --frozen --check" in new_calls
+    assert "sync --frozen --no-editable" not in new_calls
     assert not any(argv and argv[0] == "rsync" for argv, _ in workflow.runner.calls[calls_before:])
     assert "tar -cf" not in new_calls
 

@@ -53,6 +53,53 @@ def _run_generated(source: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def test_managed_path_preflight_accepts_missing_safe_paths(tmp_path: Path) -> None:
+    root = tmp_path / "remote"
+    process = _run_generated(
+        stage.build_managed_paths_probe_source(
+            str(root),
+            (str(root / "stages" / "demo"), str(root / "tools" / "uv")),
+        )
+    )
+
+    assert process.returncode == 0
+    payload = stage._parse_sentinel(
+        process.stdout,
+        stage.PATHS_SENTINEL_BEGIN,
+        stage.PATHS_SENTINEL_END,
+        "managed path preflight",
+    )
+    assert payload == {"schema_version": 1, "ok": True, "error": ""}
+
+
+def test_managed_path_preflight_rejects_symlinked_ancestor(tmp_path: Path) -> None:
+    root = tmp_path / "remote"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "stages").symlink_to(outside, target_is_directory=True)
+    process = _run_generated(
+        stage.build_managed_paths_probe_source(
+            str(root),
+            (str(root / "stages" / "demo"),),
+        )
+    )
+
+    payload = stage._parse_sentinel(
+        process.stdout,
+        stage.PATHS_SENTINEL_BEGIN,
+        stage.PATHS_SENTINEL_END,
+        "managed path preflight",
+    )
+    assert payload["ok"] is False
+    assert "managed path component is a symlink" in str(payload["error"])
+
+
+def test_managed_path_preflight_rejects_path_outside_root() -> None:
+    with pytest.raises(ValueError, match="beneath remote_root"):
+        stage.build_managed_paths_probe_source("/tmp/managed", ("/tmp/outside",))
+
+
 def test_source_promoter_verifies_and_atomically_publishes_snapshot(tmp_path: Path) -> None:
     manifest = build_source_manifest(_project(tmp_path))
     sources = tmp_path / "remote" / "sources"
@@ -188,6 +235,30 @@ def test_failed_source_upload_requests_remote_incoming_cleanup(tmp_path: Path) -
     assert ".incoming-" in " ".join(cleanup_argv)
 
 
+def test_stage_environment_check_is_read_only_and_rejects_drift() -> None:
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append(argv)
+        return SimpleNamespace(returncode=3, stdout="", stderr="environment is stale")
+
+    with pytest.raises(RuntimeError, match="environment consistency check.*environment is stale"):
+        stage.verify_stage_environment(
+            HostSpec("barbury-l", "barbury-l"),
+            source_dir="/tmp/root/source",
+            environment_dir="/tmp/root/env",
+            uv_binary_path="/tmp/root/tools/uv",
+            uv_cache_dir="/tmp/root/cache",
+            python_install_dir="/tmp/root/python",
+            python_request="3.11.5",
+            runner=runner,
+        )
+
+    joined = " ".join(calls[0])
+    assert "sync --frozen --check --project /tmp/root/source" in joined
+    assert "--no-editable" not in joined
+
+
 def test_state_probe_reports_missing_managed_paths(tmp_path: Path) -> None:
     ready = tmp_path / "ready.json"
     failed = tmp_path / "failed.json"
@@ -216,6 +287,64 @@ def test_state_probe_reports_missing_managed_paths(tmp_path: Path) -> None:
         "uv_binary_path",
         "python_path",
     ]
+
+
+def test_state_probe_accepts_a_normal_virtual_environment_python_symlink(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    environment = tmp_path / "environment"
+    source.mkdir()
+    (environment / "bin").mkdir(parents=True)
+    uv_binary = tmp_path / "tools" / "uv"
+    uv_binary.parent.mkdir(parents=True)
+    uv_binary.write_text("uv", encoding="utf-8")
+    interpreter = tmp_path / "python3.11"
+    interpreter.write_text("python", encoding="utf-8")
+    python_path = environment / "bin" / "python"
+    python_path.symlink_to(interpreter)
+    ready = tmp_path / "ready.json"
+    failed = tmp_path / "failed.json"
+    ready.write_text(
+        json.dumps(
+            {
+                "source_dir": str(source),
+                "environment_dir": str(environment),
+                "uv_binary_path": str(uv_binary),
+                "python_path": str(python_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    process = _run_generated(stage.build_state_probe_source(str(ready), str(failed)))
+    payload = stage._parse_sentinel(
+        process.stdout,
+        stage.STATE_SENTINEL_BEGIN,
+        stage.STATE_SENTINEL_END,
+        "state probe",
+    )
+
+    assert payload["status"] == "ready"
+    assert payload["missing_paths"] == []
+
+
+def test_state_probe_uses_the_newest_ready_or_failed_state(tmp_path: Path) -> None:
+    ready = tmp_path / "ready.json"
+    failed = tmp_path / "failed.json"
+    ready.write_text(json.dumps({"status": "ready"}), encoding="utf-8")
+    failed.write_text(json.dumps({"status": "failed"}), encoding="utf-8")
+    os.utime(ready, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(failed, ns=(2_000_000_000, 2_000_000_000))
+
+    process = _run_generated(stage.build_state_probe_source(str(ready), str(failed)))
+    payload = stage._parse_sentinel(
+        process.stdout,
+        stage.STATE_SENTINEL_BEGIN,
+        stage.STATE_SENTINEL_END,
+        "state probe",
+    )
+
+    assert payload["status"] == "failed"
+    assert payload["state"] == {"status": "failed"}
 
 
 def test_setup_payload_writer_uses_private_files_and_argv_only(tmp_path: Path) -> None:

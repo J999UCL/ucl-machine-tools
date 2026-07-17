@@ -43,6 +43,8 @@ from ucl_machine_tools import stage as stage_tools
 from ucl_machine_tools import stage_registry
 from ucl_machine_tools.stage_registry import StageRecord
 from ucl_machine_tools.uv_project import (
+    RemoteUvLayout,
+    UvProjectSpec,
     derive_remote_layout,
     hash_setup_environment,
     load_uv_project,
@@ -1291,87 +1293,22 @@ def _stage_summary(record: StageRecord, *, source_action: str, json_output: bool
     print(f"run_when_ready: ucl run --stage {record.stage_id} --script SCRIPT --new-session")
 
 
-def run_stage(args: argparse.Namespace, *, runner=subprocess.run) -> int:
-    host = _resolve_one_host(args.host, catalog_path=args.catalog)
-    project = load_uv_project(args.local_dir, runner=runner)
-    requested_setup_env = parse_env(args.env)
-    setup_environment_hash = hash_setup_environment(requested_setup_env)
-    stage_name = args.name or project.contract.root.name
-    layout = derive_remote_layout(
-        remote_root=args.remote_root,
-        stage_name=stage_name,
-        host=host.name,
-        uv_version=project.uv.version,
-        lock_sha256=project.lock_sha256,
-        source_sha256=project.source_sha256,
-        setup_environment_sha256=setup_environment_hash,
-    )
-    failed_state = str(layout.state_dir / f"{layout.stage_id}.failed.json")
-    python_install_dir = str(layout.python_install_dir)
-    base_record = StageRecord(
-        stage_id=layout.stage_id,
-        name=layout.stage_name,
-        host=host.name,
-        ssh_host=host.ssh_host,
-        remote_root=str(layout.remote_root),
-        source_path=str(layout.source_dir),
-        environment_path=str(layout.environment_dir),
-        uv_path=str(layout.uv_binary),
-        cache_path=str(layout.uv_cache_dir),
-        source_hash=project.source_sha256,
-        lock_hash=project.lock_sha256,
-        setup_environment_hash=setup_environment_hash,
-        uv_version=project.uv.version,
-        python_request=project.contract.python_request,
-        python_path=str(layout.environment_dir / "bin" / "python"),
-        state_path=str(layout.state_file),
-        status="planned" if args.dry_run else "preparing",
-        provenance={
-            "local_dir": str(project.contract.root),
-            "local_git_sha": _git_sha(project.contract.root),
-            "uv_executable": str(project.uv.executable),
-            "manifest_files": len(project.manifest.entries),
-            "manifest_bytes": project.manifest.total_bytes,
-            "setup_environment_hash": setup_environment_hash,
-            "setup_env_keys": sorted(key for key, _ in requested_setup_env),
-        },
-    )
-    if args.dry_run:
-        _stage_summary(base_record, source_action="not_checked", json_output=args.json)
-        return 0
-
-    ensure_knuckles_master(runner=runner)
-    resolved_env = _resolve_env(args, host, runner=runner)
-    gpu_id = _selected_gpu(resolved_env) or None
-    setup_env = tuple((key, value) for key, value in resolved_env if key != "CUDA_VISIBLE_DEVICES")
-    if hash_setup_environment(setup_env) != setup_environment_hash:
-        raise RuntimeError("resolved setup environment changed after stage identity was derived")
-    remote_environment = envcheck.run_env_check(
-        host,
-        remote_root=str(layout.remote_root),
-        create=False,
-        gpu=gpu_id,
-        runner=runner,
-    )
-    if not remote_environment.get("python_setup_exists"):
-        raise RuntimeError(f"TSG Python setup is unavailable on {host.name}")
-    if gpu_id is not None and not remote_environment.get("cuda_visibility_exists"):
-        raise RuntimeError(f"CUDA visibility setup is unavailable on {host.name}")
-    cuda_visibility_script = (
-        str(remote_environment["cuda_visibility_script"]) if gpu_id is not None else None
-    )
-
-    snapshot = materialize_source_snapshot(project.manifest)
-    try:
-        source_result = stage_tools.sync_source_snapshot(
-            host,
-            manifest=snapshot.manifest,
-            source_dir=str(layout.source_dir),
-            sources_dir=str(layout.sources_dir),
-            runner=runner,
-        )
-    finally:
-        snapshot.cleanup()
+def _reconcile_and_launch_stage(
+    *,
+    host: HostSpec,
+    layout: RemoteUvLayout,
+    project: UvProjectSpec,
+    base_record: StageRecord,
+    source_reused: bool,
+    setup_env: tuple[tuple[str, str], ...],
+    gpu_id: str | None,
+    cuda_visibility_script: str | None,
+    failed_state: str,
+    python_install_dir: str,
+    json_output: bool,
+    runner: Any,
+) -> int:
+    """Reconcile one stage identity and launch at most one local setup request."""
 
     try:
         existing_record = stage_registry.read_record(layout.stage_id)
@@ -1395,24 +1332,26 @@ def run_stage(args: argparse.Namespace, *, runner=subprocess.run) -> int:
         ready_record = stage_registry.update_status(
             identity_record.stage_id,
             "ready",
-            provenance={"source_reused": source_result.reused, "environment_reused": True},
+            provenance={"source_reused": source_reused, "environment_reused": True},
         )
         _stage_summary(
             ready_record,
-            source_action="reused" if source_result.reused else "uploaded",
-            json_output=args.json,
+            source_action="reused" if source_reused else "uploaded",
+            json_output=json_output,
         )
         return 0
     if state_payload.get("status") == "invalid":
-        raise RuntimeError(f"existing stage state is invalid: {state_payload.get('error') or layout.stage_id}")
+        raise RuntimeError(
+            f"existing stage state is invalid: {state_payload.get('error') or layout.stage_id}"
+        )
 
     if existing_record is not None and existing_record.status == "preparing" and existing_record.setup_run_id:
         sessions = list_remote_sessions(host, runner=runner)
         if existing_record.setup_run_id in sessions:
             _stage_summary(
                 existing_record,
-                source_action="reused" if source_result.reused else "uploaded",
-                json_output=args.json,
+                source_action="reused" if source_reused else "uploaded",
+                json_output=json_output,
             )
             return 0
 
@@ -1430,7 +1369,7 @@ def run_stage(args: argparse.Namespace, *, runner=subprocess.run) -> int:
         failed_state_path=failed_state,
         log_path=setup_log,
         environment_lock_path=str(layout.state_dir / "locks" / f"env-{layout.environment_id}.lock"),
-        uv_tool_lock_path=str(layout.state_dir / "locks" / f"uv-{layout.uv_version}.lock"),
+        uv_tool_lock_path=str(layout.remote_root / "state" / "locks" / f"uv-{layout.uv_version}.lock"),
     )
     spec = UvSetupSpec(
         uv_version=layout.uv_version,
@@ -1481,7 +1420,7 @@ def run_stage(args: argparse.Namespace, *, runner=subprocess.run) -> int:
             status="preparing",
             provenance={
                 **record_seed.provenance,
-                "source_reused": source_result.reused,
+                "source_reused": source_reused,
                 "selected_gpu": gpu_id or "",
             },
         )
@@ -1500,17 +1439,142 @@ def run_stage(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     )
     write_record(provisional)
     try:
-        identity = launch_tmux(setup_plan, decision, PurePosixPath(payload.csh_driver_path).name, runner=runner)
+        identity = launch_tmux(
+            setup_plan,
+            decision,
+            PurePosixPath(payload.csh_driver_path).name,
+            runner=runner,
+        )
     except Exception:
         stage_registry.update_status(record.stage_id, "launch_failed")
         raise
     write_record(replace(provisional, identity=identity))
     _stage_summary(
         record,
-        source_action="reused" if source_result.reused else "uploaded",
-        json_output=args.json,
+        source_action="reused" if source_reused else "uploaded",
+        json_output=json_output,
     )
     return 0
+
+
+def run_stage(args: argparse.Namespace, *, runner=subprocess.run) -> int:
+    host = _resolve_one_host(args.host, catalog_path=args.catalog)
+    project = load_uv_project(args.local_dir, runner=runner)
+    requested_setup_env = parse_env(args.env)
+    setup_identity_context = (("gpu_request", args.gpu or "none"),)
+    setup_environment_hash = hash_setup_environment(
+        requested_setup_env,
+        context=setup_identity_context,
+    )
+    stage_name = args.name or project.contract.root.name
+    layout = derive_remote_layout(
+        remote_root=args.remote_root,
+        stage_name=stage_name,
+        host=host.name,
+        uv_version=project.uv.version,
+        lock_sha256=project.lock_sha256,
+        source_sha256=project.source_sha256,
+        setup_environment_sha256=setup_environment_hash,
+    )
+    failed_state = str(layout.state_dir / f"{layout.stage_id}.failed.json")
+    python_install_dir = str(layout.python_install_dir)
+    base_record = StageRecord(
+        stage_id=layout.stage_id,
+        name=layout.stage_name,
+        host=host.name,
+        ssh_host=host.ssh_host,
+        remote_root=str(layout.remote_root),
+        source_path=str(layout.source_dir),
+        environment_path=str(layout.environment_dir),
+        uv_path=str(layout.uv_binary),
+        cache_path=str(layout.uv_cache_dir),
+        source_hash=project.source_sha256,
+        lock_hash=project.lock_sha256,
+        setup_environment_hash=setup_environment_hash,
+        uv_version=project.uv.version,
+        python_request=project.contract.python_request,
+        python_path=str(layout.environment_dir / "bin" / "python"),
+        state_path=str(layout.state_file),
+        status="planned" if args.dry_run else "preparing",
+        provenance={
+            "local_dir": str(project.contract.root),
+            "local_git_sha": _git_sha(project.contract.root),
+            "uv_executable": str(project.uv.executable),
+            "manifest_files": len(project.manifest.entries),
+            "manifest_bytes": project.manifest.total_bytes,
+            "setup_environment_hash": setup_environment_hash,
+            "setup_env_keys": sorted(key for key, _ in requested_setup_env),
+        },
+    )
+    if args.dry_run:
+        _stage_summary(base_record, source_action="not_checked", json_output=args.json)
+        return 0
+
+    ensure_knuckles_master(runner=runner)
+    resolved_env = _resolve_env(args, host, runner=runner)
+    gpu_id = _selected_gpu(resolved_env) or None
+    setup_env = tuple((key, value) for key, value in resolved_env if key != "CUDA_VISIBLE_DEVICES")
+    if dict(setup_env) != dict(requested_setup_env):
+        raise RuntimeError("resolved setup environment changed after stage identity was derived")
+    remote_environment = envcheck.run_env_check(
+        host,
+        remote_root=str(layout.remote_root),
+        create=False,
+        gpu=gpu_id,
+        runner=runner,
+    )
+    if not remote_environment.get("python_setup_exists"):
+        raise RuntimeError(f"TSG Python setup is unavailable on {host.name}")
+    if gpu_id is not None and not remote_environment.get("cuda_visibility_exists"):
+        raise RuntimeError(f"CUDA visibility setup is unavailable on {host.name}")
+    cuda_visibility_script = (
+        str(remote_environment["cuda_visibility_script"]) if gpu_id is not None else None
+    )
+    stage_tools.verify_managed_paths(
+        host,
+        remote_root=str(layout.remote_root),
+        managed_paths=tuple(
+            str(path)
+            for path in (
+                layout.sources_dir,
+                layout.environments_dir,
+                layout.uv_tools_dir,
+                layout.python_install_dir,
+                layout.uv_cache_dir,
+                layout.state_dir,
+                layout.launchers_dir,
+            )
+        ),
+        runner=runner,
+    )
+
+    snapshot = materialize_source_snapshot(project.manifest)
+    try:
+        source_result = stage_tools.sync_source_snapshot(
+            host,
+            manifest=snapshot.manifest,
+            source_dir=str(layout.source_dir),
+            sources_dir=str(layout.sources_dir),
+            runner=runner,
+        )
+    finally:
+        snapshot.cleanup()
+
+    with stage_registry.claim_stage(layout.stage_id):
+        return _reconcile_and_launch_stage(
+            host=host,
+            layout=layout,
+            project=project,
+            base_record=base_record,
+            source_reused=source_result.reused,
+            setup_env=setup_env,
+            gpu_id=gpu_id,
+            cuda_visibility_script=cuda_visibility_script,
+            failed_state=failed_state,
+            python_install_dir=python_install_dir,
+            json_output=args.json,
+            runner=runner,
+        )
 
 
 def run_run(args: argparse.Namespace, *, runner=subprocess.run, popener=subprocess.Popen) -> int:
@@ -1547,6 +1611,16 @@ def run_run(args: argparse.Namespace, *, runner=subprocess.run, popener=subproce
                 if state_payload.get("status") == "failed":
                     stage_registry.update_status(record.stage_id, "failed")
                 raise
+            stage_tools.verify_stage_environment(
+                host,
+                source_dir=record.source_path,
+                environment_dir=record.environment_path,
+                uv_binary_path=record.uv_path,
+                uv_cache_dir=record.cache_path,
+                python_install_dir=posixpath.join(record.remote_root, "tools", "python"),
+                python_request=record.python_request,
+                runner=runner,
+            )
             stage_registry.update_status(record.stage_id, "ready")
             env = _resolve_env(args, host, runner=runner)
         launcher_root = posixpath.join(record.remote_root, "launchers")
@@ -1976,8 +2050,7 @@ with tarfile.open(fileobj=buf, mode="w") as tar:
             for name in sorted(files):
                 path = os.path.join(root, name)
                 rel = os.path.relpath(path, REMOTE_DIR)
-                base = os.path.basename(rel)
-                if rel.endswith(SUFFIXES) or base.startswith(".ucl_"):
+                if rel.endswith(SUFFIXES):
                     tar.add(path, arcname=rel, recursive=False)
 print(BEGIN)
 sys.stdout.write(base64.b64encode(buf.getvalue()).decode("ascii"))
@@ -2021,8 +2094,33 @@ def _record_status(record: RunRecord, *, runner=subprocess.run, timeout_seconds:
         return {"status": "unreachable", "error": str(exc), "current_identity": {}}
     except Exception as exc:  # noqa: BLE001 - status should report per-job probe failures.
         return {"status": "probe_error", "error": str(exc), "current_identity": {}}
+    status = job_control.classify_identity(record.identity, current_identity)
+    if status == "exited_or_missing" and record.kind == "stage-setup":
+        stage_id = (record.provenance or {}).get("stage_id")
+        if isinstance(stage_id, str) and stage_id:
+            try:
+                stage_record = stage_registry.read_record(stage_id)
+                payload = dict(
+                    stage_tools.probe_stage_state(
+                        host,
+                        ready_state_path=stage_record.state_path,
+                        failed_state_path=_failed_state_path(stage_record.state_path),
+                        runner=runner,
+                    )
+                )
+                _validate_stage_state(stage_record, payload)
+                stage_registry.update_status(stage_id, "ready")
+                status = "completed"
+            except Exception as error:  # noqa: BLE001 - job status must stay per-record.
+                if "stage failed" in str(error):
+                    try:
+                        stage_registry.update_status(stage_id, "failed")
+                    except ValueError:
+                        pass
+                    return {"status": "failed", "error": str(error), "current_identity": current_identity}
+                return {"status": status, "error": str(error), "current_identity": current_identity}
     return {
-        "status": job_control.classify_identity(record.identity, current_identity),
+        "status": status,
         "error": "",
         "current_identity": current_identity,
     }

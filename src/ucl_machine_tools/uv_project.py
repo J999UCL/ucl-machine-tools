@@ -26,7 +26,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only on Python 3.10.
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 Which = Callable[[str], str | None]
 
-_PYTHON_REQUEST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
+_PYTHON_REQUEST_RE = re.compile(r"^(?:(?:cpython|pypy)-)?[0-9]+\.[0-9]+\.[0-9]+$")
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SAFE_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+-]{0,63}$")
@@ -617,11 +617,15 @@ def _validate_sha256(value: str, label: str) -> None:
         raise UvProjectError(f"{label} must be a lowercase SHA-256 digest")
 
 
-def hash_setup_environment(environment: Iterable[tuple[str, str]]) -> str:
+def hash_setup_environment(
+    environment: Iterable[tuple[str, str]],
+    *,
+    context: Iterable[tuple[str, str]] = (),
+) -> str:
     """Hash setup-affecting environment values without persisting them."""
 
     normalized: dict[str, str] = {}
-    for key, value in environment:
+    for key, value in (*tuple(environment), *tuple(context)):
         if key in normalized:
             raise UvProjectError(f"duplicate setup environment key: {key}")
         normalized[key] = value

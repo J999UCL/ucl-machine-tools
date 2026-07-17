@@ -23,6 +23,8 @@ SOURCE_SENTINEL_BEGIN = "UCL_STAGE_SOURCE_JSON_BEGIN"
 SOURCE_SENTINEL_END = "UCL_STAGE_SOURCE_JSON_END"
 STATE_SENTINEL_BEGIN = "UCL_STAGE_STATE_JSON_BEGIN"
 STATE_SENTINEL_END = "UCL_STAGE_STATE_JSON_END"
+PATHS_SENTINEL_BEGIN = "UCL_STAGE_PATHS_JSON_BEGIN"
+PATHS_SENTINEL_END = "UCL_STAGE_PATHS_JSON_END"
 SOURCE_MARKER_NAME = ".ucl-stage-source.json"
 
 
@@ -193,6 +195,60 @@ def _run_remote_python(
     return _parse_sentinel(stdout, begin, end, label)
 
 
+def build_managed_paths_probe_source(remote_root: str, managed_paths: tuple[str, ...]) -> str:
+    """Build a read-only probe that rejects symlinked managed path components."""
+
+    root = _safe_absolute_path(remote_root, "remote_root")
+    normalized: list[str] = []
+    for raw in managed_paths:
+        path = _safe_absolute_path(raw, "managed_path")
+        if posixpath.commonpath((root, path)) != root:
+            raise ValueError(f"managed_path must be beneath remote_root: {raw!r}")
+        if path not in normalized:
+            normalized.append(path)
+    return f'''import json
+from pathlib import Path
+
+BEGIN = {PATHS_SENTINEL_BEGIN!r}
+END = {PATHS_SENTINEL_END!r}
+ROOT = Path({root!r})
+PATHS = tuple(Path(value) for value in {tuple(normalized)!r})
+payload = {{"schema_version": 1, "ok": True, "error": ""}}
+try:
+    for path in (ROOT, *PATHS):
+        current = Path(path.anchor)
+        for part in path.parts[1:]:
+            current /= part
+            if current.is_symlink():
+                raise ValueError(f"managed path component is a symlink: {{current}}")
+except (OSError, ValueError) as exc:
+    payload["ok"] = False
+    payload["error"] = str(exc)
+print(BEGIN)
+print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+print(END)
+'''
+
+
+def verify_managed_paths(
+    host: HostSpec,
+    *,
+    remote_root: str,
+    managed_paths: tuple[str, ...],
+    runner: Runner = subprocess.run,
+) -> None:
+    payload = _run_remote_python(
+        host,
+        build_managed_paths_probe_source(remote_root, managed_paths),
+        runner=runner,
+        label="managed path preflight",
+        begin=PATHS_SENTINEL_BEGIN,
+        end=PATHS_SENTINEL_END,
+    )
+    if not payload.get("ok"):
+        raise RuntimeError(str(payload.get("error") or "managed path preflight failed"))
+
+
 def probe_remote_source(
     host: HostSpec,
     *,
@@ -232,6 +288,68 @@ def verify_registered_source(
         raise RuntimeError(str(payload.get("error") or "registered source is not ready"))
 
 
+def verify_stage_environment(
+    host: HostSpec,
+    *,
+    source_dir: str,
+    environment_dir: str,
+    uv_binary_path: str,
+    uv_cache_dir: str,
+    python_install_dir: str,
+    python_request: str,
+    runner: Runner = subprocess.run,
+) -> None:
+    source = _safe_absolute_path(source_dir, "source_dir")
+    environment = _safe_absolute_path(environment_dir, "environment_dir")
+    uv_binary = _safe_absolute_path(uv_binary_path, "uv_binary_path")
+    uv_cache = _safe_absolute_path(uv_cache_dir, "uv_cache_dir")
+    python_install = _safe_absolute_path(python_install_dir, "python_install_dir")
+    check = runner(
+        build_remote_argv(
+            host.ssh_host,
+            (
+                "env",
+                f"UV_PROJECT_ENVIRONMENT={environment}",
+                f"UV_CACHE_DIR={uv_cache}",
+                f"UV_PYTHON_INSTALL_DIR={python_install}",
+                uv_binary,
+                "sync",
+                "--frozen",
+                "--check",
+                "--project",
+                source,
+            ),
+        ),
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
+    if int(getattr(check, "returncode", 1)) != 0:
+        returncode = int(getattr(check, "returncode", 1))
+        detail = (getattr(check, "stderr", "") or getattr(check, "stdout", "") or "").strip()
+        detail = detail or f"remote check exited {returncode} without output"
+        raise RuntimeError(f"staged environment consistency check failed on {host.name}: {detail}")
+
+    python_path = posixpath.join(environment, "bin", "python")
+    version_source = (
+        "import platform,sys; request=sys.argv[1]; implementation,sep,version=request.rpartition('-'); "
+        "implementation=implementation if sep else ''; version=version if sep else request; "
+        "raise SystemExit(0 if platform.python_version()==version and "
+        "(not implementation or sys.implementation.name==implementation) else 1)"
+    )
+    version = runner(
+        build_remote_argv(host.ssh_host, (python_path, "-c", version_source, python_request)),
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
+    if int(getattr(version, "returncode", 1)) != 0:
+        returncode = int(getattr(version, "returncode", 1))
+        detail = (getattr(version, "stderr", "") or getattr(version, "stdout", "") or "").strip()
+        detail = detail or f"remote check exited {returncode} without output"
+        raise RuntimeError(f"staged Python identity check failed on {host.name}: {detail}")
+
+
 def build_source_prepare_source(
     *,
     incoming_dir: str,
@@ -251,6 +369,9 @@ import shutil
 
 incoming = Path({incoming!r})
 sources = Path({sources!r})
+for candidate in (sources, *sources.parents):
+    if candidate != Path("/") and candidate.is_symlink():
+        raise SystemExit(f"managed source path component is a symlink: {{candidate}}")
 sources.mkdir(parents=True, exist_ok=True)
 if incoming.exists() or incoming.is_symlink():
     incoming.unlink() if incoming.is_symlink() else shutil.rmtree(incoming)
@@ -306,37 +427,50 @@ def digest(path):
             value.update(chunk)
     return value.hexdigest()
 
-try:
-    if not INCOMING.is_dir() or INCOMING.is_symlink():
-        fail("incoming source snapshot is missing or is not a directory")
+def inventory(root, *, marker_name=None, require_immutable=False):
+    if not root.is_dir() or root.is_symlink():
+        fail(f"source snapshot is missing, redirected, or not a directory: {{root}}")
+    if require_immutable and root.stat().st_mode & 0o222:
+        fail(f"source snapshot root is writable: {{root}}")
     actual = {{}}
-    for base, directories, names in os.walk(INCOMING, followlinks=False):
+    for base, directories, names in os.walk(root, followlinks=False):
         base_path = Path(base)
         for name in list(directories):
             path = base_path / name
             if path.is_symlink():
-                relative = path.relative_to(INCOMING).as_posix()
-                actual[relative] = ("symlink", os.readlink(path), False, len(os.fsencode(os.readlink(path))))
+                relative = path.relative_to(root).as_posix()
+                target = os.readlink(path)
+                actual[relative] = ("symlink", target, False, len(os.fsencode(target)))
                 directories.remove(name)
             else:
-                actual[path.relative_to(INCOMING).as_posix()] = (
+                info = path.stat()
+                if require_immutable and info.st_mode & 0o222:
+                    fail(f"source directory is writable: {{path.relative_to(root).as_posix()}}")
+                actual[path.relative_to(root).as_posix()] = (
                     "directory",
                     None,
-                    bool(stat.S_IMODE(path.stat().st_mode) & 0o111),
+                    bool(stat.S_IMODE(info.st_mode) & 0o111),
                     0,
                 )
         for name in names:
+            if marker_name is not None and base_path == root and name == marker_name:
+                continue
             path = base_path / name
-            relative = path.relative_to(INCOMING).as_posix()
+            relative = path.relative_to(root).as_posix()
             info = path.lstat()
             if stat.S_ISLNK(info.st_mode):
                 target = os.readlink(path)
                 actual[relative] = ("symlink", target, False, len(os.fsencode(target)))
             elif stat.S_ISREG(info.st_mode):
+                if require_immutable and info.st_mode & 0o222:
+                    fail(f"source file is writable: {{relative}}")
                 actual[relative] = ("file", digest(path), bool(stat.S_IMODE(info.st_mode) & 0o111), info.st_size)
             else:
                 fail(f"unsupported staged source entry: {{relative}}")
+    return actual
 
+def verify_snapshot(root, *, marker_name=None, require_immutable=False):
+    actual = inventory(root, marker_name=marker_name, require_immutable=require_immutable)
     expected_paths = {{entry["path"] for entry in EXPECTED["entries"]}}
     if set(actual) != expected_paths:
         missing = sorted(expected_paths - set(actual))
@@ -350,6 +484,9 @@ try:
         if identity != expected_identity:
             fail(f"source content mismatch: {{entry['path']}}")
 
+try:
+    verify_snapshot(INCOMING)
+
     marker = EXPECTED
     marker_path = INCOMING / MARKER_NAME
     marker_path.write_text(json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\\n", encoding="utf-8")
@@ -359,13 +496,15 @@ try:
     with (SOURCES / ".ucl-source.lock").open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         reused = False
+        if FINAL.is_symlink():
+            fail("existing final source path must not be a symlink")
         if FINAL.exists():
             try:
                 existing = json.loads((FINAL / MARKER_NAME).read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 fail(f"existing final source has invalid integrity marker: {{exc}}")
-            if existing.get("source_sha256") != EXPECTED["source_sha256"]:
-                fail("existing final source has a different source identity")
+            if existing != EXPECTED:
+                fail("existing final source has a different integrity marker")
             existing_digest = hashlib.sha256()
             existing_digest.update(b"ucl-source-manifest-v1\\n")
             for entry in existing.get("entries", []):
@@ -373,6 +512,7 @@ try:
                 existing_digest.update(b"\\n")
             if existing_digest.hexdigest() != EXPECTED["source_sha256"]:
                 fail("existing final source has a forged or corrupt integrity marker")
+            verify_snapshot(FINAL, marker_name=MARKER_NAME, require_immutable=True)
             shutil.rmtree(INCOMING)
             reused = True
         else:
@@ -562,7 +702,8 @@ ready = Path({ready!r})
 failed = Path({failed!r})
 required_script = {required_script!r}
 payload = {{"schema_version": 1, "status": "missing", "state": None}}
-target = ready if ready.is_file() and not ready.is_symlink() else failed if failed.is_file() and not failed.is_symlink() else None
+candidates = [path for path in (ready, failed) if path.is_file() and not path.is_symlink()]
+target = max(candidates, key=lambda path: (path.stat().st_mtime_ns, path == failed)) if candidates else None
 if target is not None:
     try:
         payload["state"] = json.loads(target.read_text(encoding="utf-8"))
@@ -579,13 +720,15 @@ if target is not None:
             for field, kind in checks.items():
                 value = state.get(field)
                 path = Path(value) if isinstance(value, str) and value.startswith("/") else None
-                exists = path is not None and not path.is_symlink() and (path.is_dir() if kind == "dir" else path.is_file())
+                exists = path is not None and (path.is_dir() if kind == "dir" else path.is_file())
+                if path is not None and field != "python_path" and path.is_symlink():
+                    exists = False
                 if not exists:
                     missing.append(field)
             if required_script:
                 source_dir = state.get("source_dir")
                 script_path = Path(source_dir) / required_script if isinstance(source_dir, str) else None
-                if script_path is None or script_path.is_symlink() or not script_path.is_file():
+                if script_path is None or not script_path.is_file():
                     missing.append(f"script:{{required_script}}")
         payload["missing_paths"] = missing
     except (OSError, json.JSONDecodeError) as exc:

@@ -63,6 +63,22 @@ def test_env_and_gpu_are_plain_exports_not_profiles(tmp_path: Path) -> None:
     assert "export FOO='bar baz'" in files[".ucl_payload.sh"]
 
 
+def test_csh_payload_disables_history_expansion_for_literal_bang_arguments() -> None:
+    plan = launch.build_exec_plan(
+        host=host(),
+        command=("printf", "%s\\n", "hello!world"),
+        env=(("MESSAGE", "also!literal"),),
+        shell="csh",
+        session="demo_csh",
+    )
+
+    _, files = launch.build_launcher_files(plan)
+    payload = files[".ucl_payload.csh"]
+    assert "unset histchars" in payload
+    assert "'hello!world'" in payload
+    assert "'also!literal'" in payload
+
+
 def test_staged_run_uses_separate_working_directory_and_frozen_uv(tmp_path: Path) -> None:
     plan = launch.build_staged_run_plan(
         host=host(),

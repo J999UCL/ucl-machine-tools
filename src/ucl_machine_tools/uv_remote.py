@@ -18,8 +18,14 @@ _UV_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:[-+][A-Za-z0-9.-]+)
 _GPU_ID_RE = re.compile(r"^[0-9]+$")
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_PYTHON_REQUEST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
+_PYTHON_REQUEST_RE = re.compile(r"^(?:(?:cpython|pypy)-)?[0-9]+\.[0-9]+\.[0-9]+$")
 _RESERVED_SETUP_ENV = {
+    "BASHOPTS",
+    "BASH_ENV",
+    "ENV",
+    "IFS",
+    "PATH",
+    "SHELLOPTS",
     "CUDA_VISIBLE_DEVICES",
     "UV_CACHE_DIR",
     "UV_PROJECT_ENVIRONMENT",
@@ -149,7 +155,7 @@ class UvSetupSpec:
                 raise ValueError(f"invalid setup environment key: {key!r}")
             if key in seen:
                 raise ValueError(f"duplicate setup environment key: {key}")
-            if key.startswith("UCL_") or key in _RESERVED_SETUP_ENV:
+            if key.startswith(("UCL_", "UV_PYTHON")) or key in _RESERVED_SETUP_ENV:
                 raise ValueError(f"setup environment key is managed by ucl: {key}")
             if not isinstance(value, str) or "\x00" in value:
                 raise ValueError(f"setup environment value for {key!r} must be a string without NUL bytes")
@@ -229,6 +235,14 @@ def _relative_binary_path(paths: UvRemotePaths) -> str:
     return relative
 
 
+def _managed_root(paths: UvRemotePaths) -> str:
+    values = [getattr(paths, field_name) for field_name in paths.__dataclass_fields__]
+    root = posixpath.commonpath(values)
+    if root == "/":
+        raise ValueError("managed UV paths must share a root below the filesystem root")
+    return root
+
+
 def _build_csh_source(spec: UvSetupSpec, bash_driver_path: str) -> str:
     lines = [
         "#!/bin/csh -f",
@@ -255,7 +269,7 @@ def _build_csh_source(spec: UvSetupSpec, bash_driver_path: str) -> str:
     return "\n".join(lines)
 
 
-def _build_bash_source(spec: UvSetupSpec) -> str:
+def _build_bash_source(spec: UvSetupSpec, csh_driver_path: str, bash_driver_path: str) -> str:
     paths = spec.paths
     assignments = "\n".join(
         [
@@ -276,6 +290,9 @@ def _build_bash_source(spec: UvSetupSpec) -> str:
             _bash_assignment("UCL_LOG_PATH", paths.log_path),
             _bash_assignment("UCL_ENVIRONMENT_LOCK", paths.environment_lock_path),
             _bash_assignment("UCL_UV_TOOL_LOCK", paths.uv_tool_lock_path),
+            _bash_assignment("UCL_MANAGED_ROOT", _managed_root(paths)),
+            _bash_assignment("UCL_CSH_DRIVER", csh_driver_path),
+            _bash_assignment("UCL_BASH_DRIVER", bash_driver_path),
             _bash_assignment(
                 "UCL_UV_INSTALLER_URL",
                 f"https://astral.sh/uv/{spec.uv_version}/install.sh",
@@ -290,9 +307,8 @@ def _build_bash_source(spec: UvSetupSpec) -> str:
     return f'''#!/usr/bin/env bash
 set -Eeuo pipefail
 
-{assignments}
-{setup_exports}
-CURRENT_PHASE=initializing
+	{assignments}
+	CURRENT_PHASE=initializing
 REUSED_UV=false
 REUSED_ENVIRONMENT=false
 UCL_ENVIRONMENT_CREATED=false
@@ -403,6 +419,7 @@ ucl_cleanup_temporary() {{
   if [[ "$UCL_ENVIRONMENT_CREATED" == true ]]; then
     rm -rf -- "$UCL_ENVIRONMENT_DIR"
   fi
+  rm -f -- "$UCL_CSH_DRIVER" "$UCL_BASH_DRIVER"
 }}
 
 ucl_fail() {{
@@ -446,10 +463,35 @@ if [[ -n "${{UCL_TSG_BOOTSTRAP_ERROR:-}}" ]]; then
   ucl_abort 69 "TSG bootstrap failed: $UCL_TSG_BOOTSTRAP_ERROR"
 fi
 
-CURRENT_PHASE=preflight
+unset UV_PYTHON UV_PYTHON_PREFERENCE UV_MANAGED_PYTHON UV_NO_MANAGED_PYTHON
+{setup_exports}
+
+	CURRENT_PHASE=preflight
 for ucl_required in python3 curl flock mktemp cp chmod touch; do
   command -v "$ucl_required" >/dev/null 2>&1 || ucl_abort 70 "required command not found: $ucl_required"
-done
+	done
+python3 - "$UCL_MANAGED_ROOT" "$UCL_SOURCE_DIR" "$UCL_ENVIRONMENT_DIR" "$UCL_UV_CACHE_DIR" \
+  "$UCL_UV_TOOL_DIR" "$UCL_PYTHON_INSTALL_DIR" "$UCL_READY_STATE" "$UCL_FAILED_STATE" \
+  "$UCL_LOG_PATH" "$UCL_ENVIRONMENT_LOCK" "$UCL_UV_TOOL_LOCK" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+paths = [Path(value) for value in sys.argv[2:]]
+for candidate in (root, *root.parents):
+    if candidate != Path("/") and candidate.is_symlink():
+        raise SystemExit(f"managed path component is a symlink: {{candidate}}")
+for path in paths:
+    candidates = [path, *path.parents]
+    for candidate in candidates:
+        if candidate == Path("/"):
+            continue
+        if candidate.exists() or candidate.is_symlink():
+            if candidate.is_symlink():
+                raise SystemExit(f"managed path component is a symlink: {{candidate}}")
+        if candidate == root:
+            break
+PY
 [[ -d "$UCL_SOURCE_DIR" && ! -L "$UCL_SOURCE_DIR" ]] || ucl_abort 66 "source directory is missing or is a symlink: $UCL_SOURCE_DIR"
 for ucl_required_file in pyproject.toml uv.lock .python-version; do
   [[ -f "$UCL_SOURCE_DIR/$ucl_required_file" ]] || ucl_abort 66 "required project file does not exist: $UCL_SOURCE_DIR/$ucl_required_file"
@@ -571,6 +613,69 @@ else
   CURRENT_PHASE=build_source
   ucl_build_source="$(mktemp -d "$(dirname -- "$UCL_ENVIRONMENT_LOCK")/build-source.XXXXXX")"
   cp -a -- "$UCL_SOURCE_DIR/." "$ucl_build_source/"
+  python3 - "$ucl_build_source" "$UCL_SOURCE_SHA256" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+
+root = Path(sys.argv[1])
+expected_hash = sys.argv[2]
+marker_path = root / ".ucl-stage-source.json"
+marker = json.loads(marker_path.read_text(encoding="utf-8"))
+marker_digest = hashlib.sha256()
+marker_digest.update(b"ucl-source-manifest-v1\\n")
+for entry in marker.get("entries", []):
+    marker_digest.update(json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
+    marker_digest.update(b"\\n")
+if marker.get("source_sha256") != expected_hash or marker_digest.hexdigest() != expected_hash:
+    raise SystemExit("copied source integrity marker does not match requested source")
+
+actual = {{}}
+def digest(path):
+    value = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            value.update(chunk)
+    return value.hexdigest()
+
+for base, directories, names in os.walk(root, followlinks=False):
+    base_path = Path(base)
+    for name in list(directories):
+        path = base_path / name
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            target = os.readlink(path)
+            actual[relative] = ("symlink", target, False, len(os.fsencode(target)))
+            directories.remove(name)
+        else:
+            info = path.stat()
+            actual[relative] = ("directory", None, bool(stat.S_IMODE(info.st_mode) & 0o111), 0)
+    for name in names:
+        if base_path == root and name == marker_path.name:
+            continue
+        path = base_path / name
+        relative = path.relative_to(root).as_posix()
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            target = os.readlink(path)
+            actual[relative] = ("symlink", target, False, len(os.fsencode(target)))
+        elif stat.S_ISREG(info.st_mode):
+            actual[relative] = ("file", digest(path), bool(stat.S_IMODE(info.st_mode) & 0o111), info.st_size)
+        else:
+            raise SystemExit(f"unsupported copied source entry: {{relative}}")
+
+expected_paths = {{entry["path"] for entry in marker["entries"]}}
+if set(actual) != expected_paths:
+    raise SystemExit("copied source paths differ from integrity marker")
+for entry in marker["entries"]:
+    kind, identity, executable, size = actual[entry["path"]]
+    expected_identity = entry.get("sha256") if kind == "file" else entry.get("symlink_target")
+    if (kind, identity, executable, size) != (entry["kind"], expected_identity, entry["executable"], entry["size"]):
+        raise SystemExit(f"copied source entry differs from integrity marker: {{entry['path']}}")
+PY
   chmod -R u+w "$ucl_build_source"
   cd -- "$ucl_build_source"
   CURRENT_PHASE=sync
@@ -585,12 +690,27 @@ fi
 
 CURRENT_PHASE=interpreter_verify
 UCL_PYTHON_PATH="$UCL_ENVIRONMENT_DIR/bin/python"
-[[ -x "$UCL_PYTHON_PATH" ]] || ucl_abort 65 "environment interpreter is missing: $UCL_PYTHON_PATH"
-"$UCL_PYTHON_PATH" -c 'import sys; print(sys.executable)'
+	[[ -x "$UCL_PYTHON_PATH" ]] || ucl_abort 65 "environment interpreter is missing: $UCL_PYTHON_PATH"
+	"$UCL_PYTHON_PATH" - "$UCL_PYTHON_REQUEST" <<'PY'
+import platform
+import sys
+
+request = sys.argv[1]
+implementation, separator, expected_version = request.rpartition("-")
+if not separator:
+    implementation = ""
+    expected_version = request
+if platform.python_version() != expected_version:
+    raise SystemExit(f"environment Python version mismatch: expected {{expected_version}}, got {{platform.python_version()}}")
+if implementation and sys.implementation.name != implementation:
+    raise SystemExit(f"environment Python implementation mismatch: expected {{implementation}}, got {{sys.implementation.name}}")
+print(sys.executable)
+PY
 
 CURRENT_PHASE=ready
-rm -f -- "$UCL_FAILED_STATE"
-ucl_write_state "$UCL_READY_STATE" true ready 0 "" "" ""
+	rm -f -- "$UCL_FAILED_STATE"
+	ucl_write_state "$UCL_READY_STATE" true ready 0 "" "" ""
+	rm -f -- "$UCL_CSH_DRIVER" "$UCL_BASH_DRIVER"
 '''
 
 
@@ -613,7 +733,7 @@ def build_setup_payload(
         csh_driver_path=csh_path,
         bash_driver_path=bash_path,
         csh_source=_build_csh_source(spec, bash_path),
-        bash_source=_build_bash_source(spec),
+        bash_source=_build_bash_source(spec, csh_path, bash_path),
     )
 
 

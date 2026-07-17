@@ -12,6 +12,26 @@ from ucl_machine_tools import uv_remote
 
 
 PROJECT_LOCK_SHA256 = hashlib.sha256(b"version = 1\n").hexdigest()
+PROJECT_FILES = {
+    ".python-version": b"3.11.5\n",
+    "pyproject.toml": b"[project]\nname='smoke'\nversion='0.0.0'\n",
+    "uv.lock": b"version = 1\n",
+}
+PROJECT_ENTRIES = [
+    {
+        "path": path,
+        "kind": "file",
+        "executable": False,
+        "size": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+    for path, content in sorted(PROJECT_FILES.items())
+]
+_source_digest = hashlib.sha256(b"ucl-source-manifest-v1\n")
+for _entry in PROJECT_ENTRIES:
+    _source_digest.update(json.dumps(_entry, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
+    _source_digest.update(b"\n")
+PROJECT_SOURCE_SHA256 = _source_digest.hexdigest()
 
 
 def make_spec(tmp_path: Path, **overrides: object) -> uv_remote.UvSetupSpec:
@@ -32,7 +52,7 @@ def make_spec(tmp_path: Path, **overrides: object) -> uv_remote.UvSetupSpec:
     values: dict[str, object] = {
         "uv_version": "0.8.14",
         "paths": paths,
-        "source_sha256": "a" * 64,
+        "source_sha256": PROJECT_SOURCE_SHA256,
         "lock_sha256": PROJECT_LOCK_SHA256,
         "setup_environment_sha256": "c" * 64,
         "python_request": "3.11.5",
@@ -133,8 +153,9 @@ def test_setup_uses_exact_versioned_installer_atomic_promotion_and_no_fallbacks(
     assert 'ucl_uv_version_is_exact "$ucl_uv_candidate"' in source
     assert 'mv -- "$ucl_tool_temp" "$UCL_UV_TOOL_DIR"' in source
     assert "latest" not in source.lower()
-    for forbidden in ("pip install", "pip3", "conda", "docker", "UV_NO_MANAGED_PYTHON"):
+    for forbidden in ("pip install", "pip3", "conda", "docker"):
         assert forbidden not in source
+    assert "unset UV_PYTHON UV_PYTHON_PREFERENCE UV_MANAGED_PYTHON UV_NO_MANAGED_PYTHON" in source
 
 
 def test_setup_uses_frozen_lock_sync_check_and_managed_python_paths(tmp_path: Path) -> None:
@@ -235,6 +256,10 @@ def test_setup_spec_rejects_identity_and_managed_environment_overrides(tmp_path:
         make_spec(tmp_path, python_request="3.11; rm -rf")
     with pytest.raises(ValueError, match="managed by ucl"):
         make_spec(tmp_path, setup_env=(("UV_CACHE_DIR", "/other"),))
+    with pytest.raises(ValueError, match="managed by ucl"):
+        make_spec(tmp_path, setup_env=(("UV_PYTHON", "/other/python"),))
+    with pytest.raises(ValueError, match="managed by ucl"):
+        make_spec(tmp_path, setup_env=(("PATH", "/other/bin"),))
 
 
 def test_parse_setup_result_ignores_outside_noise_and_preserves_failure_details() -> None:
@@ -340,7 +365,13 @@ if args and args[0] == "sync":
         (environment / "bin").mkdir(exist_ok=True)
         interpreter = environment / "bin" / "python"
         if not interpreter.exists():
-            interpreter.symlink_to(sys.executable)
+            interpreter.write_text(
+                '#!/bin/sh\\\\n'
+                'if [ "$1" = "-" ]; then cat >/dev/null; echo "$0"; exit 0; fi\\\\n'
+                f'exec "{{sys.executable}}" "$@"\\\\n',
+                encoding="utf-8",
+            )
+            interpreter.chmod(0o755)
     if "--check" in args and not pathlib.Path(os.environ["UV_PROJECT_ENVIRONMENT"]).is_dir():
         raise SystemExit(9)
     raise SystemExit(0)
@@ -369,9 +400,21 @@ fcntl.flock(int(sys.argv[-1]), fcntl.LOCK_EX)
 
 def _write_project_contract(source: Path) -> None:
     source.mkdir(parents=True, exist_ok=True)
-    (source / "pyproject.toml").write_text("[project]\nname='smoke'\nversion='0.0.0'\n", encoding="utf-8")
-    (source / "uv.lock").write_text("version = 1\n", encoding="utf-8")
-    (source / ".python-version").write_text("3.11.5\n", encoding="utf-8")
+    for relative, content in PROJECT_FILES.items():
+        (source / relative).write_bytes(content)
+    marker = {
+        "schema_version": 1,
+        "source_sha256": PROJECT_SOURCE_SHA256,
+        "file_count": len(PROJECT_ENTRIES),
+        "symlink_count": 0,
+        "directory_count": 0,
+        "total_bytes": sum(len(content) for content in PROJECT_FILES.values()),
+        "entries": PROJECT_ENTRIES,
+    }
+    (source / ".ucl-stage-source.json").write_text(
+        json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _run_bash_payload(

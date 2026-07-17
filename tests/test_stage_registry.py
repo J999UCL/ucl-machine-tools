@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+import threading
 from typing import Any
 
 import pytest
@@ -12,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ucl_machine_tools import stage_registry
 from ucl_machine_tools.stage_registry import (
     StageRecord,
+    claim_stage,
     list_records,
     read_record,
     registry_root,
@@ -60,6 +62,39 @@ def test_registry_root_uses_default_cache(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.delenv("UCL_MACHINE_TOOLS_CACHE", raising=False)
 
     assert registry_root() == Path("~/.cache/ucl-machine-tools/stages").expanduser()
+
+
+def test_stage_claim_serializes_same_identity(tmp_path: Path) -> None:
+    attempting = threading.Event()
+    acquired = threading.Event()
+
+    def contender() -> None:
+        attempting.set()
+        with claim_stage("same-stage", root=tmp_path):
+            acquired.set()
+
+    with claim_stage("same-stage", root=tmp_path):
+        thread = threading.Thread(target=contender)
+        thread.start()
+        assert attempting.wait(timeout=1)
+        assert not acquired.wait(timeout=0.05)
+
+    assert acquired.wait(timeout=1)
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert (tmp_path / "claims" / "same-stage.lock").stat().st_mode & 0o777 == 0o600
+
+
+def test_stage_claim_rejects_symlinked_lock_file(tmp_path: Path) -> None:
+    claims = tmp_path / "claims"
+    claims.mkdir()
+    target = tmp_path / "outside"
+    target.write_text("do not lock\n", encoding="utf-8")
+    (claims / "unsafe.lock").symlink_to(target)
+
+    with pytest.raises(RuntimeError, match="unable to claim stage"):
+        with claim_stage("unsafe", root=tmp_path):
+            pytest.fail("symlinked claim must not be acquired")
 
 
 def test_write_read_latest_and_list_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -123,6 +158,7 @@ def test_read_backfills_additive_fields_for_legacy_record(tmp_path: Path) -> Non
         if key
         not in {
             "python_path",
+            "setup_environment_hash",
             "state_path",
             "setup_run_id",
             "status",
@@ -136,6 +172,7 @@ def test_read_backfills_additive_fields_for_legacy_record(tmp_path: Path) -> Non
     loaded = read_record("legacy", root=tmp_path)
 
     assert loaded.python_path == ""
+    assert loaded.setup_environment_hash == "0" * 64
     assert loaded.state_path == ""
     assert loaded.setup_run_id == ""
     assert loaded.status == "unknown"
