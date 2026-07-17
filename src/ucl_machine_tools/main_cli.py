@@ -80,6 +80,8 @@ Common workflows:
     ucl exec barbury-l --shell csh --stdin < check_torch.csh
 
   Launch and manage tmux-backed jobs:
+    ucl stage --uv --host barbury-l --name fpt --local-dir ./project --remote-root /tmp/thakwani/fpt --gpu auto
+    ucl run --stage STAGE_ID --script scripts/train.sh --new-session --gpu auto
     ucl exec barbury-l --detach --new-session -- hostname
     ucl run --host barbury-l --new-session --gpu auto --min-free-vram-gb 20 --local-dir ./bundle --script run.sh
     ucl jobs
@@ -112,9 +114,23 @@ Use 'ucl COMMAND --help' for command-specific flags.
     doctor.add_argument("--catalog", type=Path)
     doctor.add_argument("--timeout-seconds", type=int, default=8)
 
-    run = subparsers.add_parser("run", help="Upload a local bundle and launch it in tmux.")
-    run.add_argument("--host", required=True)
-    run.add_argument("--local-dir", required=True, type=Path)
+    stage = subparsers.add_parser("stage", help="Upload a locked UV project and prepare its remote environment.")
+    stage.add_argument("--uv", action="store_true", required=True, help="require the locked UV staging workflow")
+    stage.add_argument("--host", required=True)
+    stage.add_argument("--name", help="safe stage name; defaults to the local directory name")
+    stage.add_argument("--local-dir", required=True, type=Path)
+    stage.add_argument("--remote-root", required=True, help="absolute managed project root on the remote host")
+    stage.add_argument("--catalog", type=Path)
+    stage.add_argument("--env", action="append", default=[], help="setup env KEY=VALUE; values are redacted in records")
+    stage.add_argument("--gpu", help="GPU id or auto")
+    stage.add_argument("--min-free-vram-gb", type=float, default=DEFAULT_AUTO_GPU_MIN_FREE_VRAM_GB)
+    stage.add_argument("--dry-run", action="store_true")
+    stage.add_argument("--json", action="store_true")
+
+    run = subparsers.add_parser("run", help="Launch a local bundle or a verified stage in tmux.")
+    run.add_argument("--host")
+    run.add_argument("--local-dir", type=Path)
+    run.add_argument("--stage", help="verified stage id from `ucl stage`")
     run.add_argument("--script", required=True)
     _add_launch_common_flags(run)
     run.add_argument("--arg", action="append", default=[], help="script argument; repeat for multiple args")
@@ -192,6 +208,26 @@ Use 'ucl COMMAND --help' for command-specific flags.
     env.add_argument("--json", action="store_true")
 
     return parser
+
+
+def _validate_run_mode(args: argparse.Namespace) -> str:
+    if args.stage:
+        conflicts = (
+            ("--host", args.host),
+            ("--local-dir", args.local_dir),
+            ("--remote-dir", args.remote_dir),
+            ("--remote-root", args.remote_root),
+            ("--replace", args.replace),
+        )
+        for flag, value in conflicts:
+            if value:
+                raise ValueError(f"--stage cannot be combined with {flag}")
+        return "stage"
+    if not args.host:
+        raise ValueError("ordinary ucl run requires --host")
+    if args.local_dir is None:
+        raise ValueError("ordinary ucl run requires --local-dir")
+    return "bundle"
 
 
 def _add_inventory_flags(parser: argparse.ArgumentParser) -> None:
