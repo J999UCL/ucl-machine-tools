@@ -63,6 +63,57 @@ def test_env_and_gpu_are_plain_exports_not_profiles(tmp_path: Path) -> None:
     assert "export FOO='bar baz'" in files[".ucl_payload.sh"]
 
 
+def test_staged_run_uses_separate_working_directory_and_frozen_uv(tmp_path: Path) -> None:
+    plan = launch.build_staged_run_plan(
+        host=host(),
+        source_dir="/tmp/thakwani/fpt/stages/demo/sources/source123",
+        environment_dir="/tmp/thakwani/fpt/stages/demo/envs/env123",
+        uv_bin="/tmp/thakwani/fpt/tools/uv/0.9.27/uv",
+        uv_cache_dir="/tmp/thakwani/fpt/cache/uv",
+        script="scripts/train.sh",
+        args=("--steps", "10"),
+        session="demo",
+        remote_root="/tmp/thakwani/fpt/launchers",
+    )
+
+    assert plan.remote_dir == "/tmp/thakwani/fpt/launchers/demo"
+    assert plan.work_dir == "/tmp/thakwani/fpt/stages/demo/sources/source123"
+    assert plan.command == (
+        "/tmp/thakwani/fpt/tools/uv/0.9.27/uv",
+        "run",
+        "--frozen",
+        "--no-sync",
+        "--project",
+        "/tmp/thakwani/fpt/stages/demo/sources/source123",
+        "bash",
+        "scripts/train.sh",
+        "--steps",
+        "10",
+    )
+    assert ("UV_PROJECT_ENVIRONMENT", "/tmp/thakwani/fpt/stages/demo/envs/env123") in plan.env
+    assert ("UV_CACHE_DIR", "/tmp/thakwani/fpt/cache/uv") in plan.env
+
+    _, files = launch.build_launcher_files(plan)
+    payload = files[".ucl_payload.sh"]
+    assert "cd /tmp/thakwani/fpt/stages/demo/sources/source123" in payload
+    assert "mkdir -p /tmp/thakwani/fpt/launchers/demo" in payload
+    assert "uv run --frozen --no-sync" in payload
+
+
+@pytest.mark.parametrize("script", ("/absolute.sh", "../escape.sh", "scripts/../../escape.sh", ""))
+def test_staged_run_rejects_unsafe_script_paths(script: str) -> None:
+    with pytest.raises(ValueError, match="script"):
+        launch.build_staged_run_plan(
+            host=host(),
+            source_dir="/tmp/project",
+            environment_dir="/tmp/env",
+            uv_bin="/tmp/tools/uv",
+            uv_cache_dir="/tmp/cache",
+            script=script,
+            session="demo",
+        )
+
+
 def test_remote_root_can_be_configured_in_plans(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     bundle = make_bundle(tmp_path)
 

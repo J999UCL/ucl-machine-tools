@@ -10,7 +10,7 @@ import shlex
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
 
 from ucl_machine_tools import job_control
@@ -38,6 +38,7 @@ class RemoteJobPlan:
     remote_dir: str
     remote_root: str
     log_path: str
+    work_dir: str
     command: tuple[str, ...]
     env: tuple[tuple[str, str], ...]
     shell: str
@@ -197,6 +198,7 @@ def build_run_plan(
         remote_dir=final_remote_dir,
         remote_root=final_remote_root,
         log_path=final_log_path,
+        work_dir=final_remote_dir,
         command=("bash", script_rel, *args),
         env=env,
         shell=shell,
@@ -248,6 +250,91 @@ def build_exec_plan(
         new_session=new_session,
         window=window_name,
         stdin_body=stdin_body,
+        work_dir=final_remote_dir,
+    )
+
+
+def _validate_absolute_remote_path(value: str, label: str) -> str:
+    if not value.startswith("/"):
+        raise ValueError(f"{label} must be absolute: {value!r}")
+    normalized = posixpath.normpath(value)
+    if normalized == "/" or ".." in PurePosixPath(value).parts:
+        raise ValueError(f"{label} must be a safe absolute path: {value!r}")
+    return normalized
+
+
+def _validate_staged_script(script: str) -> str:
+    path = PurePosixPath(script)
+    if not script or path.is_absolute() or ".." in path.parts or path.name in {"", "."}:
+        raise ValueError(f"staged script must be a safe relative path: {script!r}")
+    normalized = posixpath.normpath(script)
+    if normalized in {"", "."}:
+        raise ValueError(f"staged script must be a safe relative path: {script!r}")
+    return normalized
+
+
+def build_staged_run_plan(
+    *,
+    host: HostSpec,
+    source_dir: str,
+    environment_dir: str,
+    uv_bin: str,
+    uv_cache_dir: str,
+    script: str,
+    args: tuple[str, ...] = (),
+    env: tuple[tuple[str, str], ...] = (),
+    shell: str = "bash",
+    session: str | None = None,
+    new_session: bool = False,
+    window: str | None = None,
+    remote_dir: str | None = None,
+    remote_root: str | None = None,
+    log_path: str | None = None,
+) -> RemoteJobPlan:
+    """Plan a run from an immutable staged source and UV environment."""
+    validate_shell(shell)
+    final_source_dir = _validate_absolute_remote_path(source_dir, "source_dir")
+    final_environment_dir = _validate_absolute_remote_path(environment_dir, "environment_dir")
+    final_uv_bin = _validate_absolute_remote_path(uv_bin, "uv_bin")
+    final_uv_cache_dir = _validate_absolute_remote_path(uv_cache_dir, "uv_cache_dir")
+    final_script = _validate_staged_script(script)
+    run_id, window_name, final_remote_dir, final_remote_root, final_log_path = _common_plan_values(
+        stem=PurePosixPath(final_script).stem or "run",
+        session=session,
+        window=window,
+        remote_dir=remote_dir,
+        remote_root=remote_root,
+        log_path=log_path,
+    )
+    staged_env = (
+        ("UV_PROJECT_ENVIRONMENT", final_environment_dir),
+        ("UV_CACHE_DIR", final_uv_cache_dir),
+        *env,
+    )
+    return RemoteJobPlan(
+        kind="run",
+        host=host,
+        run_id=run_id,
+        remote_dir=final_remote_dir,
+        remote_root=final_remote_root,
+        log_path=final_log_path,
+        work_dir=final_source_dir,
+        command=(
+            final_uv_bin,
+            "run",
+            "--frozen",
+            "--no-sync",
+            "--project",
+            final_source_dir,
+            "bash",
+            final_script,
+            *args,
+        ),
+        env=staged_env,
+        shell=shell,
+        requested_session=session,
+        new_session=new_session,
+        window=window_name,
     )
 
 
@@ -255,7 +342,7 @@ def _bash_payload_source(plan: RemoteJobPlan) -> str:
     lines = [
         "#!/usr/bin/env bash",
         "set -Eeuo pipefail",
-        f"cd {shlex.quote(plan.remote_dir)}",
+        f"cd {shlex.quote(plan.work_dir)}",
         f"mkdir -p {shlex.quote(posixpath.dirname(plan.log_path))}",
         f"exec > >(tee -a {shlex.quote(plan.log_path)}) 2>&1",
         "trap 'rc=$?; echo \"[ucl] failed rc=$rc line=$LINENO\"; exit $rc' ERR",
@@ -273,7 +360,7 @@ def _bash_csh_launcher_source(plan: RemoteJobPlan) -> str:
     lines = [
         "#!/usr/bin/env bash",
         "set -Eeuo pipefail",
-        f"cd {shlex.quote(plan.remote_dir)}",
+        f"cd {shlex.quote(plan.work_dir)}",
         f"mkdir -p {shlex.quote(posixpath.dirname(plan.log_path))}",
         f"exec > >(tee -a {shlex.quote(plan.log_path)}) 2>&1",
         "trap 'rc=$?; echo \"[ucl] failed rc=$rc line=$LINENO\"; exit $rc' ERR",
@@ -287,7 +374,7 @@ def _bash_csh_launcher_source(plan: RemoteJobPlan) -> str:
 def _csh_payload_source(plan: RemoteJobPlan) -> str:
     lines = [
         "#!/bin/csh -f",
-        f"cd {shlex.quote(plan.remote_dir)}",
+        f"cd {shlex.quote(plan.work_dir)}",
         *csh_setenv_lines(plan.env),
         "echo '[ucl] run'",
     ]
