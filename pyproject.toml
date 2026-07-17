@@ -3,7 +3,10 @@ name = "ucl-machine-tools"
 version = "0.1.0"
 description = "UCL CS GPU status, exec, and tmux launch tools"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+  "pathspec",
+  "tomli; python_version < '3.11'",
+]
 
 [project.scripts]
 ucl = "ucl_machine_tools.main_cli:main"

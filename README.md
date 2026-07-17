@@ -13,6 +13,8 @@ scripts/ucl exec 3090ti --gpu auto --min-free-vram-gb 20 -- nvidia-smi
 scripts/ucl exec barbury-l --cwd /tmp --timeout 60 pwd
 scripts/ucl exec barbury-l --shell csh --stdin < setup_python.csh
 scripts/ucl exec barbury-l --detach --new-session -- hostname
+scripts/ucl stage --uv --host barbury-l --name demo --local-dir ./project --remote-root /tmp/thakwani/demo
+scripts/ucl run --stage demo-barbury-l-STAGE_HASH --script scripts/run.sh --new-session
 scripts/ucl run --host barbury-l --new-session --gpu auto --min-free-vram-gb 20 --local-dir ./bundle --script run.sh
 scripts/ucl run --host barbury-l --session my_run --remote-root /tmp/ucl-machine-tools/fpt/launchers --local-dir ./bundle --script run.sh
 scripts/ucl tail last --live
@@ -46,8 +48,15 @@ unchanged, including command output that happens to mention VirtualBox.
   needs to source UCL `.csh` setup files.
 - `ucl exec HOST --detach -- COMMAND...` uses the old tmux-backed async path
   and records the run for `tail`/`fetch`.
+- `ucl stage --uv` validates a locked UV project, uploads an ignore-aware,
+  content-addressed source snapshot, and starts exact environment setup in a
+  dedicated tmux session. It prints both the reusable stage ID and setup run ID.
 - `ucl run` uploads a local bundle, writes launcher files, and starts the bundle
   script in tmux. It requires `--session NAME` or `--new-session`.
+- `ucl run --stage STAGE_ID` verifies the remote ready state, source,
+  environment, UV binary, Python interpreter, and requested script before
+  launch. It runs with `uv run --frozen --no-sync` and performs no upload or
+  dependency sync.
 - `ucl jobs`, `ucl info`, `ucl stop`, `ucl tail`, `ucl fetch`, and `ucl clean`
   operate on recorded run metadata.
 - New detached jobs record the tmux socket, pane, process, and Linux session
@@ -92,26 +101,38 @@ Detached `ucl exec`, `ucl run`, and `ucl clean` default to
 `UCL_LAUNCH_ROOT`, for example `/tmp/ucl-machine-tools/fpt/launchers`. Explicit
 `--remote-dir` values must stay under the selected root.
 
-## Environment Setup
+## Automatic UV Environments
 
-The tool deliberately does not encode Python, PyTorch, uv, conda, or project
-setup. Put setup commands in the script you launch, or send them with
-`ucl exec --stdin`.
+Projects staged with `ucl stage --uv` must contain `pyproject.toml`, `uv.lock`,
+and `.python-version`. The local lock must pass `uv lock --check`; staging never
+updates it. Commit those three files with the project and use `uv lock`
+intentionally when dependencies change.
 
-For UCL TSG Python setup:
+The source snapshot follows nested `.gitignore` and `.uclignore` files and
+always excludes Git metadata, virtual environments, caches, secrets such as
+`.env`, and top-level data/output/checkpoint directories. The exact selected
+files are hashed locally, verified again remotely, and atomically promoted into
+`REMOTE_ROOT/stages/NAME/sources/SHA256`. A changed included file creates a new
+stage identity; ignored data does not.
+
+Remote setup sources `/opt/Python/Python-3.11.5_Setup.csh`, installs the exact
+local UV release through Astral's versioned standalone installer, keeps UV,
+Python downloads, package cache, source, and environment under the requested
+remote root, and runs `uv sync --frozen --no-editable` followed by
+`uv sync --frozen --check`. UV may use the TSG Python or install the version
+requested by `.python-version`. Concurrent setup for the same UV tool or
+environment is lock-serialized.
+
+Setup is asynchronous. Follow it with `ucl tail SETUP_RUN_ID --live`; once its
+state is ready, launch any script already in the snapshot with:
 
 ```bash
-scripts/ucl exec barbury-l --shell csh --stdin <<'CSH'
-source /opt/Python/Python-3.11.5_Setup.csh
-pip install torch --user
-CSH
+scripts/ucl run --stage STAGE_ID --script scripts/run.sh --new-session
 ```
 
-For bash-native work, keep the default shell:
-
-```bash
-scripts/ucl exec barbury-l df -h /tmp
-```
+The local `scripts/ucl` wrapper bootstraps its own small staging dependencies
+through the repository's `uv.lock` only when `ucl stage` needs them. It does not
+install anything into the system Python.
 
 ## Tmux Rules
 

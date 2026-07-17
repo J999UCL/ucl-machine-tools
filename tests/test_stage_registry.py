@@ -33,14 +33,14 @@ def make_record(
         host="barbury-l",
         ssh_host="barbury-l.cs.ucl.ac.uk",
         remote_root=root,
-        source_path=f"{root}/stages/fpt/sources/source-hash",
-        environment_path=f"{root}/stages/fpt/envs/environment-key",
+        source_path=f"{root}/stages/fpt/sources/{'a' * 64}",
+        environment_path=f"{root}/stages/fpt/envs/{'c' * 64}",
         uv_path=f"{root}/tools/uv/1.2.3/uv",
         cache_path=f"{root}/cache/uv",
         python_path=f"{root}/tools/python",
         state_path=f"{root}/stages/fpt/state/{stage_id}.json",
-        source_hash="source-hash",
-        lock_hash="lock-hash",
+        source_hash="a" * 64,
+        lock_hash="b" * 64,
         uv_version="1.2.3",
         python_request="3.11.5",
         setup_run_id=f"{stage_id}-setup",
@@ -180,6 +180,24 @@ def test_record_ids_cannot_escape_registry_root(tmp_path: Path) -> None:
         write_record(make_record("../escape"), root=tmp_path)
     with pytest.raises(ValueError, match="invalid stage id"):
         read_record("../escape", root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("source_hash", "bad", "source_hash"),
+        ("status", "made_up", "status"),
+        ("source_path", "/tmp/outside", "source_path"),
+        ("uv_path", "relative/uv", "uv_path"),
+        ("host", "bad host", "host"),
+    ],
+)
+def test_registry_rejects_untrusted_execution_metadata(
+    tmp_path: Path, field: str, value: str, message: str
+) -> None:
+    values = {**make_record().__dict__, field: value}
+    with pytest.raises(ValueError, match=message):
+        write_record(StageRecord(**values), root=tmp_path)
 
 
 def test_atomic_write_preserves_record_if_replace_fails(

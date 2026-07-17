@@ -8,13 +8,20 @@ from datetime import datetime, timezone
 import fcntl
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import tempfile
 from typing import Any, Mapping
 
 
 _STAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_SAFE_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_UV_VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:[-+][A-Za-z0-9.-]+)?$")
+_PYTHON_REQUEST_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
+_STAGE_STATUSES = frozenset(
+    {"unknown", "planned", "preparing", "ready", "failed", "launch_failed"}
+)
 _REQUIRED_FIELDS = (
     "stage_id",
     "name",
@@ -158,6 +165,52 @@ def _validate_record(record: StageRecord) -> None:
             raise ValueError(f"invalid stage record {record.stage_id}: {field_name} must be a string")
     if not isinstance(record.provenance, dict):
         raise ValueError(f"invalid stage record {record.stage_id}: provenance must be an object")
+    for field_name in ("name", "host", "ssh_host"):
+        value = getattr(record, field_name)
+        if _SAFE_TOKEN_PATTERN.fullmatch(value) is None:
+            raise ValueError(f"invalid stage record {record.stage_id}: unsafe {field_name}")
+    for field_name in ("source_hash", "lock_hash"):
+        if _SHA256_PATTERN.fullmatch(getattr(record, field_name)) is None:
+            raise ValueError(f"invalid stage record {record.stage_id}: {field_name} must be SHA-256")
+    if _UV_VERSION_PATTERN.fullmatch(record.uv_version) is None:
+        raise ValueError(f"invalid stage record {record.stage_id}: invalid uv_version")
+    if _PYTHON_REQUEST_PATTERN.fullmatch(record.python_request) is None:
+        raise ValueError(f"invalid stage record {record.stage_id}: invalid python_request")
+    if record.status not in _STAGE_STATUSES:
+        raise ValueError(f"invalid stage record {record.stage_id}: invalid status {record.status!r}")
+    if record.setup_run_id and _STAGE_ID_PATTERN.fullmatch(record.setup_run_id) is None:
+        raise ValueError(f"invalid stage record {record.stage_id}: invalid setup_run_id")
+
+    root = PurePosixPath(record.remote_root)
+    if not record.remote_root.startswith("/") or root == PurePosixPath("/") or ".." in root.parts:
+        raise ValueError(f"invalid stage record {record.stage_id}: remote_root must be a safe absolute path")
+    for field_name in (
+        "source_path",
+        "environment_path",
+        "uv_path",
+        "cache_path",
+        "python_path",
+        "state_path",
+    ):
+        raw = getattr(record, field_name)
+        if not raw:
+            continue
+        path = PurePosixPath(raw)
+        if not raw.startswith("/") or ".." in path.parts or path == root:
+            raise ValueError(f"invalid stage record {record.stage_id}: unsafe {field_name}")
+        try:
+            path.relative_to(root)
+        except ValueError as error:
+            raise ValueError(
+                f"invalid stage record {record.stage_id}: {field_name} must be under remote_root"
+            ) from error
+    if PurePosixPath(record.source_path).name != record.source_hash:
+        raise ValueError(f"invalid stage record {record.stage_id}: source_path does not match source_hash")
+    expected_uv = root / "tools" / "uv" / record.uv_version / "uv"
+    if PurePosixPath(record.uv_path) != expected_uv:
+        raise ValueError(f"invalid stage record {record.stage_id}: uv_path does not match managed layout")
+    if PurePosixPath(record.cache_path) != root / "cache" / "uv":
+        raise ValueError(f"invalid stage record {record.stage_id}: cache_path does not match managed layout")
 
 
 def _prepared_record(record: StageRecord, *, now: str | None = None) -> StageRecord:

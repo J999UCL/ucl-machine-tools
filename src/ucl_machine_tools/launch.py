@@ -281,6 +281,7 @@ def build_staged_run_plan(
     uv_bin: str,
     uv_cache_dir: str,
     script: str,
+    python_install_dir: str | None = None,
     args: tuple[str, ...] = (),
     env: tuple[tuple[str, str], ...] = (),
     shell: str = "bash",
@@ -297,7 +298,15 @@ def build_staged_run_plan(
     final_environment_dir = _validate_absolute_remote_path(environment_dir, "environment_dir")
     final_uv_bin = _validate_absolute_remote_path(uv_bin, "uv_bin")
     final_uv_cache_dir = _validate_absolute_remote_path(uv_cache_dir, "uv_cache_dir")
+    final_python_install_dir = _validate_absolute_remote_path(
+        python_install_dir or posixpath.join(posixpath.dirname(final_uv_cache_dir), "python"),
+        "python_install_dir",
+    )
     final_script = _validate_staged_script(script)
+    managed_keys = {"UV_PROJECT_ENVIRONMENT", "UV_CACHE_DIR", "UV_PYTHON_INSTALL_DIR"}
+    conflicts = sorted(key for key, _ in env if key in managed_keys)
+    if conflicts:
+        raise ValueError(f"staged run environment cannot override ucl-managed keys: {', '.join(conflicts)}")
     run_id, window_name, final_remote_dir, final_remote_root, final_log_path = _common_plan_values(
         stem=PurePosixPath(final_script).stem or "run",
         session=session,
@@ -307,9 +316,10 @@ def build_staged_run_plan(
         log_path=log_path,
     )
     staged_env = (
+        *env,
         ("UV_PROJECT_ENVIRONMENT", final_environment_dir),
         ("UV_CACHE_DIR", final_uv_cache_dir),
-        *env,
+        ("UV_PYTHON_INSTALL_DIR", final_python_install_dir),
     )
     return RemoteJobPlan(
         kind="run",
@@ -326,7 +336,8 @@ def build_staged_run_plan(
             "--no-sync",
             "--project",
             final_source_dir,
-            "bash",
+            "--",
+            *(('csh', '-f') if shell == 'csh' else ('bash',)),
             final_script,
             *args,
         ),

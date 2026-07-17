@@ -4,10 +4,49 @@
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
+import shutil
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _ensure_stage_dependencies() -> None:
+    if len(sys.argv) < 2 or sys.argv[1] != "stage":
+        return
+    try:
+        import pathspec  # noqa: F401
+        if sys.version_info < (3, 11):
+            import tomli  # noqa: F401
+        return
+    except ModuleNotFoundError as error:
+        if os.environ.get("UCL_STAGE_BOOTSTRAPPED") == "1":
+            raise SystemExit(f"ucl stage dependency bootstrap failed: {error}") from error
+    uv = shutil.which("uv")
+    if uv is None:
+        raise SystemExit("ucl stage requires uv on the local PATH")
+    environment = os.environ.copy()
+    environment["UCL_STAGE_BOOTSTRAPPED"] = "1"
+    os.execve(
+        uv,
+        [
+            uv,
+            "run",
+            "--frozen",
+            "--project",
+            str(ROOT),
+            "--",
+            "python",
+            str(Path(__file__).resolve()),
+            *sys.argv[1:],
+        ],
+        environment,
+    )
+
+
+_ensure_stage_dependencies()
+sys.path.insert(0, str(ROOT / "src"))
 
 from ucl_machine_tools.main_cli import main
 

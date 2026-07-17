@@ -70,6 +70,7 @@ def test_staged_run_uses_separate_working_directory_and_frozen_uv(tmp_path: Path
         environment_dir="/tmp/thakwani/fpt/stages/demo/envs/env123",
         uv_bin="/tmp/thakwani/fpt/tools/uv/0.9.27/uv",
         uv_cache_dir="/tmp/thakwani/fpt/cache/uv",
+        python_install_dir="/tmp/thakwani/fpt/tools/python",
         script="scripts/train.sh",
         args=("--steps", "10"),
         session="demo",
@@ -85,6 +86,7 @@ def test_staged_run_uses_separate_working_directory_and_frozen_uv(tmp_path: Path
         "--no-sync",
         "--project",
         "/tmp/thakwani/fpt/stages/demo/sources/source123",
+        "--",
         "bash",
         "scripts/train.sh",
         "--steps",
@@ -92,6 +94,7 @@ def test_staged_run_uses_separate_working_directory_and_frozen_uv(tmp_path: Path
     )
     assert ("UV_PROJECT_ENVIRONMENT", "/tmp/thakwani/fpt/stages/demo/envs/env123") in plan.env
     assert ("UV_CACHE_DIR", "/tmp/thakwani/fpt/cache/uv") in plan.env
+    assert ("UV_PYTHON_INSTALL_DIR", "/tmp/thakwani/fpt/tools/python") in plan.env
 
     _, files = launch.build_launcher_files(plan)
     payload = files[".ucl_payload.sh"]
