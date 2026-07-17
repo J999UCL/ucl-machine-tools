@@ -431,7 +431,10 @@ def build_write_file_argv(host: HostSpec, remote_dir: str, name: str, *, remote_
     if "/" in name or not name:
         raise ValueError(f"remote file name must be a basename: {name!r}")
     path = posixpath.join(remote_dir, name)
-    command = f"set -euo pipefail; cat > {shlex.quote(path)}; chmod +x {shlex.quote(path)}"
+    command = (
+        f"set -euo pipefail; umask 077; cat > {shlex.quote(path)}; "
+        f"chmod 700 {shlex.quote(path)}"
+    )
     return remote_bash_argv(host, command)
 
 

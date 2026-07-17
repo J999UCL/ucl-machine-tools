@@ -42,7 +42,12 @@ from ucl_machine_tools.ssh import build_remote_python_argv, ensure_knuckles_mast
 from ucl_machine_tools import stage as stage_tools
 from ucl_machine_tools import stage_registry
 from ucl_machine_tools.stage_registry import StageRecord
-from ucl_machine_tools.uv_project import derive_remote_layout, load_uv_project
+from ucl_machine_tools.uv_project import (
+    derive_remote_layout,
+    hash_setup_environment,
+    load_uv_project,
+    materialize_source_snapshot,
+)
 from ucl_machine_tools.uv_remote import (
     UvRemotePaths,
     UvSetupSpec,
@@ -142,7 +147,7 @@ Use 'ucl COMMAND --help' for command-specific flags.
     stage.add_argument("--local-dir", required=True, type=Path)
     stage.add_argument("--remote-root", required=True, help="absolute managed project root on the remote host")
     stage.add_argument("--catalog", type=Path)
-    stage.add_argument("--env", action="append", default=[], help="setup env KEY=VALUE; values are redacted in records")
+    stage.add_argument("--env", action="append", default=[], help="setup env KEY=VALUE; values are not stored in records")
     stage.add_argument("--gpu", help="GPU id or auto")
     stage.add_argument("--min-free-vram-gb", type=float, default=DEFAULT_AUTO_GPU_MIN_FREE_VRAM_GB)
     stage.add_argument("--dry-run", action="store_true")
@@ -1243,6 +1248,7 @@ def _validate_stage_state(record: StageRecord, payload: dict[str, object]) -> No
         "uv_version": record.uv_version,
         "source_sha256": record.source_hash,
         "lock_sha256": record.lock_hash,
+        "setup_environment_sha256": record.setup_environment_hash,
         "python_request": record.python_request,
         "source_dir": record.source_path,
         "environment_dir": record.environment_path,
@@ -1258,12 +1264,12 @@ def _validate_stage_state(record: StageRecord, payload: dict[str, object]) -> No
         raise RuntimeError(f"stage files are missing on {record.host}: {', '.join(str(item) for item in missing)}")
 
 
-def _stage_summary(record: StageRecord, *, source_reused: bool, json_output: bool) -> None:
+def _stage_summary(record: StageRecord, *, source_action: str, json_output: bool) -> None:
     payload = {
         "stage_id": record.stage_id,
         "host": record.host,
         "status": record.status,
-        "source_reused": source_reused,
+        "source_action": source_action,
         "source_path": record.source_path,
         "environment_path": record.environment_path,
         "state_path": record.state_path,
@@ -1275,7 +1281,7 @@ def _stage_summary(record: StageRecord, *, source_reused: bool, json_output: boo
     print(f"stage_id:     {record.stage_id}")
     print(f"host:         {record.host}")
     print(f"status:       {record.status}")
-    print(f"source:       {'reused' if source_reused else 'uploaded'}")
+    print(f"source:       {source_action}")
     print(f"source_dir:   {record.source_path}")
     print(f"environment:  {record.environment_path}")
     print(f"state:        {record.state_path}")
@@ -1288,6 +1294,8 @@ def _stage_summary(record: StageRecord, *, source_reused: bool, json_output: boo
 def run_stage(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     host = _resolve_one_host(args.host, catalog_path=args.catalog)
     project = load_uv_project(args.local_dir, runner=runner)
+    requested_setup_env = parse_env(args.env)
+    setup_environment_hash = hash_setup_environment(requested_setup_env)
     stage_name = args.name or project.contract.root.name
     layout = derive_remote_layout(
         remote_root=args.remote_root,
@@ -1296,6 +1304,7 @@ def run_stage(args: argparse.Namespace, *, runner=subprocess.run) -> int:
         uv_version=project.uv.version,
         lock_sha256=project.lock_sha256,
         source_sha256=project.source_sha256,
+        setup_environment_sha256=setup_environment_hash,
     )
     failed_state = str(layout.state_dir / f"{layout.stage_id}.failed.json")
     python_install_dir = str(layout.python_install_dir)
@@ -1311,6 +1320,7 @@ def run_stage(args: argparse.Namespace, *, runner=subprocess.run) -> int:
         cache_path=str(layout.uv_cache_dir),
         source_hash=project.source_sha256,
         lock_hash=project.lock_sha256,
+        setup_environment_hash=setup_environment_hash,
         uv_version=project.uv.version,
         python_request=project.contract.python_request,
         python_path=str(layout.environment_dir / "bin" / "python"),
@@ -1322,17 +1332,20 @@ def run_stage(args: argparse.Namespace, *, runner=subprocess.run) -> int:
             "uv_executable": str(project.uv.executable),
             "manifest_files": len(project.manifest.entries),
             "manifest_bytes": project.manifest.total_bytes,
-            "env": dict(parse_env(args.env)),
+            "setup_environment_hash": setup_environment_hash,
+            "setup_env_keys": sorted(key for key, _ in requested_setup_env),
         },
     )
     if args.dry_run:
-        _stage_summary(base_record, source_reused=False, json_output=args.json)
+        _stage_summary(base_record, source_action="not_checked", json_output=args.json)
         return 0
 
     ensure_knuckles_master(runner=runner)
     resolved_env = _resolve_env(args, host, runner=runner)
     gpu_id = _selected_gpu(resolved_env) or None
     setup_env = tuple((key, value) for key, value in resolved_env if key != "CUDA_VISIBLE_DEVICES")
+    if hash_setup_environment(setup_env) != setup_environment_hash:
+        raise RuntimeError("resolved setup environment changed after stage identity was derived")
     remote_environment = envcheck.run_env_check(
         host,
         remote_root=str(layout.remote_root),
@@ -1348,13 +1361,24 @@ def run_stage(args: argparse.Namespace, *, runner=subprocess.run) -> int:
         str(remote_environment["cuda_visibility_script"]) if gpu_id is not None else None
     )
 
-    source_result = stage_tools.sync_source_snapshot(
-        host,
-        manifest=project.manifest,
-        source_dir=str(layout.source_dir),
-        sources_dir=str(layout.sources_dir),
-        runner=runner,
-    )
+    snapshot = materialize_source_snapshot(project.manifest)
+    try:
+        source_result = stage_tools.sync_source_snapshot(
+            host,
+            manifest=snapshot.manifest,
+            source_dir=str(layout.source_dir),
+            sources_dir=str(layout.sources_dir),
+            runner=runner,
+        )
+    finally:
+        snapshot.cleanup()
+
+    try:
+        existing_record = stage_registry.read_record(layout.stage_id)
+    except ValueError as error:
+        if "not found" not in str(error):
+            raise
+        existing_record = None
     state_payload = dict(
         stage_tools.probe_stage_state(
             host,
@@ -1364,17 +1388,33 @@ def run_stage(args: argparse.Namespace, *, runner=subprocess.run) -> int:
         )
     )
     if state_payload.get("status") == "ready":
-        ready_record = stage_registry.write_record(base_record)
-        _validate_stage_state(ready_record, state_payload)
+        identity_record = existing_record or base_record
+        _validate_stage_state(identity_record, state_payload)
+        if existing_record is None:
+            stage_registry.write_record(base_record)
         ready_record = stage_registry.update_status(
-            ready_record.stage_id,
+            identity_record.stage_id,
             "ready",
             provenance={"source_reused": source_result.reused, "environment_reused": True},
         )
-        _stage_summary(ready_record, source_reused=source_result.reused, json_output=args.json)
+        _stage_summary(
+            ready_record,
+            source_action="reused" if source_result.reused else "uploaded",
+            json_output=args.json,
+        )
         return 0
     if state_payload.get("status") == "invalid":
         raise RuntimeError(f"existing stage state is invalid: {state_payload.get('error') or layout.stage_id}")
+
+    if existing_record is not None and existing_record.status == "preparing" and existing_record.setup_run_id:
+        sessions = list_remote_sessions(host, runner=runner)
+        if existing_record.setup_run_id in sessions:
+            _stage_summary(
+                existing_record,
+                source_action="reused" if source_result.reused else "uploaded",
+                json_output=args.json,
+            )
+            return 0
 
     setup_run_id = utc_run_id(f"uvsetup_{layout.stage_name}")
     setup_remote_dir = str(layout.launchers_dir / setup_run_id)
@@ -1397,6 +1437,7 @@ def run_stage(args: argparse.Namespace, *, runner=subprocess.run) -> int:
         paths=paths,
         source_sha256=layout.source_sha256,
         lock_sha256=layout.lock_sha256,
+        setup_environment_sha256=layout.setup_environment_sha256,
         python_request=project.contract.python_request,
         gpu_id=gpu_id,
         cuda_visibility_script=cuda_visibility_script,
@@ -1432,12 +1473,14 @@ def run_stage(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     )
     create_remote_dir(setup_plan, runner=runner)
     stage_tools.write_setup_payload(host, payload, runner=runner)
+    record_seed = existing_record or base_record
     record = stage_registry.write_record(
         replace(
-            base_record,
+            record_seed,
             setup_run_id=setup_run_id,
+            status="preparing",
             provenance={
-                **base_record.provenance,
+                **record_seed.provenance,
                 "source_reused": source_result.reused,
                 "selected_gpu": gpu_id or "",
             },
@@ -1462,7 +1505,11 @@ def run_stage(args: argparse.Namespace, *, runner=subprocess.run) -> int:
         stage_registry.update_status(record.stage_id, "launch_failed")
         raise
     write_record(replace(provisional, identity=identity))
-    _stage_summary(record, source_reused=source_result.reused, json_output=args.json)
+    _stage_summary(
+        record,
+        source_action="reused" if source_result.reused else "uploaded",
+        json_output=args.json,
+    )
     return 0
 
 
@@ -1476,11 +1523,15 @@ def run_run(args: argparse.Namespace, *, runner=subprocess.run, popener=subproce
         if host.ssh_host != record.ssh_host:
             raise RuntimeError(f"stage host catalog identity changed: {record.host}")
         if args.dry_run:
-            if record.status != "ready":
-                raise RuntimeError(f"stage is not locally marked ready: {record.stage_id} ({record.status})")
             env = parse_env(args.env)
         else:
             ensure_knuckles_master(runner=runner)
+            stage_tools.verify_registered_source(
+                host,
+                source_dir=record.source_path,
+                source_sha256=record.source_hash,
+                runner=runner,
+            )
             state_payload = dict(
                 stage_tools.probe_stage_state(
                     host,

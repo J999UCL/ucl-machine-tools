@@ -34,6 +34,7 @@ _REQUIRED_FIELDS = (
     "cache_path",
     "source_hash",
     "lock_hash",
+    "setup_environment_hash",
     "uv_version",
     "python_request",
 )
@@ -72,6 +73,7 @@ class StageRecord:
     cache_path: str
     source_hash: str
     lock_hash: str
+    setup_environment_hash: str
     uv_version: str
     python_request: str
     python_path: str = ""
@@ -169,7 +171,7 @@ def _validate_record(record: StageRecord) -> None:
         value = getattr(record, field_name)
         if _SAFE_TOKEN_PATTERN.fullmatch(value) is None:
             raise ValueError(f"invalid stage record {record.stage_id}: unsafe {field_name}")
-    for field_name in ("source_hash", "lock_hash"):
+    for field_name in ("source_hash", "lock_hash", "setup_environment_hash"):
         if _SHA256_PATTERN.fullmatch(getattr(record, field_name)) is None:
             raise ValueError(f"invalid stage record {record.stage_id}: {field_name} must be SHA-256")
     if _UV_VERSION_PATTERN.fullmatch(record.uv_version) is None:

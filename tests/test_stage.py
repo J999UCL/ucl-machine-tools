@@ -35,7 +35,9 @@ def _materialize(manifest, destination: Path) -> None:
         source = manifest.root / entry.path
         target = destination / entry.path
         target.parent.mkdir(parents=True, exist_ok=True)
-        if entry.kind == "symlink":
+        if entry.kind == "directory":
+            target.mkdir(exist_ok=True)
+        elif entry.kind == "symlink":
             target.symlink_to(entry.symlink_target)
         else:
             shutil.copy2(source, target)
@@ -82,6 +84,29 @@ def test_source_promoter_verifies_and_atomically_publishes_snapshot(tmp_path: Pa
     assert marker["source_sha256"] == manifest.source_sha256
     assert (final / "src" / "run.sh").stat().st_mode & 0o111
     assert os.readlink(final / "src" / "alias.sh") == "run.sh"
+    assert final.stat().st_mode & 0o222 == 0
+    assert (final / "pyproject.toml").stat().st_mode & 0o222 == 0
+
+    clean_probe = _run_generated(stage.build_source_probe_source(str(final), manifest))
+    assert stage._parse_sentinel(
+        clean_probe.stdout,
+        stage.SOURCE_SENTINEL_BEGIN,
+        stage.SOURCE_SENTINEL_END,
+        "source probe",
+    )["ready"] is True
+
+    tracked = final / "pyproject.toml"
+    tracked.chmod(0o644)
+    tracked.write_text("tampered\n", encoding="utf-8")
+    changed_probe = _run_generated(stage.build_source_probe_source(str(final), manifest))
+    changed = stage._parse_sentinel(
+        changed_probe.stdout,
+        stage.SOURCE_SENTINEL_BEGIN,
+        stage.SOURCE_SENTINEL_END,
+        "source probe",
+    )
+    assert changed["ok"] is False
+    assert any(word in str(changed["error"]) for word in ("differs", "writable"))
 
 
 def test_source_promoter_rejects_changed_bytes_and_removes_incoming(tmp_path: Path) -> None:
@@ -115,9 +140,10 @@ def test_source_promoter_rejects_changed_bytes_and_removes_incoming(tmp_path: Pa
 
 
 def test_source_probe_rejects_existing_unmanaged_directory(tmp_path: Path) -> None:
+    manifest = build_source_manifest(_project(tmp_path))
     source = tmp_path / "source"
     source.mkdir()
-    process = _run_generated(stage.build_source_probe_source(str(source), "a" * 64))
+    process = _run_generated(stage.build_source_probe_source(str(source), manifest))
     payload = stage._parse_sentinel(
         process.stdout,
         stage.SOURCE_SENTINEL_BEGIN,
@@ -125,7 +151,41 @@ def test_source_probe_rejects_existing_unmanaged_directory(tmp_path: Path) -> No
         "source probe",
     )
     assert payload["ok"] is False
-    assert "integrity marker" in str(payload["error"])
+    assert "integrity verification" in str(payload["error"])
+
+
+def test_failed_source_upload_requests_remote_incoming_cleanup(tmp_path: Path) -> None:
+    manifest = build_source_manifest(_project(tmp_path))
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def runner(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append((argv, kwargs))
+        if len(calls) == 1:
+            stdout = "\n".join(
+                (
+                    stage.SOURCE_SENTINEL_BEGIN,
+                    json.dumps({"schema_version": 1, "ok": True, "ready": False, "exists": False, "error": ""}),
+                    stage.SOURCE_SENTINEL_END,
+                )
+            )
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+        if len(calls) == 3:
+            return SimpleNamespace(returncode=23, stdout="", stderr="partial transfer")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with pytest.raises(RuntimeError, match="partial transfer"):
+        stage.sync_source_snapshot(
+            HostSpec("barbury-l", "barbury-l"),
+            manifest=manifest,
+            source_dir=f"/tmp/sources/{manifest.source_sha256}",
+            sources_dir="/tmp/sources",
+            runner=runner,
+        )
+
+    assert len(calls) == 4
+    cleanup_argv = calls[-1][0]
+    assert "shutil.rmtree" in " ".join(cleanup_argv)
+    assert ".incoming-" in " ".join(cleanup_argv)
 
 
 def test_state_probe_reports_missing_managed_paths(tmp_path: Path) -> None:
@@ -179,6 +239,7 @@ def test_setup_payload_writer_uses_private_files_and_argv_only(tmp_path: Path) -
             paths=paths,
             source_sha256="a" * 64,
             lock_sha256="b" * 64,
+            setup_environment_sha256="c" * 64,
             python_request="3.11.5",
         ),
         csh_driver_path=f"{root}/setup/setup.csh",
@@ -199,6 +260,7 @@ def test_setup_payload_writer_uses_private_files_and_argv_only(tmp_path: Path) -
 
 
 @pytest.mark.parametrize("value", ("relative", "/", "/tmp/root/../escape"))
-def test_stage_paths_reject_unsafe_values(value: str) -> None:
+def test_stage_paths_reject_unsafe_values(tmp_path: Path, value: str) -> None:
+    manifest = build_source_manifest(_project(tmp_path))
     with pytest.raises(ValueError):
-        stage.build_source_probe_source(value, "a" * 64)
+        stage.build_source_probe_source(value, manifest)

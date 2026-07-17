@@ -111,7 +111,8 @@ intentionally when dependencies change.
 The source snapshot follows nested `.gitignore` and `.uclignore` files and
 always excludes Git metadata, virtual environments, caches, secrets such as
 `.env`, and top-level data/output/checkpoint directories. The exact selected
-files are hashed locally, verified again remotely, and atomically promoted into
+files are copied into a stable local snapshot, rehashed, verified remotely, and
+atomically promoted into
 `REMOTE_ROOT/stages/NAME/sources/SHA256`. A changed included file creates a new
 stage identity; ignored data does not.
 
@@ -122,6 +123,10 @@ remote root, and runs `uv sync --frozen --no-editable` followed by
 `uv sync --frozen --check`. UV may use the TSG Python or install the version
 requested by `.python-version`. Concurrent setup for the same UV tool or
 environment is lock-serialized.
+
+The stage identity includes the remote root and a digest of setup environment
+values, so build-affecting changes cannot silently reuse another environment.
+Environment values themselves are not stored in the stage registry.
 
 Setup is asynchronous. Follow it with `ucl tail SETUP_RUN_ID --live`; once its
 state is ready, launch any script already in the snapshot with:

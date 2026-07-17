@@ -16,7 +16,9 @@ from ucl_machine_tools.uv_project import (
     check_uv_lock,
     derive_remote_layout,
     discover_local_uv,
+    hash_setup_environment,
     load_uv_project,
+    materialize_source_snapshot,
     validate_uv_project,
 )
 
@@ -258,6 +260,34 @@ def test_mandatory_exclusions_cannot_be_negated_and_env_example_is_allowed(tmp_p
     assert {".env", ".env.secret", "data/keep.txt", "nested/__pycache__/keep.pyc", ".venv/python", ".git/config"}.isdisjoint(paths)
 
 
+def test_manifest_rejects_ignored_contract_files_and_preserves_empty_directories(tmp_path: Path) -> None:
+    project = make_project(tmp_path / "project")
+    (project / "empty").mkdir()
+    manifest = build_source_manifest(project)
+    assert next(entry for entry in manifest.entries if entry.path == "empty").kind == "directory"
+
+    snapshot = materialize_source_snapshot(manifest)
+    try:
+        assert (snapshot.temporary_root / "empty").is_dir()
+    finally:
+        snapshot.cleanup()
+
+    (project / ".gitignore").write_text("uv.lock\n", encoding="utf-8")
+    with pytest.raises(UvProjectError, match="required UV contract file is excluded.*uv.lock"):
+        build_source_manifest(project)
+
+
+def test_materialized_snapshot_rejects_a_tree_changed_after_manifest(tmp_path: Path) -> None:
+    project = make_project(tmp_path / "project")
+    source = project / "module.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    manifest = build_source_manifest(project)
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+
+    with pytest.raises(UvProjectError, match="source changed while staging: module.py"):
+        materialize_source_snapshot(manifest)
+
+
 def test_manifest_walks_checked_out_submodule_contents(tmp_path: Path) -> None:
     project = make_project(tmp_path / "project")
     submodule = project / "vendor" / "library"
@@ -338,6 +368,7 @@ def test_remote_layout_is_safe_content_addressed_and_deterministic() -> None:
         uv_version="0.9.27",
         lock_sha256=lock_hash,
         source_sha256=source_hash,
+        setup_environment_sha256="c" * 64,
     )
     repeated = derive_remote_layout(
         remote_root="/tmp/thakwani/fpt",
@@ -346,6 +377,7 @@ def test_remote_layout_is_safe_content_addressed_and_deterministic() -> None:
         uv_version="0.9.27",
         lock_sha256=lock_hash,
         source_sha256=source_hash,
+        setup_environment_sha256="c" * 64,
     )
 
     assert layout == repeated
@@ -369,6 +401,7 @@ def test_remote_identity_changes_for_uv_lock_or_source() -> None:
         uv_version="0.9.27",
         lock_sha256="a" * 64,
         source_sha256="b" * 64,
+        setup_environment_sha256="e" * 64,
     )
     identities = {
         derive_remote_layout(**base).environment_id,
@@ -377,6 +410,28 @@ def test_remote_identity_changes_for_uv_lock_or_source() -> None:
         derive_remote_layout(**{**base, "source_sha256": "d" * 64}).environment_id,
     }
     assert len(identities) == 4
+
+
+def test_remote_identity_includes_setup_environment_and_remote_root() -> None:
+    base = dict(
+        remote_root="/tmp/project-a",
+        stage_name="demo",
+        host="canada-l",
+        uv_version="0.9.27",
+        lock_sha256="a" * 64,
+        source_sha256="b" * 64,
+        setup_environment_sha256=hash_setup_environment((("BUILD_FLAG", "one"),)),
+    )
+    first = derive_remote_layout(**base)
+    different_env = derive_remote_layout(
+        **{**base, "setup_environment_sha256": hash_setup_environment((("BUILD_FLAG", "two"),))}
+    )
+    different_root = derive_remote_layout(**{**base, "remote_root": "/tmp/project-b"})
+
+    assert different_env.environment_id != first.environment_id
+    assert different_env.stage_id != first.stage_id
+    assert different_root.environment_id == first.environment_id
+    assert different_root.stage_id != first.stage_id
 
 
 @pytest.mark.parametrize(
@@ -400,6 +455,7 @@ def test_remote_layout_rejects_unsafe_inputs(changes: dict[str, str], message: s
         "uv_version": "0.9.27",
         "lock_sha256": "a" * 64,
         "source_sha256": "b" * 64,
+        "setup_environment_sha256": "c" * 64,
     }
     args.update(changes)
 

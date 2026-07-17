@@ -62,28 +62,100 @@ def _parse_sentinel(stdout: str, begin: str, end: str, label: str) -> dict[str, 
     return payload
 
 
-def build_source_probe_source(source_dir: str, source_sha256: str) -> str:
+def build_source_probe_source(
+    source_dir: str,
+    manifest: SourceManifest | None = None,
+    *,
+    source_sha256: str | None = None,
+) -> str:
     source = _safe_absolute_path(source_dir, "source_dir")
     marker = posixpath.join(source, SOURCE_MARKER_NAME)
-    return f'''import json
+    if (manifest is None) == (source_sha256 is None):
+        raise ValueError("source probe requires exactly one of manifest or source_sha256")
+    expected = manifest.as_dict() if manifest is not None else None
+    expected_hash = manifest.source_sha256 if manifest is not None else source_sha256
+    expected_literal = (
+        f"json.loads({json.dumps(json.dumps(expected, sort_keys=True))})"
+        if expected is not None
+        else "None"
+    )
+    return f'''import hashlib
+import json
+import os
 from pathlib import Path
+import stat
 
 BEGIN = {SOURCE_SENTINEL_BEGIN!r}
 END = {SOURCE_SENTINEL_END!r}
 SOURCE = Path({source!r})
 MARKER = Path({marker!r})
-EXPECTED = {source_sha256!r}
+EXPECTED_LITERAL = {expected_literal}
+EXPECTED_HASH = {expected_hash!r}
 payload = {{"schema_version": 1, "ok": True, "ready": False, "exists": SOURCE.exists(), "error": ""}}
 if SOURCE.exists():
     try:
         marker = json.loads(MARKER.read_text(encoding="utf-8"))
-        payload["ready"] = marker.get("schema_version") == 1 and marker.get("source_sha256") == EXPECTED
-        if not payload["ready"]:
-            payload["ok"] = False
-            payload["error"] = "existing source directory has no matching integrity marker"
-    except (OSError, json.JSONDecodeError) as exc:
+        EXPECTED = EXPECTED_LITERAL if EXPECTED_LITERAL is not None else marker
+        if marker != EXPECTED or marker.get("source_sha256") != EXPECTED_HASH or not SOURCE.is_dir() or SOURCE.is_symlink():
+            raise ValueError("integrity marker or source directory does not match")
+        marker_digest = hashlib.sha256()
+        marker_digest.update(b"ucl-source-manifest-v1\\n")
+        for entry in marker.get("entries", []):
+            marker_digest.update(json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
+            marker_digest.update(b"\\n")
+        if marker_digest.hexdigest() != EXPECTED_HASH:
+            raise ValueError("integrity marker entries do not match the registered source identity")
+        if SOURCE.stat().st_mode & 0o222 or MARKER.stat().st_mode & 0o222:
+            raise ValueError("source snapshot is not immutable")
+        actual = {{}}
+        for base, directories, names in os.walk(SOURCE, followlinks=False):
+            base_path = Path(base)
+            for name in list(directories):
+                path = base_path / name
+                if path.is_symlink():
+                    target = os.readlink(path)
+                    actual[path.relative_to(SOURCE).as_posix()] = ("symlink", target, False, len(os.fsencode(target)))
+                    directories.remove(name)
+                elif path.stat().st_mode & 0o222:
+                    raise ValueError(f"source directory is writable: {{path.relative_to(SOURCE).as_posix()}}")
+                else:
+                    info = path.stat()
+                    actual[path.relative_to(SOURCE).as_posix()] = (
+                        "directory",
+                        None,
+                        bool(stat.S_IMODE(info.st_mode) & 0o111),
+                        0,
+                    )
+            for name in names:
+                if base_path == SOURCE and name == {SOURCE_MARKER_NAME!r}:
+                    continue
+                path = base_path / name
+                relative = path.relative_to(SOURCE).as_posix()
+                info = path.lstat()
+                if stat.S_ISLNK(info.st_mode):
+                    target = os.readlink(path)
+                    actual[relative] = ("symlink", target, False, len(os.fsencode(target)))
+                elif stat.S_ISREG(info.st_mode):
+                    if info.st_mode & 0o222:
+                        raise ValueError(f"source file is writable: {{relative}}")
+                    digest = hashlib.sha256()
+                    with path.open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                    actual[relative] = ("file", digest.hexdigest(), bool(stat.S_IMODE(info.st_mode) & 0o111), info.st_size)
+                else:
+                    raise ValueError(f"unsupported source entry: {{relative}}")
+        if set(actual) != {{entry["path"] for entry in EXPECTED["entries"]}}:
+            raise ValueError("source paths differ from the staged manifest")
+        for entry in EXPECTED["entries"]:
+            kind, identity, executable, size = actual[entry["path"]]
+            expected_identity = entry.get("sha256") if kind == "file" else entry.get("symlink_target")
+            if (kind, identity, executable, size) != (entry["kind"], expected_identity, entry["executable"], entry["size"]):
+                raise ValueError(f"source entry differs from the staged manifest: {{entry['path']}}")
+        payload["ready"] = True
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         payload["ok"] = False
-        payload["error"] = f"existing source integrity marker is unreadable: {{exc}}"
+        payload["error"] = f"existing source integrity verification failed: {{exc}}"
 print(BEGIN)
 print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
 print(END)
@@ -125,12 +197,12 @@ def probe_remote_source(
     host: HostSpec,
     *,
     source_dir: str,
-    source_sha256: str,
+    manifest: SourceManifest,
     runner: Runner = subprocess.run,
 ) -> bool:
     payload = _run_remote_python(
         host,
-        build_source_probe_source(source_dir, source_sha256),
+        build_source_probe_source(source_dir, manifest),
         runner=runner,
         label="source probe",
         begin=SOURCE_SENTINEL_BEGIN,
@@ -141,11 +213,39 @@ def probe_remote_source(
     return bool(payload.get("ready"))
 
 
-def build_source_prepare_source(*, incoming_dir: str, sources_dir: str) -> str:
+def verify_registered_source(
+    host: HostSpec,
+    *,
+    source_dir: str,
+    source_sha256: str,
+    runner: Runner = subprocess.run,
+) -> None:
+    payload = _run_remote_python(
+        host,
+        build_source_probe_source(source_dir, source_sha256=source_sha256),
+        runner=runner,
+        label="registered source verification",
+        begin=SOURCE_SENTINEL_BEGIN,
+        end=SOURCE_SENTINEL_END,
+    )
+    if not payload.get("ok") or not payload.get("ready"):
+        raise RuntimeError(str(payload.get("error") or "registered source is not ready"))
+
+
+def build_source_prepare_source(
+    *,
+    incoming_dir: str,
+    sources_dir: str,
+    directories: tuple[str, ...] = (),
+) -> str:
     incoming = _safe_absolute_path(incoming_dir, "incoming_dir")
     sources = _safe_absolute_path(sources_dir, "sources_dir")
     if posixpath.commonpath((incoming, sources)) != sources or incoming == sources:
         raise ValueError("incoming_dir must be beneath sources_dir")
+    for directory in directories:
+        path = PurePosixPath(directory)
+        if path.is_absolute() or ".." in path.parts or str(path) in {"", "."}:
+            raise ValueError(f"unsafe source directory path: {directory!r}")
     return f'''from pathlib import Path
 import shutil
 
@@ -153,8 +253,10 @@ incoming = Path({incoming!r})
 sources = Path({sources!r})
 sources.mkdir(parents=True, exist_ok=True)
 if incoming.exists() or incoming.is_symlink():
-    shutil.rmtree(incoming)
+    incoming.unlink() if incoming.is_symlink() else shutil.rmtree(incoming)
 incoming.mkdir(mode=0o700)
+for relative in {directories!r}:
+    (incoming / relative).mkdir(parents=True, exist_ok=True)
 '''
 
 
@@ -216,6 +318,13 @@ try:
                 relative = path.relative_to(INCOMING).as_posix()
                 actual[relative] = ("symlink", os.readlink(path), False, len(os.fsencode(os.readlink(path))))
                 directories.remove(name)
+            else:
+                actual[path.relative_to(INCOMING).as_posix()] = (
+                    "directory",
+                    None,
+                    bool(stat.S_IMODE(path.stat().st_mode) & 0o111),
+                    0,
+                )
         for name in names:
             path = base_path / name
             relative = path.relative_to(INCOMING).as_posix()
@@ -241,13 +350,7 @@ try:
         if identity != expected_identity:
             fail(f"source content mismatch: {{entry['path']}}")
 
-    marker = {{
-        "schema_version": 1,
-        "source_sha256": EXPECTED["source_sha256"],
-        "file_count": EXPECTED["file_count"],
-        "symlink_count": EXPECTED["symlink_count"],
-        "total_bytes": EXPECTED["total_bytes"],
-    }}
+    marker = EXPECTED
     marker_path = INCOMING / MARKER_NAME
     marker_path.write_text(json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\\n", encoding="utf-8")
     marker_path.chmod(0o600)
@@ -263,10 +366,32 @@ try:
                 fail(f"existing final source has invalid integrity marker: {{exc}}")
             if existing.get("source_sha256") != EXPECTED["source_sha256"]:
                 fail("existing final source has a different source identity")
+            existing_digest = hashlib.sha256()
+            existing_digest.update(b"ucl-source-manifest-v1\\n")
+            for entry in existing.get("entries", []):
+                existing_digest.update(json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
+                existing_digest.update(b"\\n")
+            if existing_digest.hexdigest() != EXPECTED["source_sha256"]:
+                fail("existing final source has a forged or corrupt integrity marker")
             shutil.rmtree(INCOMING)
             reused = True
         else:
+            expected_by_path = {{entry["path"]: entry for entry in EXPECTED["entries"]}}
+            marker_path.chmod(0o444)
+            for base, directories, names in os.walk(INCOMING, topdown=False, followlinks=False):
+                base_path = Path(base)
+                for name in names:
+                    path = base_path / name
+                    if path.is_symlink() or path == marker_path:
+                        continue
+                    entry = expected_by_path[path.relative_to(INCOMING).as_posix()]
+                    path.chmod(0o555 if entry["executable"] else 0o444)
+                for name in directories:
+                    path = base_path / name
+                    if not path.is_symlink():
+                        path.chmod(0o555)
             os.replace(INCOMING, FINAL)
+            FINAL.chmod(0o555)
     payload = {{
         "schema_version": 1,
         "ok": True,
@@ -297,7 +422,7 @@ def sync_source_snapshot(
     if probe_remote_source(
         host,
         source_dir=source_dir,
-        source_sha256=manifest.source_sha256,
+        manifest=manifest,
         runner=runner,
     ):
         return SourceSyncResult(
@@ -311,7 +436,11 @@ def sync_source_snapshot(
     incoming = posixpath.join(sources_dir, f".incoming-{manifest.source_sha256[:16]}-{uuid.uuid4().hex}")
     prepare = runner(
         build_remote_python_argv(host.ssh_host, timeout_seconds=30),
-        input=build_source_prepare_source(incoming_dir=incoming, sources_dir=sources_dir),
+        input=build_source_prepare_source(
+            incoming_dir=incoming,
+            sources_dir=sources_dir,
+            directories=tuple(entry.path for entry in manifest.entries if entry.kind == "directory"),
+        ),
         capture_output=True,
         text=True,
         shell=False,
@@ -333,7 +462,7 @@ def sync_source_snapshot(
         destination_endpoint,
         source_is_directory=True,
     )
-    paths = [entry.path for entry in manifest.entries]
+    paths = [entry.path for entry in manifest.entries if entry.kind != "directory"]
     transfer = runner(
         argv,
         input=copy_tools.files_from_input(paths),
@@ -343,6 +472,24 @@ def sync_source_snapshot(
     )
     if int(getattr(transfer, "returncode", 1)) != 0:
         detail = (getattr(transfer, "stderr", "") or getattr(transfer, "stdout", "") or "").strip()
+        cleanup = runner(
+            build_remote_argv(
+                host.ssh_host,
+                (
+                    "python3",
+                    "-c",
+                    "import pathlib,shutil,sys; p=pathlib.Path(sys.argv[1]); "
+                    "shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink(missing_ok=True)",
+                    incoming,
+                ),
+            ),
+            capture_output=True,
+            text=True,
+            shell=False,
+        )
+        if int(getattr(cleanup, "returncode", 1)) != 0:
+            cleanup_detail = (getattr(cleanup, "stderr", "") or getattr(cleanup, "stdout", "") or "").strip()
+            detail = f"{detail or 'source upload failed'}; cleanup failed: {cleanup_detail or 'unknown error'}"
         raise RuntimeError(detail or f"source upload failed on {host.name}")
 
     payload = _run_remote_python(
@@ -415,7 +562,7 @@ ready = Path({ready!r})
 failed = Path({failed!r})
 required_script = {required_script!r}
 payload = {{"schema_version": 1, "status": "missing", "state": None}}
-target = ready if ready.is_file() else failed if failed.is_file() else None
+target = ready if ready.is_file() and not ready.is_symlink() else failed if failed.is_file() and not failed.is_symlink() else None
 if target is not None:
     try:
         payload["state"] = json.loads(target.read_text(encoding="utf-8"))
@@ -432,13 +579,13 @@ if target is not None:
             for field, kind in checks.items():
                 value = state.get(field)
                 path = Path(value) if isinstance(value, str) and value.startswith("/") else None
-                exists = path is not None and (path.is_dir() if kind == "dir" else path.is_file())
+                exists = path is not None and not path.is_symlink() and (path.is_dir() if kind == "dir" else path.is_file())
                 if not exists:
                     missing.append(field)
             if required_script:
                 source_dir = state.get("source_dir")
                 script_path = Path(source_dir) / required_script if isinstance(source_dir, str) else None
-                if script_path is None or not script_path.is_file():
+                if script_path is None or script_path.is_symlink() or not script_path.is_file():
                     missing.append(f"script:{{required_script}}")
         payload["missing_paths"] = missing
     except (OSError, json.JSONDecodeError) as exc:

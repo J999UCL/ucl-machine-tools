@@ -138,6 +138,7 @@ def setup_state(record: StageRecord, *, status: str = "ready") -> dict[str, Any]
         "uv_version": record.uv_version,
         "source_sha256": record.source_hash,
         "lock_sha256": record.lock_hash,
+        "setup_environment_sha256": record.setup_environment_hash,
         "python_request": record.python_request,
         "python_path": record.python_path,
         "source_dir": record.source_path,
@@ -446,6 +447,46 @@ def test_stage_uploads_content_addressed_source_and_launches_dedicated_setup_tmu
     assert not any(path.startswith("data/") for path in manifest_paths)
     assert not any(path.startswith(".venv/") for path in manifest_paths)
     assert ".env" not in manifest_paths
+
+
+def test_repeated_stage_reuses_the_in_progress_setup_job(workflow: SimpleNamespace) -> None:
+    assert invoke_stage(workflow) == 0
+    first = stage_registry.list_records()[0]
+    workflow.runner.tmux_sessions = (first.setup_run_id,)
+    launches_before = workflow.runner.joined_calls().count(job_control.LAUNCH_SENTINEL_BEGIN)
+
+    assert invoke_stage(workflow) == 0
+
+    current = stage_registry.read_record(first.stage_id)
+    assert current.setup_run_id == first.setup_run_id
+    assert current.created_at == first.created_at
+    assert workflow.runner.joined_calls().count(job_control.LAUNCH_SENTINEL_BEGIN) == launches_before
+
+
+def test_setup_environment_changes_stage_identity_without_persisting_values(
+    workflow: SimpleNamespace,
+) -> None:
+    assert invoke_stage(workflow, "--env", "BUILD_FLAG=supersecret-one") == 0
+    assert invoke_stage(workflow, "--env", "BUILD_FLAG=supersecret-two") == 0
+
+    records = stage_registry.list_records()
+    assert len(records) == 2
+    assert records[0].stage_id != records[1].stage_id
+    assert records[0].setup_environment_hash != records[1].setup_environment_hash
+    registry_text = "\n".join(path.read_text(encoding="utf-8") for path in (workflow.cache / "stages").glob("*.json"))
+    assert "supersecret-one" not in registry_text
+    assert "supersecret-two" not in registry_text
+
+
+def test_stage_dry_run_reports_that_source_was_not_checked(
+    workflow: SimpleNamespace,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert invoke_stage(workflow, "--dry-run", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "planned"
+    assert payload["source_action"] == "not_checked"
+    assert workflow.runner.transfer_count() == 0
 
 
 def test_identical_stage_reuses_content_addressed_source_and_environment(

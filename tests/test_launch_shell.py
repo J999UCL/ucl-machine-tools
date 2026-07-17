@@ -229,5 +229,7 @@ def test_upload_and_launcher_writes_use_argv_only(tmp_path: Path) -> None:
     assert popen_calls[0][:2] == ["tar", "-cf"]
     assert all(call[0] == "python3" for call in runner_calls)
     assert all("--logical-argv" in call for call in runner_calls)
+    assert "umask 077" in " ".join(runner_calls[-1])
+    assert "chmod 700" in " ".join(runner_calls[-1])
     assert "scp" not in " ".join(" ".join(call) for call in runner_calls)
     assert all("rsync" not in call for call in runner_calls)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 from pathlib import Path
@@ -8,6 +9,9 @@ from pathlib import Path
 import pytest
 
 from ucl_machine_tools import uv_remote
+
+
+PROJECT_LOCK_SHA256 = hashlib.sha256(b"version = 1\n").hexdigest()
 
 
 def make_spec(tmp_path: Path, **overrides: object) -> uv_remote.UvSetupSpec:
@@ -29,7 +33,8 @@ def make_spec(tmp_path: Path, **overrides: object) -> uv_remote.UvSetupSpec:
         "uv_version": "0.8.14",
         "paths": paths,
         "source_sha256": "a" * 64,
-        "lock_sha256": "b" * 64,
+        "lock_sha256": PROJECT_LOCK_SHA256,
+        "setup_environment_sha256": "c" * 64,
         "python_request": "3.11.5",
         "gpu_id": "0",
         "cuda_visibility_script": "/usr/local/cuda/CUDA_VISIBILITY.csh",
@@ -56,6 +61,7 @@ def result_payload(**overrides: object) -> dict[str, object]:
         "uv_version": "0.8.14",
         "source_sha256": "a" * 64,
         "lock_sha256": "b" * 64,
+        "setup_environment_sha256": "c" * 64,
         "python_request": "3.11.5",
         "python_path": "/tmp/project/env/bin/python",
         "source_dir": "/tmp/project/source",
@@ -141,6 +147,8 @@ def test_setup_uses_frozen_lock_sync_check_and_managed_python_paths(tmp_path: Pa
     assert "UV_PROJECT_ENVIRONMENT=" in source
     assert "UV_PYTHON_INSTALL_DIR=" in source
     assert "UV_PYTHON_DOWNLOADS" not in source
+    assert 'cp -a -- "$UCL_SOURCE_DIR/." "$ucl_build_source/"' in source
+    assert 'chmod -R u+w "$ucl_build_source"' in source
 
 
 def test_setup_has_separate_tool_and_environment_locks_and_atomic_state(tmp_path: Path) -> None:
@@ -373,11 +381,20 @@ def _run_bash_payload(
     fail: bool = False,
     counter: Path | None = None,
     sleep: float = 0,
+    readonly_source: bool = False,
+    tamper_lock: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     bin_dir = tmp_path / "fake-bin"
     bin_dir.mkdir(exist_ok=True)
     _write_fake_installer(bin_dir)
-    _write_project_contract(Path(payload.spec.paths.source_dir))
+    source_dir = Path(payload.spec.paths.source_dir)
+    _write_project_contract(source_dir)
+    if tamper_lock:
+        (source_dir / "uv.lock").write_text("version = 2\n", encoding="utf-8")
+    if readonly_source:
+        for path in source_dir.rglob("*"):
+            path.chmod(0o555 if path.is_dir() else 0o444)
+        source_dir.chmod(0o555)
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
     if fail:
@@ -385,15 +402,24 @@ def _run_bash_payload(
     if counter is not None:
         env["FAKE_UV_COUNTER"] = str(counter)
     env["FAKE_UV_SLEEP"] = str(sleep)
-    return subprocess.run(
-        ["/bin/bash", "--noprofile", "--norc"],
-        input=payload.bash_source,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=15,
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            ["/bin/bash", "--noprofile", "--norc"],
+            input=payload.bash_source,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=15,
+            check=False,
+        )
+    finally:
+        if readonly_source:
+            source_dir.chmod(0o755)
+            for path in source_dir.rglob("*"):
+                if path.is_dir():
+                    path.chmod(0o755)
+                elif not path.is_symlink():
+                    path.chmod(0o644)
 
 
 def test_generated_setup_driver_succeeds_then_reuses_exact_tool_and_environment(tmp_path: Path) -> None:
@@ -415,6 +441,15 @@ def test_generated_setup_driver_succeeds_then_reuses_exact_tool_and_environment(
     assert not Path(payload.spec.paths.failed_state_path).exists()
 
 
+def test_generated_setup_driver_builds_from_readonly_immutable_source(tmp_path: Path) -> None:
+    payload = build_payload(tmp_path, gpu_id=None, cuda_visibility_script=None)
+
+    process = _run_bash_payload(payload, tmp_path, readonly_source=True)
+
+    assert process.returncode == 0, process.stdout
+    assert uv_remote.parse_setup_result(process.stdout).ok
+
+
 def test_generated_setup_driver_writes_exact_structured_failure_and_no_ready_marker(tmp_path: Path) -> None:
     payload = build_payload(tmp_path, gpu_id=None, cuda_visibility_script=None)
 
@@ -430,6 +465,25 @@ def test_generated_setup_driver_writes_exact_structured_failure_and_no_ready_mar
     failed = uv_remote.parse_state_json(Path(payload.spec.paths.failed_state_path).read_text(encoding="utf-8"))
     assert failed.error == result.error
     assert not Path(payload.spec.paths.ready_state_path).exists()
+
+
+def test_generated_setup_driver_rejects_a_changed_lock_before_bootstrap(tmp_path: Path) -> None:
+    payload = build_payload(tmp_path, gpu_id=None, cuda_visibility_script=None)
+
+    process = _run_bash_payload(payload, tmp_path, tamper_lock=True)
+
+    assert process.returncode != 0
+    result = uv_remote.parse_setup_result(process.stdout)
+    assert result.phase == "preflight"
+    assert "uv.lock digest mismatch" in result.error
+    assert not Path(payload.spec.paths.uv_binary_path).exists()
+
+
+def test_setup_failure_handlers_do_not_remove_another_jobs_ready_state(tmp_path: Path) -> None:
+    payload = build_payload(tmp_path, gpu_id=None, cuda_visibility_script=None)
+
+    assert 'rm -f -- "$UCL_READY_STATE"' not in payload.bash_source
+    assert "trap 'ucl_cancel 129 HUP' HUP" in payload.bash_source
     assert not Path(payload.spec.paths.environment_dir).exists()
 
 

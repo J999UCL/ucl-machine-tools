@@ -10,6 +10,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Literal
 
@@ -75,6 +76,7 @@ class UvProjectContract:
     python_version_path: Path
     python_request: str
     lock_sha256: str
+    python_version_sha256: str
 
 
 @dataclass(frozen=True)
@@ -90,7 +92,7 @@ class SourceEntry:
     """One portable, content-addressed entry in a project snapshot."""
 
     path: str
-    kind: Literal["file", "symlink"]
+    kind: Literal["file", "symlink", "directory"]
     executable: bool
     size: int
     sha256: str | None = None
@@ -125,9 +127,19 @@ class SourceManifest:
             "source_sha256": self.source_sha256,
             "file_count": sum(entry.kind == "file" for entry in self.entries),
             "symlink_count": sum(entry.kind == "symlink" for entry in self.entries),
+            "directory_count": sum(entry.kind == "directory" for entry in self.entries),
             "total_bytes": self.total_bytes,
             "entries": [entry.as_dict() for entry in self.entries],
         }
+
+
+@dataclass
+class MaterializedSourceSnapshot:
+    manifest: SourceManifest
+    temporary_root: Path
+
+    def cleanup(self) -> None:
+        shutil.rmtree(self.temporary_root, ignore_errors=False)
 
 
 @dataclass(frozen=True)
@@ -157,6 +169,7 @@ class RemoteUvLayout:
     uv_version: str
     lock_sha256: str
     source_sha256: str
+    setup_environment_sha256: str
     environment_id: str
     stage_id: str
     uv_tools_dir: PurePosixPath
@@ -248,6 +261,7 @@ def validate_uv_project(project_dir: Path | str) -> UvProjectContract:
         python_version_path=python_version,
         python_request=python_request,
         lock_sha256=_sha256_file(lock),
+        python_version_sha256=_sha256_file(python_version),
     )
 
 
@@ -413,6 +427,18 @@ def _symlink_entry(root: Path, path: Path) -> SourceEntry:
     )
 
 
+def _directory_entry(root: Path, path: Path, info: os.stat_result) -> SourceEntry:
+    executable = bool(stat.S_IMODE(info.st_mode) & 0o111)
+    if not executable:
+        raise UvProjectError(f"source directory is not traversable: {path.relative_to(root)}")
+    return SourceEntry(
+        path=path.relative_to(root).as_posix(),
+        kind="directory",
+        executable=executable,
+        size=0,
+    )
+
+
 def _source_identity(entries: Iterable[SourceEntry]) -> str:
     digest = hashlib.sha256()
     digest.update(b"ucl-source-manifest-v1\n")
@@ -480,6 +506,7 @@ def build_source_manifest(project_dir: Path | str) -> SourceManifest:
             if stat.S_ISLNK(info.st_mode):
                 entries.append(_symlink_entry(root, path))
             elif is_directory:
+                entries.append(_directory_entry(root, path, info))
                 visit(path, child_parts, tuple(git_scopes), tuple(ucl_scopes))
             elif stat.S_ISREG(info.st_mode):
                 entries.append(_file_entry(root, path, info))
@@ -490,12 +517,59 @@ def build_source_manifest(project_dir: Path | str) -> SourceManifest:
 
     visit(root, (), (), ())
     ordered = tuple(sorted(entries, key=lambda entry: entry.path))
-    return SourceManifest(
+    manifest = SourceManifest(
         root=root,
         entries=ordered,
         source_sha256=_source_identity(ordered),
         total_bytes=sum(entry.size for entry in ordered if entry.kind == "file"),
     )
+    entry_by_path = {entry.path: entry for entry in manifest.entries}
+    for required in ("pyproject.toml", "uv.lock", ".python-version"):
+        entry = entry_by_path.get(required)
+        if entry is None or entry.kind != "file":
+            raise UvProjectError(f"required UV contract file is excluded from the source snapshot: {required}")
+    return manifest
+
+
+def materialize_source_snapshot(manifest: SourceManifest) -> MaterializedSourceSnapshot:
+    """Copy the verified manifest bytes into a stable local transfer tree."""
+
+    temporary_root = Path(tempfile.mkdtemp(prefix="ucl-stage-source-"))
+    try:
+        for entry in manifest.entries:
+            source = manifest.root / entry.path
+            destination = temporary_root / entry.path
+            if entry.kind == "directory":
+                destination.mkdir(parents=True, exist_ok=True)
+                destination.chmod(0o755 if entry.executable else 0o644)
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if entry.kind == "symlink":
+                current_target = os.readlink(source)
+                if current_target != entry.symlink_target:
+                    raise UvProjectError(f"source changed while staging: {entry.path}")
+                destination.symlink_to(current_target)
+                continue
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(source, flags)
+            except OSError as exc:
+                raise UvProjectError(f"source changed while staging: {entry.path}") from exc
+            with os.fdopen(descriptor, "rb") as source_handle, destination.open("xb") as destination_handle:
+                shutil.copyfileobj(source_handle, destination_handle, length=1024 * 1024)
+            destination.chmod(0o755 if entry.executable else 0o644)
+            if destination.stat().st_size != entry.size or _sha256_file(destination) != entry.sha256:
+                raise UvProjectError(f"source changed while staging: {entry.path}")
+        stable = SourceManifest(
+            root=temporary_root,
+            entries=manifest.entries,
+            source_sha256=manifest.source_sha256,
+            total_bytes=manifest.total_bytes,
+        )
+        return MaterializedSourceSnapshot(manifest=stable, temporary_root=temporary_root)
+    except Exception:
+        shutil.rmtree(temporary_root, ignore_errors=True)
+        raise
 
 
 def load_uv_project(
@@ -510,6 +584,12 @@ def load_uv_project(
     uv = discover_local_uv(runner=runner, which=which)
     check_uv_lock(contract, uv, runner=runner)
     manifest = build_source_manifest(contract.root)
+    lock_entry = next(entry for entry in manifest.entries if entry.path == "uv.lock")
+    if lock_entry.sha256 != contract.lock_sha256:
+        raise UvProjectError("uv.lock changed while staging; retry from a stable working tree")
+    python_entry = next(entry for entry in manifest.entries if entry.path == ".python-version")
+    if python_entry.sha256 != contract.python_version_sha256:
+        raise UvProjectError(".python-version changed while staging; retry from a stable working tree")
     return UvProjectSpec(contract=contract, uv=uv, manifest=manifest)
 
 
@@ -537,6 +617,18 @@ def _validate_sha256(value: str, label: str) -> None:
         raise UvProjectError(f"{label} must be a lowercase SHA-256 digest")
 
 
+def hash_setup_environment(environment: Iterable[tuple[str, str]]) -> str:
+    """Hash setup-affecting environment values without persisting them."""
+
+    normalized: dict[str, str] = {}
+    for key, value in environment:
+        if key in normalized:
+            raise UvProjectError(f"duplicate setup environment key: {key}")
+        normalized[key] = value
+    payload = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def derive_remote_layout(
     *,
     remote_root: str | PurePosixPath,
@@ -545,6 +637,7 @@ def derive_remote_layout(
     uv_version: str,
     lock_sha256: str,
     source_sha256: str,
+    setup_environment_sha256: str,
 ) -> RemoteUvLayout:
     """Derive deterministic managed paths without consulting remote state."""
 
@@ -554,18 +647,27 @@ def derive_remote_layout(
     _validate_token(uv_version, "uv version", _SAFE_VERSION_RE)
     _validate_sha256(lock_sha256, "lock_sha256")
     _validate_sha256(source_sha256, "source_sha256")
+    _validate_sha256(setup_environment_sha256, "setup_environment_sha256")
 
     identity_payload = json.dumps(
         {
             "uv_version": uv_version,
             "lock_sha256": lock_sha256,
             "source_sha256": source_sha256,
+            "setup_environment_sha256": setup_environment_sha256,
         },
         sort_keys=True,
         separators=(",", ":"),
     ).encode("ascii")
     environment_id = hashlib.sha256(identity_payload).hexdigest()
-    stage_id = f"{stage_name}-{host}-{environment_id[:16]}"
+    stage_identity = hashlib.sha256(
+        json.dumps(
+            {"environment_id": environment_id, "remote_root": str(root)},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    stage_id = f"{stage_name}-{host}-{stage_identity[:16]}"
     stage_root = root / "stages" / stage_name
     uv_tools_dir = root / "tools" / "uv" / uv_version
     sources_dir = stage_root / "sources"
@@ -579,6 +681,7 @@ def derive_remote_layout(
         uv_version=uv_version,
         lock_sha256=lock_sha256,
         source_sha256=source_sha256,
+        setup_environment_sha256=setup_environment_sha256,
         environment_id=environment_id,
         stage_id=stage_id,
         uv_tools_dir=uv_tools_dir,

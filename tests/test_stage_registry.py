@@ -41,6 +41,7 @@ def make_record(
         state_path=f"{root}/stages/fpt/state/{stage_id}.json",
         source_hash="a" * 64,
         lock_hash="b" * 64,
+        setup_environment_hash="d" * 64,
         uv_version="1.2.3",
         python_request="3.11.5",
         setup_run_id=f"{stage_id}-setup",

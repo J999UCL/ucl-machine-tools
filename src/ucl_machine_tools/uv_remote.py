@@ -107,6 +107,7 @@ class UvSetupSpec:
     paths: UvRemotePaths
     source_sha256: str
     lock_sha256: str
+    setup_environment_sha256: str
     python_request: str
     gpu_id: str | None = None
     cuda_visibility_script: str | None = None
@@ -120,6 +121,7 @@ class UvSetupSpec:
         for value, label in (
             (self.source_sha256, "source_sha256"),
             (self.lock_sha256, "lock_sha256"),
+            (self.setup_environment_sha256, "setup_environment_sha256"),
         ):
             if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
                 raise ValueError(f"{label} must be a lowercase SHA-256 digest")
@@ -189,6 +191,7 @@ class UvSetupResult:
     uv_version: str
     source_sha256: str
     lock_sha256: str
+    setup_environment_sha256: str
     python_request: str
     python_path: str
     source_dir: str
@@ -229,7 +232,7 @@ def _relative_binary_path(paths: UvRemotePaths) -> str:
 def _build_csh_source(spec: UvSetupSpec, bash_driver_path: str) -> str:
     lines = [
         "#!/bin/csh -f",
-        "source /opt/Python/Python-3.11.5_Setup.csh",
+        f"source {TSG_PYTHON_SETUP}",
         "if ($status != 0) setenv UCL_TSG_BOOTSTRAP_ERROR python_setup_failed",
     ]
     if spec.gpu_id is not None:
@@ -259,6 +262,7 @@ def _build_bash_source(spec: UvSetupSpec) -> str:
             _bash_assignment("UCL_UV_VERSION", spec.uv_version),
             _bash_assignment("UCL_SOURCE_SHA256", spec.source_sha256),
             _bash_assignment("UCL_LOCK_SHA256", spec.lock_sha256),
+            _bash_assignment("UCL_SETUP_ENVIRONMENT_SHA256", spec.setup_environment_sha256),
             _bash_assignment("UCL_PYTHON_REQUEST", spec.python_request),
             _bash_assignment("UCL_SOURCE_DIR", paths.source_dir),
             _bash_assignment("UCL_ENVIRONMENT_DIR", paths.environment_dir),
@@ -295,6 +299,7 @@ UCL_ENVIRONMENT_CREATED=false
 UCL_PYTHON_PATH=""
 ucl_tool_temp=""
 ucl_installer=""
+ucl_build_source=""
 
 mkdir -p -- "$(dirname -- "$UCL_LOG_PATH")"
 exec > >(tee -a "$UCL_LOG_PATH") 2>&1
@@ -309,6 +314,7 @@ ucl_write_state() {{
   local failed_line="$7"
   python3 - "$target" "$ok" "$status" "$CURRENT_PHASE" "$returncode" "$error" "$failed_command" "$failed_line" \
     "$REUSED_UV" "$REUSED_ENVIRONMENT" "$UCL_UV_VERSION" "$UCL_SOURCE_SHA256" "$UCL_LOCK_SHA256" \
+    "$UCL_SETUP_ENVIRONMENT_SHA256" \
     "$UCL_PYTHON_REQUEST" "$UCL_PYTHON_PATH" "$UCL_SOURCE_DIR" "$UCL_ENVIRONMENT_DIR" \
     "$UCL_UV_BINARY" "$UCL_READY_STATE" "$UCL_FAILED_STATE" "$UCL_LOG_PATH" \
     "$UCL_SENTINEL_BEGIN" "$UCL_SENTINEL_END" <<'PY'
@@ -332,6 +338,7 @@ import sys
     uv_version,
     source_sha256,
     lock_sha256,
+    setup_environment_sha256,
     python_request,
     python_path,
     source_dir,
@@ -351,6 +358,7 @@ payload = {{
     "uv_version": uv_version,
     "source_sha256": source_sha256,
     "lock_sha256": lock_sha256,
+    "setup_environment_sha256": setup_environment_sha256,
     "python_request": python_request,
     "python_path": python_path,
     "source_dir": source_dir,
@@ -389,6 +397,9 @@ ucl_cleanup_temporary() {{
   if [[ -n "$ucl_tool_temp" ]]; then
     rm -rf -- "$ucl_tool_temp"
   fi
+  if [[ -n "$ucl_build_source" ]]; then
+    rm -rf -- "$ucl_build_source"
+  fi
   if [[ "$UCL_ENVIRONMENT_CREATED" == true ]]; then
     rm -rf -- "$UCL_ENVIRONMENT_DIR"
   fi
@@ -401,7 +412,6 @@ ucl_fail() {{
   trap - ERR
   set +e
   ucl_cleanup_temporary
-  rm -f -- "$UCL_READY_STATE"
   local error="phase $CURRENT_PHASE failed at line $failed_line: $failed_command (exit $returncode)"
   ucl_write_state "$UCL_FAILED_STATE" false failed "$returncode" "$error" "$failed_command" "$failed_line"
   exit "$returncode"
@@ -413,7 +423,6 @@ ucl_abort() {{
   trap - ERR
   set +e
   ucl_cleanup_temporary
-  rm -f -- "$UCL_READY_STATE"
   ucl_write_state "$UCL_FAILED_STATE" false failed "$returncode" "$error" "" ""
   exit "$returncode"
 }}
@@ -421,15 +430,15 @@ ucl_abort() {{
 ucl_cancel() {{
   local returncode="$1"
   local signal_name="$2"
-  trap - ERR INT TERM
+  trap - ERR HUP INT TERM
   set +e
   ucl_cleanup_temporary
-  rm -f -- "$UCL_READY_STATE"
   ucl_write_state "$UCL_FAILED_STATE" false failed "$returncode" "setup cancelled by $signal_name" "" ""
   exit "$returncode"
 }}
 
 trap 'ucl_fail $? $LINENO "$BASH_COMMAND"' ERR
+trap 'ucl_cancel 129 HUP' HUP
 trap 'ucl_cancel 130 INT' INT
 trap 'ucl_cancel 143 TERM' TERM
 
@@ -438,13 +447,26 @@ if [[ -n "${{UCL_TSG_BOOTSTRAP_ERROR:-}}" ]]; then
 fi
 
 CURRENT_PHASE=preflight
-for ucl_required in python3 curl flock mktemp; do
+for ucl_required in python3 curl flock mktemp cp chmod touch; do
   command -v "$ucl_required" >/dev/null 2>&1 || ucl_abort 70 "required command not found: $ucl_required"
 done
-[[ -d "$UCL_SOURCE_DIR" ]] || ucl_abort 66 "source directory does not exist: $UCL_SOURCE_DIR"
+[[ -d "$UCL_SOURCE_DIR" && ! -L "$UCL_SOURCE_DIR" ]] || ucl_abort 66 "source directory is missing or is a symlink: $UCL_SOURCE_DIR"
 for ucl_required_file in pyproject.toml uv.lock .python-version; do
   [[ -f "$UCL_SOURCE_DIR/$ucl_required_file" ]] || ucl_abort 66 "required project file does not exist: $UCL_SOURCE_DIR/$ucl_required_file"
 done
+python3 - "$UCL_SOURCE_DIR/uv.lock" "$UCL_LOCK_SHA256" "$UCL_SOURCE_DIR/.python-version" "$UCL_PYTHON_REQUEST" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+lock_path, expected_lock, python_path, expected_python = sys.argv[1:]
+actual_lock = hashlib.sha256(pathlib.Path(lock_path).read_bytes()).hexdigest()
+if actual_lock != expected_lock:
+    raise SystemExit(f"uv.lock digest mismatch: expected {{expected_lock}}, got {{actual_lock}}")
+requests = [line.strip() for line in pathlib.Path(python_path).read_text(encoding="utf-8").splitlines() if line.strip()]
+if requests != [expected_python]:
+    raise SystemExit(f".python-version mismatch: expected {{expected_python!r}}, got {{requests!r}}")
+PY
 
 mkdir -p -- "$UCL_UV_CACHE_DIR" "$UCL_PYTHON_INSTALL_DIR" \
   "$(dirname -- "$UCL_UV_TOOL_DIR")" "$(dirname -- "$UCL_ENVIRONMENT_DIR")" \
@@ -461,6 +483,9 @@ ucl_uv_version_is_exact() {{
 }}
 
 CURRENT_PHASE=uv_lock_wait
+[[ ! -L "$UCL_UV_TOOL_LOCK" ]] || ucl_abort 65 "uv tool lock must not be a symlink: $UCL_UV_TOOL_LOCK"
+touch -- "$UCL_UV_TOOL_LOCK"
+chmod 600 "$UCL_UV_TOOL_LOCK"
 exec 9>"$UCL_UV_TOOL_LOCK"
 flock -w 1800 9 || ucl_abort 75 "timed out waiting for uv tool lock"
 
@@ -488,18 +513,22 @@ fi
 exec 9>&-
 
 CURRENT_PHASE=environment_lock_wait
+[[ ! -L "$UCL_ENVIRONMENT_LOCK" ]] || ucl_abort 65 "environment lock must not be a symlink: $UCL_ENVIRONMENT_LOCK"
+touch -- "$UCL_ENVIRONMENT_LOCK"
+chmod 600 "$UCL_ENVIRONMENT_LOCK"
 exec 8>"$UCL_ENVIRONMENT_LOCK"
 flock -w 1800 8 || ucl_abort 75 "timed out waiting for environment lock"
 cd -- "$UCL_SOURCE_DIR"
 
 ucl_ready_matches() {{
   python3 - "$UCL_READY_STATE" "$UCL_UV_VERSION" "$UCL_SOURCE_SHA256" "$UCL_LOCK_SHA256" \
+    "$UCL_SETUP_ENVIRONMENT_SHA256" \
     "$UCL_PYTHON_REQUEST" "$UCL_SOURCE_DIR" "$UCL_ENVIRONMENT_DIR" "$UCL_UV_BINARY" <<'PY'
 import json
 import pathlib
 import sys
 
-path, uv_version, source_sha256, lock_sha256, python_request, source_dir, environment_dir, uv_binary_path = sys.argv[1:]
+path, uv_version, source_sha256, lock_sha256, setup_environment_sha256, python_request, source_dir, environment_dir, uv_binary_path = sys.argv[1:]
 try:
     payload = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
 except (OSError, json.JSONDecodeError):
@@ -512,6 +541,7 @@ expected = {{
     "uv_version": uv_version,
     "source_sha256": source_sha256,
     "lock_sha256": lock_sha256,
+    "setup_environment_sha256": setup_environment_sha256,
     "python_request": python_request,
     "source_dir": source_dir,
     "environment_dir": environment_dir,
@@ -538,8 +568,16 @@ else
     rm -rf -- "$UCL_ENVIRONMENT_DIR"
   fi
   UCL_ENVIRONMENT_CREATED=true
+  CURRENT_PHASE=build_source
+  ucl_build_source="$(mktemp -d "$(dirname -- "$UCL_ENVIRONMENT_LOCK")/build-source.XXXXXX")"
+  cp -a -- "$UCL_SOURCE_DIR/." "$ucl_build_source/"
+  chmod -R u+w "$ucl_build_source"
+  cd -- "$ucl_build_source"
   CURRENT_PHASE=sync
   "$UCL_UV_BINARY" sync --frozen --no-editable
+  cd -- "$UCL_SOURCE_DIR"
+  rm -rf -- "$ucl_build_source"
+  ucl_build_source=""
   CURRENT_PHASE=sync_check
   "$UCL_UV_BINARY" sync --frozen --check
   UCL_ENVIRONMENT_CREATED=false
@@ -585,6 +623,7 @@ _RESULT_STRING_FIELDS = (
     "uv_version",
     "source_sha256",
     "lock_sha256",
+    "setup_environment_sha256",
     "python_request",
     "python_path",
     "source_dir",
@@ -608,7 +647,7 @@ def _validate_state_payload(payload: object) -> UvSetupResult:
     for field in _RESULT_STRING_FIELDS:
         if not isinstance(payload.get(field), str):
             raise ValueError(f"uv setup state field {field!r} must be a string")
-    for field in ("source_sha256", "lock_sha256"):
+    for field in ("source_sha256", "lock_sha256", "setup_environment_sha256"):
         if _SHA256_RE.fullmatch(payload[field]) is None:
             raise ValueError(f"uv setup state field {field!r} must be SHA-256")
     if _PYTHON_REQUEST_RE.fullmatch(payload["python_request"]) is None:
