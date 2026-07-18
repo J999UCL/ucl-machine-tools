@@ -525,6 +525,16 @@
       "restart_policy": "lab_pc",
       "expected_gpu_count": 1,
       "expected_gpu_name": "RTX 4070 Ti SUPER"
+    },
+    "dopey": {
+      "ssh": "dopey",
+      "gpu_class": "temporary",
+      "restart_policy": "unknown",
+      "labels": [
+        "restricted",
+        "temporary"
+      ],
+      "warning": "DO NOT USE WITHOUT EXPLICIT PERMISSION"
     }
   }
 }

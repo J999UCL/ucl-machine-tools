@@ -23,6 +23,7 @@ class HostSpec:
     restart_policy: str = "unknown"
     expected_gpu_count: int | None = None
     expected_gpu_name: str | None = None
+    warning: str = ""
 
 
 def default_catalog_path() -> Path:
@@ -37,6 +38,11 @@ def _validate_token(value: str, label: str) -> None:
 def _validate_ssh_host(value: str) -> None:
     if not value or not _SAFE_SSH_RE.match(value):
         raise ValueError(f"ssh_host contains unsafe characters: {value!r}")
+
+
+def _validate_warning(value: str) -> None:
+    if len(value) > 200 or any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("host warning must be at most 200 printable characters")
 
 
 def _catalog_specs_from_yaml(path: Path | str | None = None) -> list[HostSpec]:
@@ -88,6 +94,7 @@ def _catalog_specs_from_yaml(path: Path | str | None = None) -> list[HostSpec]:
                 restart_policy=str(raw.get("restart_policy", "unknown")),
                 expected_gpu_count=int(raw["expected_gpu_count"]) if raw.get("expected_gpu_count") is not None else None,
                 expected_gpu_name=str(raw["expected_gpu_name"]) if raw.get("expected_gpu_name") is not None else None,
+                warning=str(raw.get("warning", "")),
             )
         )
     return specs
@@ -108,6 +115,7 @@ def validate_catalog(specs: Iterable[HostSpec]) -> dict[str, HostSpec]:
         if not spec.scratch_root.startswith("/"):
             raise ValueError(f"scratch_root must be absolute for {spec.name}: {spec.scratch_root!r}")
         _validate_token(spec.restart_policy, "restart_policy")
+        _validate_warning(spec.warning)
         for label in spec.labels:
             _validate_token(label, "label")
         for alias in spec.aliases:
@@ -139,18 +147,28 @@ def parse_selector(selector: str, *, catalog: dict[str, HostSpec] | None = None)
 
     def matching_names(token: str) -> list[str]:
         if token == "all":
-            return list(active_catalog)
+            return [
+                name for name, spec in active_catalog.items() if "restricted" not in spec.labels
+            ]
         if token.startswith("label:"):
             label = token.split(":", 1)[1]
             if not label:
                 raise ValueError("label selector must be non-empty")
-            return [name for name, spec in active_catalog.items() if label in spec.labels]
+            return [
+                name
+                for name, spec in active_catalog.items()
+                if label in spec.labels and "restricted" not in spec.labels
+            ]
         if token in active_catalog:
             return [token]
         alias_matches = [name for name, spec in active_catalog.items() if token == spec.ssh_host or token in spec.aliases]
         if alias_matches:
             return alias_matches
-        label_matches = [name for name, spec in active_catalog.items() if token in spec.labels]
+        label_matches = [
+            name
+            for name, spec in active_catalog.items()
+            if token in spec.labels and "restricted" not in spec.labels
+        ]
         if label_matches:
             return label_matches
         raise ValueError(f"unknown selector token: {token}")

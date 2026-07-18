@@ -118,6 +118,20 @@ def test_default_catalog_validates_known_ucl_gpu_host() -> None:
     assert catalog["barbury-l"].scratch_root.startswith("/tmp/")
 
 
+def test_default_catalog_marks_temporary_dopey_host_as_restricted() -> None:
+    remote_hosts, _, _ = import_toolkit()
+
+    catalog = remote_hosts.load_catalog()
+
+    assert catalog["dopey"].ssh_host == "dopey"
+    assert {"temporary", "restricted"}.issubset(catalog["dopey"].labels)
+    assert catalog["dopey"].warning == "DO NOT USE WITHOUT EXPLICIT PERMISSION"
+    assert "dopey" not in {host.name for host in remote_hosts.parse_selector("3090ti", catalog=catalog)}
+    assert "dopey" not in {host.name for host in remote_hosts.parse_selector("4070ti", catalog=catalog)}
+    assert "dopey" not in {host.name for host in remote_hosts.parse_selector("all", catalog=catalog)}
+    assert [host.name for host in remote_hosts.parse_selector("dopey", catalog=catalog)] == ["dopey"]
+
+
 def test_catalog_validation_rejects_duplicate_names_and_unsafe_ssh_hosts() -> None:
     remote_hosts, _, _ = import_toolkit()
 
@@ -422,6 +436,22 @@ def test_human_table_formatting_is_plain_text_and_scan_friendly() -> None:
     assert "fpt" not in table.lower()
     assert "{" not in table
     assert "\x1b" not in table
+
+
+def test_host_warning_is_shown_in_full_ahead_of_probe_errors() -> None:
+    _, remote_inventory, _ = import_toolkit()
+    warning = "DO NOT USE WITHOUT EXPLICIT PERMISSION"
+    row = {
+        **inventory_payload(host="dopey", ok=False, errors=["connection refused"]),
+        "ssh_host": "dopey",
+        "status": "unreachable",
+        "warning": warning,
+    }
+
+    table = remote_inventory.format_table([row])
+
+    assert warning in table
+    assert "connection refused" not in table
 
 
 def test_stream_table_uses_stable_columns() -> None:

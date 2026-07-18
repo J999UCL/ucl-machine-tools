@@ -398,6 +398,7 @@ def collect_one(
     payload["ssh_host"] = host.ssh_host
     payload["expected_gpu_count"] = host.expected_gpu_count
     payload["expected_gpu_name"] = host.expected_gpu_name
+    payload["warning"] = host.warning
     payload["restart"] = {
         "policy": host.restart_policy,
         "text": restart_text(host.restart_policy, reachable=True, now=now),
@@ -424,6 +425,7 @@ def _error_row(
         "schema_version": SCHEMA_VERSION,
         "host": host.name,
         "ssh_host": host.ssh_host,
+        "warning": host.warning,
         "ok": False,
         "status": status,
         "gpus": [],
@@ -528,6 +530,9 @@ def _tmp_summary(row: dict[str, Any]) -> str:
 
 
 def _note(row: dict[str, Any]) -> str:
+    warning = str(row.get("warning") or "").strip()
+    if warning:
+        return warning
     errors = row.get("errors", []) or []
     if errors:
         text = str(errors[0]).replace("\n", " ")
