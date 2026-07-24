@@ -49,6 +49,27 @@ def test_bash_and_csh_launchers_have_no_profile_artifacts(tmp_path: Path) -> Non
         assert forbidden not in combined
 
 
+@pytest.mark.parametrize("shell", ["bash", "/bin/bash"])
+def test_explicit_bash_login_command_is_normalized_to_clean_shell(shell: str) -> None:
+    command = (shell, "-lc", "printf '%s\\n' \"$1\"", "job", "hello world")
+
+    assert launch.normalize_remote_command(command) == (
+        shell,
+        "--noprofile",
+        "--norc",
+        "-c",
+        "printf '%s\\n' \"$1\"",
+        "job",
+        "hello world",
+    )
+
+
+def test_non_login_remote_command_is_not_rewritten() -> None:
+    command = ("bash", "-c", "printf hello")
+
+    assert launch.normalize_remote_command(command) is command
+
+
 def test_env_and_gpu_are_plain_exports_not_profiles(tmp_path: Path) -> None:
     plan = launch.build_exec_plan(
         host=host(),

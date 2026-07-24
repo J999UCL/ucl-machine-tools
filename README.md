@@ -31,6 +31,10 @@ output before the command starts. In particular, broken VirtualBox startup
 diagnostics cannot corrupt probes, checksums, rsync, tmux control, or command
 results. Once the frame is established, command stdout and stderr are forwarded
 unchanged, including command output that happens to mention VirtualBox.
+Internal shell helpers use Bash without startup profiles. An explicit
+`ucl exec HOST -- bash -lc '...'` is likewise normalized to
+`bash --noprofile --norc -c`, preventing a nested login shell from printing
+profile hooks such as dates or `nvidia-smi` tables inside the command result.
 
 ## Commands
 

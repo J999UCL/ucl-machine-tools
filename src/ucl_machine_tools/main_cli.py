@@ -32,6 +32,7 @@ from ucl_machine_tools.launch import (
     format_summary,
     launch_tmux,
     list_remote_sessions,
+    normalize_remote_command,
     parse_env,
     upload_bundle,
     utc_run_id,
@@ -1738,7 +1739,7 @@ def run_run(args: argparse.Namespace, *, runner=subprocess.run, popener=subproce
 def run_exec(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     hosts = _resolve_exec_hosts(args)
     host = hosts[0]
-    command = _strip_remainder(args.exec_command)
+    command = normalize_remote_command(_strip_remainder(args.exec_command))
     stdin_body = sys.stdin.read() if args.stdin else None
     if not args.detach:
         if len(hosts) > 1:

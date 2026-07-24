@@ -599,6 +599,37 @@ def test_ucl_exec_sync_command_prints_output_and_preserves_argv(
     assert not any("UCL_TMUX_JSON_BEGIN" in str(call) for call in calls)
 
 
+def test_ucl_exec_normalizes_explicit_bash_login_shell_without_filtering_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv("dopey", timeout_seconds=30):
+            params = embedded_exec_params(kwargs["input"])
+            assert params["argv"] == [
+                "bash",
+                "--noprofile",
+                "--norc",
+                "-c",
+                "printf command-output",
+            ]
+            return ok(stdout=exec_stdout(stdout=b"command-output", stderr=b""))
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert (
+        main_cli.main(
+            ["exec", "dopey", "--", "bash", "-lc", "printf command-output"],
+            runner=runner,
+        )
+        == 0
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == "command-output"
+    assert captured.err == ""
+
+
 def test_ucl_exec_sync_accepts_multiple_hosts_with_delimiter(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

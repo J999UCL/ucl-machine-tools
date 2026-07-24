@@ -22,7 +22,7 @@ def test_remote_bash_builder_uses_shared_framed_transport() -> None:
     assert argv[0] == "python3"
     assert "--logical-argv" in argv
     assert "cream" in argv
-    assert argv[-3:] == ["bash", "-lc", "printf hello"]
+    assert argv[-5:] == ["bash", "--noprofile", "--norc", "-c", "printf hello"]
 
 
 def test_virtualbox_startup_block_is_removed_without_hiding_other_errors() -> None:

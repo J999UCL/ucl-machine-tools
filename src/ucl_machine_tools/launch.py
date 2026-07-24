@@ -59,7 +59,24 @@ class TmuxDecision:
 
 
 def remote_bash_argv(host: HostSpec, command: str) -> list[str]:
-    return build_remote_argv(host.ssh_host, ("bash", "-lc", command))
+    return build_remote_argv(
+        host.ssh_host,
+        ("bash", "--noprofile", "--norc", "-c", command),
+    )
+
+
+def normalize_remote_command(command: tuple[str, ...]) -> tuple[str, ...]:
+    """Replace explicit Bash login shells with deterministic clean shells."""
+
+    if len(command) >= 3 and command[0] in {"bash", "/bin/bash"} and command[1] == "-lc":
+        return (
+            command[0],
+            "--noprofile",
+            "--norc",
+            "-c",
+            *command[2:],
+        )
+    return command
 
 
 def validate_name(value: str, label: str) -> None:
