@@ -115,14 +115,19 @@ def remote_python_argv(host: str = "barbury-l", *, timeout_seconds: int | None =
     return ssh_tools.build_remote_python_argv(host, timeout_seconds=timeout_seconds)
 
 
-def inventory_stdout(host: str = "barbury-l", *, busy: bool = False) -> str:
+def inventory_stdout(
+    host: str = "barbury-l",
+    *,
+    busy: bool = False,
+    gpus: list[dict[str, Any]] | None = None,
+) -> str:
     gpu = {
         "index": 0,
         "name": "NVIDIA GeForce RTX 3090 Ti",
         "memory_total_mb": 24576,
         "memory_used_mb": 1024,
         "memory_free_mb": 23552,
-        "utilization_gpu_percent": 1,
+        "utilization_gpu_percent": 65 if busy else 1,
         "processes": [{"pid": 7}] if busy else [],
     }
     payload = {
@@ -130,7 +135,7 @@ def inventory_stdout(host: str = "barbury-l", *, busy: bool = False) -> str:
         "host": host,
         "hostname": host,
         "ok": True,
-        "gpus": [gpu],
+        "gpus": [gpu] if gpus is None else gpus,
         "filesystems": [{"path": "/tmp", "available_gb": 500}],
         "scratch": {"root": "/tmp/ucl-machine-tools", "exists": True},
         "restart": {"policy": "lab_pc", "text": "Mon/Thu 19:30-midnight; may reboot anytime"},
@@ -482,6 +487,56 @@ def test_ucl_run_full_fake_path_writes_registry(
     assert "abc" not in json.dumps(provenance)
 
 
+def test_ucl_run_gpu_auto_injects_busy_gpu_when_vram_meets_threshold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("UCL_MACHINE_TOOLS_CACHE", str(tmp_path / "cache"))
+    bundle = make_bundle(tmp_path)
+    launcher_sources: list[str] = []
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        joined = " ".join(argv)
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv(timeout_seconds=8) and "UCL_INVENTORY_JSON_BEGIN" in kwargs.get("input", ""):
+            return ok(stdout=inventory_stdout(busy=True))
+        if argv == remote_python_argv() and "UCL_TMUX_JSON_BEGIN" in kwargs.get("input", ""):
+            return ok(stdout=tmux_stdout(["work"]))
+        if "tar -xf -" in joined:
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        if "cat >" in joined:
+            launcher_sources.append(kwargs["input"])
+            return ok()
+        if argv == remote_python_argv(timeout_seconds=8) and job_control.LAUNCH_SENTINEL_BEGIN in kwargs.get("input", ""):
+            return ok(stdout=launch_stdout(job_identity(session="work", window="run")))
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    rc = main_cli.main(
+        [
+            "run",
+            "--host",
+            "barbury-l",
+            "--gpu",
+            "auto",
+            "--min-free-vram-gb",
+            "22",
+            "--session",
+            "work",
+            "--local-dir",
+            str(bundle),
+            "--script",
+            "run.sh",
+        ],
+        runner=runner,
+        popener=FakePopen,
+    )
+
+    assert rc == 0
+    assert launcher_sources
+    assert "export CUDA_VISIBLE_DEVICES=0" in launcher_sources[0]
+
+
 def test_ucl_run_requires_explicit_session(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -772,6 +827,48 @@ def test_ucl_exec_sync_supports_options_cwd_json_timeout_and_gpu_auto(
     assert payload["timed_out"] is False
 
 
+def test_ucl_exec_gpu_auto_selects_most_free_vram_despite_busy_signals(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    busy_gpu = {
+        "index": 0,
+        "name": "NVIDIA GeForce RTX 3090 Ti",
+        "memory_total_mb": 24576,
+        "memory_used_mb": 1024,
+        "memory_free_mb": 23552,
+        "utilization_gpu_percent": 65,
+        "processes": [{"pid": 7}],
+    }
+    clean_gpu = {
+        "index": 1,
+        "name": "NVIDIA GeForce RTX 3090 Ti",
+        "memory_total_mb": 24576,
+        "memory_used_mb": 2048,
+        "memory_free_mb": 22528,
+        "utilization_gpu_percent": 1,
+        "processes": [],
+    }
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv(timeout_seconds=8):
+            return ok(stdout=inventory_stdout(gpus=[busy_gpu, clean_gpu]))
+        if argv == remote_python_argv(timeout_seconds=30):
+            params = embedded_exec_params(kwargs["input"])
+            assert params["env"]["CUDA_VISIBLE_DEVICES"] == "0"
+            return ok(stdout=exec_stdout(stdout=b"0\n"))
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    rc = main_cli.main(
+        ["exec", "barbury-l", "--gpu", "auto", "--min-free-vram-gb", "20", "printenv", "CUDA_VISIBLE_DEVICES"],
+        runner=runner,
+    )
+
+    assert rc == 0
+    assert capsys.readouterr().out == "0\n"
+
+
 def test_ucl_exec_gpu_auto_respects_min_free_vram_threshold(capsys: pytest.CaptureFixture[str]) -> None:
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         if argv[:3] == ["ssh", "-O", "check"]:
@@ -784,6 +881,44 @@ def test_ucl_exec_gpu_auto_respects_min_free_vram_threshold(capsys: pytest.Captu
 
     assert rc == 2
     assert "no free GPU found on barbury-l" in capsys.readouterr().err
+
+
+def test_ucl_exec_gpu_auto_allows_shared_gpu_with_enough_free_vram(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    payload = main_cli.inventory.parse_sentinel_stdout(inventory_stdout())
+    payload["gpus"][0]["processes"] = [{"pid": 834627, "user": "other", "used_memory_mb": 1024}]
+    payload["gpus"][0]["memory_free_mb"] = 20 * 1024
+    payload["gpus"][0]["utilization_gpu_percent"] = 95
+    inventory_result = "\n".join(
+        (
+            "login noise",
+            main_cli.inventory.INVENTORY_SENTINEL_BEGIN,
+            json.dumps(payload),
+            main_cli.inventory.INVENTORY_SENTINEL_END,
+        )
+    )
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == remote_python_argv(timeout_seconds=8):
+            return ok(stdout=inventory_result)
+        if argv == remote_python_argv(timeout_seconds=30):
+            params = embedded_exec_params(kwargs["input"])
+            assert params["env"]["CUDA_VISIBLE_DEVICES"] == "0"
+            return ok(stdout=exec_stdout(stdout=b"shared-ok\n"))
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    assert (
+        main_cli.main(
+            ["exec", "barbury-l", "--gpu", "auto", "--min-free-vram-gb", "20", "--json", "hostname"],
+            runner=runner,
+        )
+        == 0
+    )
+
+    assert json.loads(capsys.readouterr().out)["stdout"] == "shared-ok\n"
 
 
 def test_ucl_exec_sync_separates_command_and_connect_timeouts(capsys: pytest.CaptureFixture[str]) -> None:

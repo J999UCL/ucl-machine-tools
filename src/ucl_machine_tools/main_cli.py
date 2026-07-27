@@ -666,18 +666,13 @@ def _resolve_status_targets(targets: tuple[str, ...], *, catalog: dict[str, Host
     return parse_selector(",".join(targets), catalog=catalog)
 
 
-def _best_free_gpu(row: dict[str, Any], *, min_free_vram_gb: float) -> str:
+def _best_gpu_by_vram(row: dict[str, Any], *, min_free_vram_gb: float) -> str:
     candidates: list[dict[str, Any]] = []
     for gpu in row.get("gpus", []) or []:
-        if gpu.get("processes", []) or []:
-            continue
         free_mb = gpu.get("memory_free_mb")
         if free_mb is None and gpu.get("memory_total_mb") is not None and gpu.get("memory_used_mb") is not None:
             free_mb = gpu["memory_total_mb"] - gpu["memory_used_mb"]
         if free_mb is not None and float(free_mb) < min_free_vram_gb * 1024:
-            continue
-        util = gpu.get("utilization_gpu_percent")
-        if util is not None and int(util) > 20:
             continue
         candidates.append(gpu)
     if not candidates:
@@ -700,7 +695,7 @@ def _gpu_env(
     if min_free_vram_gb < 0:
         raise ValueError("--min-free-vram-gb must be >= 0")
     rows = inventory.collect([host], runner=runner, jobs=1, min_free_vram_gb=min_free_vram_gb)
-    gpu_id = _best_free_gpu(rows[0], min_free_vram_gb=min_free_vram_gb)
+    gpu_id = _best_gpu_by_vram(rows[0], min_free_vram_gb=min_free_vram_gb)
     return (("CUDA_VISIBLE_DEVICES", gpu_id),)
 
 
@@ -2787,7 +2782,7 @@ def run_env(args: argparse.Namespace, *, runner=subprocess.run) -> int:
         if float(args.min_free_vram_gb) < 0:
             raise ValueError("--min-free-vram-gb must be >= 0")
         rows = inventory.collect([host], runner=runner, jobs=1, min_free_vram_gb=float(args.min_free_vram_gb))
-        gpu = _best_free_gpu(rows[0], min_free_vram_gb=float(args.min_free_vram_gb))
+        gpu = _best_gpu_by_vram(rows[0], min_free_vram_gb=float(args.min_free_vram_gb))
     payload = envcheck.run_env_check(host, remote_root=args.remote_root, create=args.create, gpu=gpu, runner=runner)
     payload.update({"host": host.name, "ssh_host": host.ssh_host})
     if args.json:

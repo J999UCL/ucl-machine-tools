@@ -96,7 +96,8 @@ profile hooks such as dates or `nvidia-smi` tables inside the command result.
 - `ucl env HOST --remote-root DIR` checks reachability, scratch/root state, TSG
   setup scripts, `/tmp` space, and optional GPU availability.
 - `--gpu auto` on `exec`, `run`, and `env` requires 20 GB free VRAM by default;
-  tune it with `--min-free-vram-gb`.
+  tune it with `--min-free-vram-gb`. Existing GPU processes and utilization do
+  not veto launch selection; a GPU is eligible when it meets the VRAM threshold.
 
 ## Launcher Root
 
