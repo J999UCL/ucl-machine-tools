@@ -15,7 +15,7 @@ from typing import Any, Callable, Sequence
 
 from ucl_machine_tools import rsync_transport
 from ucl_machine_tools.hosts import HostSpec, load_catalog, parse_selector
-from ucl_machine_tools.ssh import build_remote_python_argv
+from ucl_machine_tools.ssh import build_remote_argv, build_remote_python_argv
 
 
 Runner = Callable[..., subprocess.CompletedProcess]
@@ -153,7 +153,28 @@ def build_remote_to_remote_argv(
         dry_run=dry_run,
         rsync_args=rsync_args,
     )
-    return rsync_transport.build_transport_argv(src.host, rsync)
+    return rsync_transport.build_transport_argv(src.host, rsync, forward_agent=True)
+
+
+def build_remote_destination_probe_argv(source_host: str, destination_host: str) -> list[str]:
+    """Build a framed source-side SSH authentication probe."""
+
+    return build_remote_argv(
+        source_host,
+        (
+            "ssh",
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "LogLevel=ERROR",
+            "-o",
+            "ConnectTimeout=30",
+            destination_host,
+            "true",
+        ),
+        forward_agent=True,
+    )
 
 
 def validate_rsync_args(rsync_args: Sequence[str]) -> None:

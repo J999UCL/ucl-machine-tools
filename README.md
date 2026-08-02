@@ -75,7 +75,10 @@ profile hooks such as dates or `nvidia-smi` tables inside the command result.
 - `ucl copy SRC DST [-- RSYNC_ARGS...]` copies between local paths or
   `HOST:/absolute/path` endpoints; host aliases/selectors must resolve to exactly
   one UCL host. For lab-machine-to-lab-machine copies, rsync runs from the source
-  host so data stays inside UCL. Its SSH hops use the same global nonce-framed
+  host so data stays inside UCL. These remote-to-remote copies automatically
+  forward the controller's SSH agent to the source host for the destination hop;
+  the source-side destination authentication probe must pass before rsync starts.
+  No private key is copied to either machine. Its SSH hops use the same global nonce-framed
   transport: a missing, late, or oversized handshake fails closed and never
   retries through raw SSH.
   Remote copies require `python3` and `rsync` in each participating host's

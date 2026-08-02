@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from typing import Callable, Sequence
 
@@ -47,6 +48,7 @@ def build_remote_argv(
     command: Sequence[str],
     *,
     timeout_seconds: int | None = None,
+    forward_agent: bool = False,
     ssh_executable: str = "ssh",
 ) -> list[str]:
     if timeout_seconds is not None and timeout_seconds <= 0:
@@ -61,11 +63,31 @@ def build_remote_argv(
         command,
         ssh_executable=ssh_executable,
         handshake_timeout_seconds=handshake_timeout,
+        forward_agent=forward_agent,
     )
 
 
 def build_remote_python_argv(host: str, *, timeout_seconds: int | None = None) -> list[str]:
     return build_remote_argv(host, ("python3", "-"), timeout_seconds=timeout_seconds)
+
+
+def ensure_ssh_agent(*, runner: Runner = subprocess.run) -> None:
+    """Require a locally available agent with at least one loaded identity."""
+
+    if not os.environ.get("SSH_AUTH_SOCK"):
+        raise RuntimeError("SSH_AUTH_SOCK is not set; cannot forward the controller SSH agent")
+    result = runner(
+        ["ssh-add", "-l"],
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
+    if int(getattr(result, "returncode", 1)) == 0:
+        return
+    detail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").strip()
+    if "no identities" in detail.lower():
+        raise RuntimeError("the controller SSH agent has no loaded identities")
+    raise RuntimeError(f"could not query the controller SSH agent: {detail or 'ssh-add exited unsuccessfully'}")
 
 
 def ensure_knuckles_master(

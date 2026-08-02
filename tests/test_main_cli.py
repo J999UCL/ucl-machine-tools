@@ -2652,6 +2652,7 @@ def test_ucl_copy_resolves_aliases_and_rejects_multi_host_selectors(
 def test_ucl_copy_remote_to_remote_runs_rsync_from_source_host(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     catalog = tmp_path / "ucl_hosts.json"
     catalog.write_text(
@@ -2665,12 +2666,17 @@ def test_ucl_copy_remote_to_remote_runs_rsync_from_source_host(
         ),
         encoding="utf-8",
     )
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent-test.sock")
     calls: list[list[str]] = []
 
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         calls.append(argv)
         assert kwargs.get("shell", False) is False
         if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == ["ssh-add", "-l"]:
+            return ok(stdout="256 SHA256:test controller-key\n")
+        if argv == copy_tools.build_remote_destination_probe_argv("barbury.internal", "barnacle.internal"):
             return ok()
         if argv == remote_python_argv("barnacle.internal"):
             return ok(stdout=copy_tools.PRESENCE_BEGIN + "\n{" + '"exists": false' + "}\n" + copy_tools.PRESENCE_END + "\n")
@@ -2704,13 +2710,157 @@ def test_ucl_copy_remote_to_remote_runs_rsync_from_source_host(
     payload = json.loads(capsys.readouterr().out)
     assert payload["mode"] == "remote-to-remote"
     assert payload["ok"] is False
+    assert payload["agent_forwarding"] is True
+    assert payload["authentication_preflight"] == "passed"
     assert payload["verify"]["message"] == "destination path does not exist after rsync"
     assert not any(call[0] == "rsync" for call in calls)
+
+
+def test_ucl_copy_remote_to_remote_requires_a_local_agent_before_remote_work(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = tmp_path / "ucl_hosts.json"
+    catalog.write_text(
+        json.dumps(
+            {
+                "hosts": {
+                    "barbury-l": {"ssh": "barbury.internal", "gpu_class": "3090ti"},
+                    "dopey": {"ssh": "dopey", "gpu_class": "temporary"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+
+    def unexpected_runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        raise AssertionError(f"agent preflight should fail locally: {argv}")
+
+    rc = main_cli.main(
+        [
+            "copy",
+            "barbury-l:/tmp/src",
+            "dopey:/tmp/dst",
+            "--catalog",
+            str(catalog),
+            "--json",
+        ],
+        runner=unexpected_runner,
+    )
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert "SSH_AUTH_SOCK" in payload["error"]
+    assert payload["agent_forwarding"] is True
+    assert payload["authentication_preflight"] == "failed"
+
+
+def test_ucl_copy_remote_to_remote_rejects_an_agent_with_no_identities(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = tmp_path / "ucl_hosts.json"
+    catalog.write_text(
+        json.dumps(
+            {
+                "hosts": {
+                    "barbury-l": {"ssh": "barbury.internal", "gpu_class": "3090ti"},
+                    "dopey": {"ssh": "dopey", "gpu_class": "temporary"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent-test.sock")
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        calls.append(argv)
+        if argv == ["ssh-add", "-l"]:
+            return SimpleNamespace(returncode=1, stdout="The agent has no identities.\n", stderr="")
+        raise AssertionError(f"remote work must not start: {argv}")
+
+    rc = main_cli.main(
+        [
+            "copy",
+            "barbury-l:/tmp/src",
+            "dopey:/tmp/dst",
+            "--catalog",
+            str(catalog),
+            "--json",
+        ],
+        runner=runner,
+    )
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert "no loaded identities" in payload["error"]
+    assert calls == [["ssh-add", "-l"]]
+
+
+def test_ucl_copy_remote_to_remote_auth_probe_blocks_rsync(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = tmp_path / "ucl_hosts.json"
+    catalog.write_text(
+        json.dumps(
+            {
+                "hosts": {
+                    "barbury-l": {"ssh": "barbury.internal", "gpu_class": "3090ti"},
+                    "dopey": {"ssh": "dopey", "gpu_class": "temporary"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent-test.sock")
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        calls.append(argv)
+        assert kwargs.get("shell", False) is False
+        if argv == ["ssh-add", "-l"]:
+            return ok(stdout="256 SHA256:test controller-key\n")
+        if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == copy_tools.build_remote_destination_probe_argv("barbury.internal", "dopey"):
+            return SimpleNamespace(returncode=255, stdout="", stderr="Permission denied (publickey).")
+        if argv[0] == "python3":
+            raise AssertionError("rsync must not start after destination auth failure")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    rc = main_cli.main(
+        [
+            "copy",
+            "barbury-l:/tmp/src",
+            "dopey:/tmp/dst",
+            "--catalog",
+            str(catalog),
+            "--json",
+        ],
+        runner=runner,
+    )
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert "could not authenticate" in payload["error"]
+    assert "Permission denied" in payload["error"]
+    assert payload["authentication_preflight"] == "failed"
+    assert not any("rsync" in call for call in calls)
 
 
 def test_ucl_copy_remote_to_remote_verify_reads_each_endpoint_host(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     catalog = tmp_path / "ucl_hosts.json"
     catalog.write_text(
@@ -2724,6 +2874,7 @@ def test_ucl_copy_remote_to_remote_verify_reads_each_endpoint_host(
         ),
         encoding="utf-8",
     )
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent-test.sock")
     manifest_hosts: list[str] = []
     transfer_hosts: list[str] = []
 
@@ -2734,6 +2885,10 @@ def test_ucl_copy_remote_to_remote_verify_reads_each_endpoint_host(
     def runner(argv: list[str], **kwargs: Any) -> SimpleNamespace:
         assert kwargs.get("shell", False) is False
         if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == ["ssh-add", "-l"]:
+            return ok(stdout="256 SHA256:test controller-key\n")
+        if argv == copy_tools.build_remote_destination_probe_argv("barbury.internal", "barnacle.internal"):
             return ok()
         if argv == remote_python_argv("barbury.internal"):
             manifest_hosts.append("barbury.internal")
@@ -2764,6 +2919,8 @@ def test_ucl_copy_remote_to_remote_verify_reads_each_endpoint_host(
 
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
+    assert payload["agent_forwarding"] is True
+    assert payload["authentication_preflight"] == "passed"
     assert payload["verify"]["ok"] is True
     assert sorted(manifest_hosts) == ["barbury.internal", "barbury.internal", "barnacle.internal"]
     assert transfer_hosts == []

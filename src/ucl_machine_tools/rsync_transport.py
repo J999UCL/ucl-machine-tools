@@ -162,6 +162,7 @@ def build_transport_command(
     handshake_timeout_seconds: float = DEFAULT_HANDSHAKE_TIMEOUT_SECONDS,
     max_prefix_bytes: int = DEFAULT_MAX_PREFIX_BYTES,
     logical_argv: bool = False,
+    forward_agent: bool = False,
 ) -> str:
     argv = [
         "python3",
@@ -176,6 +177,8 @@ def build_transport_command(
     ]
     if logical_argv:
         argv.append("--logical-argv")
+    if forward_agent:
+        argv.append("--forward-agent")
     return shlex.join([*argv, "--"])
 
 
@@ -186,6 +189,7 @@ def build_transport_argv(
     ssh_executable: str = "ssh",
     handshake_timeout_seconds: float = DEFAULT_HANDSHAKE_TIMEOUT_SECONDS,
     max_prefix_bytes: int = DEFAULT_MAX_PREFIX_BYTES,
+    forward_agent: bool = False,
 ) -> list[str]:
     if not host or host.startswith("-") or "\x00" in host:
         raise ValueError(f"unsafe SSH host: {host!r}")
@@ -194,6 +198,7 @@ def build_transport_argv(
         handshake_timeout_seconds=handshake_timeout_seconds,
         max_prefix_bytes=max_prefix_bytes,
         logical_argv=True,
+        forward_agent=forward_agent,
     )
     return [*shlex.split(command), host, *remote_argv]
 
@@ -483,6 +488,7 @@ def _parse_args(argv: Sequence[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--handshake-timeout", type=float, default=DEFAULT_HANDSHAKE_TIMEOUT_SECONDS)
     parser.add_argument("--max-prefix-bytes", type=int, default=DEFAULT_MAX_PREFIX_BYTES)
     parser.add_argument("--logical-argv", action="store_true")
+    parser.add_argument("--forward-agent", action="store_true")
     options = parser.parse_args(tokens[:separator])
     if options.handshake_timeout <= 0:
         raise FrameError("handshake timeout must be positive")
@@ -512,6 +518,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "LogLevel=ERROR",
             "-o",
             f"ConnectTimeout={max(1, int(options.handshake_timeout))}",
+            *(["-A"] if options.forward_agent else []),
             *ssh_options,
             host,
             remote_command,

@@ -392,12 +392,14 @@ def test_ucl_copy_reconcile_dry_run_reports_plan_without_mutating_or_transferrin
 def test_ucl_copy_reconcile_remote_to_remote_manifests_and_transfer_stay_on_endpoint_hosts(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     catalog = write_catalog(tmp_path)
     source = manifest({"missing.bin": b"missing", "same.bin": b"same"})
     destination_before = manifest({"same.bin": b"same"})
     destination_after = source
     destination_reads = 0
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent-test.sock")
     transfer_hosts: list[str] = []
     transfers: list[list[str]] = []
 
@@ -405,6 +407,10 @@ def test_ucl_copy_reconcile_remote_to_remote_manifests_and_transfer_stay_on_endp
         nonlocal destination_reads
         assert kwargs.get("shell", False) is False
         if argv[:3] == ["ssh", "-O", "check"]:
+            return ok()
+        if argv == ["ssh-add", "-l"]:
+            return ok(stdout="256 SHA256:test controller-key\n")
+        if argv == copy_tools.build_remote_destination_probe_argv("barbury.internal", "barnacle.internal"):
             return ok()
         if argv == ssh_tools.build_remote_python_argv("barbury.internal"):
             assert "ROOT=\"/tmp/src\"" in kwargs["input"]

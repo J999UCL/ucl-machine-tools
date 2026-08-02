@@ -39,7 +39,7 @@ from ucl_machine_tools.launch import (
     write_launcher_files,
 )
 from ucl_machine_tools.registry import RunRecord, list_records, read_record, utc_now, write_record
-from ucl_machine_tools.ssh import build_remote_python_argv, ensure_knuckles_master
+from ucl_machine_tools.ssh import build_remote_python_argv, ensure_knuckles_master, ensure_ssh_agent
 from ucl_machine_tools import stage as stage_tools
 from ucl_machine_tools import stage_registry
 from ucl_machine_tools.stage_registry import StageRecord
@@ -530,8 +530,9 @@ def _build_copy_parser() -> argparse.ArgumentParser:
         epilog=(
             "Use '--verify sha256' to hash both sides, skip exact files, transfer only missing/mismatched files, "
             "and retry verification failures. Remote copies use a framed SSH transport that removes only startup "
-            "output before rsync begins. Raw rsync args after '--' are available only without --verify, but cannot "
-            "replace the protected transport or inject remote-side rsync options."
+            "output before rsync begins. Remote-to-remote copies automatically forward the controller SSH agent "
+            "to the source host for the destination hop. Raw rsync args after '--' are available only without "
+            "--verify, but cannot replace the protected transport or inject remote-side rsync options."
         ),
     )
     parser.add_argument("src")
@@ -2445,6 +2446,8 @@ def _run_plain_copy(
         "resolved_src": src.rsync_spec(),
         "resolved_dst": dst.rsync_spec(),
         "mode": mode,
+        "agent_forwarding": bool(getattr(args, "agent_forwarding", False)),
+        "authentication_preflight": getattr(args, "authentication_preflight", "not_started"),
         "argv": argv,
         "returncode": int(getattr(proc, "returncode", 1)),
         # The framed rsync transport has already removed only pre-handshake
@@ -2512,6 +2515,8 @@ def _render_reconciled_copy_error(
         "resolved_dst": dst.rsync_spec(),
         "reuse_from": args.reuse_from,
         "mode": mode,
+        "agent_forwarding": bool(getattr(args, "agent_forwarding", False)),
+        "authentication_preflight": getattr(args, "authentication_preflight", "not_started"),
         "argv": attempts[-1]["argv"] if attempts else [],
         "returncode": 2,
         "stdout": "".join(str(attempt["stdout"]) for attempt in attempts),
@@ -2634,6 +2639,8 @@ def _run_reconciled_copy(
             "resolved_dst": dst.rsync_spec(),
             "reuse_from": args.reuse_from,
             "mode": mode,
+            "agent_forwarding": bool(getattr(args, "agent_forwarding", False)),
+            "authentication_preflight": getattr(args, "authentication_preflight", "not_started"),
             "argv": planned_argv if transfer_paths else [],
             "dry_run": True,
             "plan": plan,
@@ -2754,6 +2761,8 @@ def _run_reconciled_copy(
         "resolved_dst": dst.rsync_spec(),
         "reuse_from": args.reuse_from,
         "mode": mode,
+        "agent_forwarding": bool(getattr(args, "agent_forwarding", False)),
+        "authentication_preflight": getattr(args, "authentication_preflight", "not_started"),
         "argv": attempts[-1]["argv"] if attempts else [],
         "returncode": attempts[-1]["returncode"] if attempts else 0,
         "stdout": "".join(str(attempt["stdout"]) for attempt in attempts),
@@ -2775,12 +2784,37 @@ def _run_reconciled_copy(
 def run_copy(args: argparse.Namespace, *, runner=subprocess.run) -> int:
     src = copy_tools.resolve_endpoint(copy_tools.parse_endpoint(args.src), args.catalog)
     dst = copy_tools.resolve_endpoint(copy_tools.parse_endpoint(args.dst), args.catalog)
+    args.agent_forwarding = bool(src.host and dst.host)
+    args.authentication_preflight = "not_applicable"
     reuse = None
     if args.reuse_from:
         reuse = copy_tools.resolve_endpoint(copy_tools.parse_endpoint(args.reuse_from), args.catalog)
     needs_ssh = bool(src.host or dst.host or (reuse and reuse.host))
+    if args.agent_forwarding:
+        if args.dry_run:
+            args.authentication_preflight = "skipped (dry-run)"
+        else:
+            args.authentication_preflight = "failed"
+            ensure_ssh_agent(runner=runner)
+            ensure_knuckles_master(runner=runner)
+            probe = runner(
+                copy_tools.build_remote_destination_probe_argv(src.host, dst.host),
+                capture_output=True,
+                text=True,
+                shell=False,
+            )
+            if int(getattr(probe, "returncode", 1)) != 0:
+                detail = (getattr(probe, "stderr", "") or getattr(probe, "stdout", "") or "").strip()
+                if not detail:
+                    detail = f"SSH exited {getattr(probe, 'returncode', 'unknown')}"
+                raise RuntimeError(
+                    f"source host {src.host} could not authenticate to destination {dst.host}: "
+                    f"{detail}"
+                )
+            args.authentication_preflight = "passed"
     if needs_ssh and (not args.dry_run or args.verify != "none"):
-        ensure_knuckles_master(runner=runner)
+        if not args.agent_forwarding:
+            ensure_knuckles_master(runner=runner)
     if args.verify == "none":
         if reuse is not None:
             raise ValueError("--reuse-from requires --verify sha256")
@@ -2927,6 +2961,8 @@ def main(argv: list[str] | None = None, *, runner=subprocess.run, popener=subpro
                             "src": args.src,
                             "dst": args.dst,
                             "dry_run": bool(args.dry_run),
+                            "agent_forwarding": bool(getattr(args, "agent_forwarding", False)),
+                            "authentication_preflight": getattr(args, "authentication_preflight", "not_started"),
                             "returncode": 2,
                             "stdout": "",
                             "stderr": "",

@@ -147,6 +147,15 @@ def test_transport_argv_filters_both_startup_streams_and_preserves_command_bytes
     assert proc.stderr == b"ERR\x00\xff"
 
 
+def test_transport_argv_can_forward_the_controller_agent_only_when_requested() -> None:
+    command = rsync_transport.build_transport_argv("source-host", ["true"])
+    forwarded = rsync_transport.build_transport_argv("source-host", ["true"], forward_agent=True)
+
+    assert "-A" not in command
+    assert "--forward-agent" in forwarded
+    assert forwarded[-2:] == ["source-host", "true"]
+
+
 def test_command_output_that_looks_like_login_noise_is_preserved_after_handshake() -> None:
     command_output = "\n".join(
         [
