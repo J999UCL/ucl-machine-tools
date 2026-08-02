@@ -2672,6 +2672,8 @@ def test_ucl_copy_remote_to_remote_runs_rsync_from_source_host(
         assert kwargs.get("shell", False) is False
         if argv[:3] == ["ssh", "-O", "check"]:
             return ok()
+        if argv == remote_python_argv("barnacle.internal"):
+            return ok(stdout=copy_tools.PRESENCE_BEGIN + "\n{" + '"exists": false' + "}\n" + copy_tools.PRESENCE_END + "\n")
         assert argv[0] == "python3"
         assert "barbury.internal" in argv
         inner = argv[argv.index("rsync") :]
@@ -2698,10 +2700,11 @@ def test_ucl_copy_remote_to_remote_runs_rsync_from_source_host(
         runner=runner,
     )
 
-    assert rc == 0
+    assert rc == 2
     payload = json.loads(capsys.readouterr().out)
     assert payload["mode"] == "remote-to-remote"
-    assert payload["ok"] is True
+    assert payload["ok"] is False
+    assert payload["verify"]["message"] == "destination path does not exist after rsync"
     assert not any(call[0] == "rsync" for call in calls)
 
 

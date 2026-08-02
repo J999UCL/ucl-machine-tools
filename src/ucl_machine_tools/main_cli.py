@@ -2429,6 +2429,15 @@ def _run_plain_copy(
         return 0
     proc = runner(argv, capture_output=True, text=True, shell=False)
     ok = int(getattr(proc, "returncode", 1)) == 0
+    destination_error = ""
+    if ok and dst.is_remote:
+        try:
+            if not copy_tools.endpoint_exists(dst, runner=runner):
+                ok = False
+                destination_error = "destination path does not exist after rsync"
+        except Exception as exc:
+            ok = False
+            destination_error = f"destination postcondition check failed: {exc}"
     payload = {
         "ok": ok,
         "src": args.src,
@@ -2442,10 +2451,15 @@ def _run_plain_copy(
         # startup output. Everything after that boundary is rsync output.
         "stdout": getattr(proc, "stdout", "") or "",
         "stderr": getattr(proc, "stderr", "") or "",
+        "error": destination_error,
         "dry_run": False,
         "plan": None,
         "attempts": [],
-        "verify": {"mode": "none", "ok": None, "message": "skipped"},
+        "verify": {
+            "mode": "none",
+            "ok": None if not destination_error else False,
+            "message": destination_error or "destination exists",
+        },
     }
     _render_copy_payload(payload, json_output=args.json)
     return 0 if ok else 2

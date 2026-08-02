@@ -21,6 +21,8 @@ from ucl_machine_tools.ssh import build_remote_python_argv
 Runner = Callable[..., subprocess.CompletedProcess]
 MANIFEST_BEGIN = "UCL_COPY_MANIFEST_BEGIN"
 MANIFEST_END = "UCL_COPY_MANIFEST_END"
+PRESENCE_BEGIN = "UCL_COPY_PRESENCE_BEGIN"
+PRESENCE_END = "UCL_COPY_PRESENCE_END"
 LINK_BEGIN = "UCL_COPY_LINK_BEGIN"
 LINK_END = "UCL_COPY_LINK_END"
 RSYNC_SSH = rsync_transport.build_transport_command()
@@ -303,6 +305,41 @@ def endpoint_manifest(endpoint: Endpoint, *, sha256: bool, runner: Runner = subp
         detail = (getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip()
         raise RuntimeError(detail or f"remote manifest failed on {endpoint.host}")
     return _extract_manifest(getattr(proc, "stdout", "") or "")
+
+
+def presence_source(path: str) -> str:
+    """Return a tiny remote probe for the destination postcondition."""
+
+    return f"""
+import json, os
+print({PRESENCE_BEGIN!r})
+print(json.dumps({{"exists": os.path.lexists({path!r})}}, sort_keys=True))
+print({PRESENCE_END!r})
+"""
+
+
+def endpoint_exists(endpoint: Endpoint, *, runner: Runner = subprocess.run) -> bool:
+    if endpoint.host is None:
+        return os.path.lexists(endpoint.path)
+    proc = runner(
+        build_remote_python_argv(endpoint.host),
+        input=presence_source(endpoint.path),
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
+    if int(getattr(proc, "returncode", 1)) != 0:
+        detail = (getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip()
+        raise RuntimeError(detail or f"remote destination check failed on {endpoint.host}")
+    payload = _extract_between(
+        getattr(proc, "stdout", "") or "",
+        PRESENCE_BEGIN,
+        PRESENCE_END,
+        "copy destination presence",
+    )
+    if not isinstance(payload.get("exists"), bool):
+        raise RuntimeError("copy destination presence response did not contain a boolean exists field")
+    return payload["exists"]
 
 
 def local_manifest(endpoint: Endpoint, *, sha256: bool) -> dict[str, Any]:
